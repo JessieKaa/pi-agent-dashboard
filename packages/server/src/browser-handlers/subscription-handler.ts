@@ -7,6 +7,7 @@ import type { WebSocket } from "ws";
 import { extractStatsFromEvents } from "../session/event-status-extraction.js";
 import type { StoredEvent } from "../persistence/memory-event-store.js";
 import { pluginIntentCache } from "../plugin-intent-cache.js";
+import { compactReplayEvents } from "../session/replay-compact.js";
 import { truncateToolResultForReplay } from "../session/replay-truncate.js";
 import type { BrowserHandlerContext } from "./handler-context.js";
 
@@ -38,9 +39,11 @@ async function sendEventBatches(
   stored: StoredEvent[],
   sendTo: (ws: WebSocket, msg: ServerToBrowserMessage) => void,
 ): Promise<number> {
-  for (let i = 0; i < stored.length; i += REPLAY_BATCH_SIZE) {
+  const lastSent = stored.length > 0 ? stored[stored.length - 1].seq : 0;
+  const events = compactReplayEvents(stored);
+  for (let i = 0; i < events.length; i += REPLAY_BATCH_SIZE) {
     if (ws.readyState !== ws.OPEN) return 0;
-    const batch = stored.slice(i, i + REPLAY_BATCH_SIZE);
+    const batch = events.slice(i, i + REPLAY_BATCH_SIZE);
     sendTo(ws, {
       type: "event_replay",
       sessionId,
@@ -49,7 +52,7 @@ async function sendEventBatches(
       // keeps the full body for develop's "Show full output" route; small
       // results and non-tool events pass through untouched.
       events: batch.map((e) => ({ seq: e.seq, event: truncateToolResultForReplay(e.event) })),
-      isLast: i + REPLAY_BATCH_SIZE >= stored.length,
+      isLast: i + REPLAY_BATCH_SIZE >= events.length,
     });
     // Yield to event loop between batches to allow GC and buffer flushing
     if (ws.bufferedAmount > BACKPRESSURE_THRESHOLD) {
@@ -67,7 +70,7 @@ async function sendEventBatches(
       await new Promise<void>((r) => setImmediate(r));
     }
   }
-  return stored.length > 0 ? stored[stored.length - 1].seq : 0;
+  return lastSent;
 }
 
 /**

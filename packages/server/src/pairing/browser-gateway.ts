@@ -15,6 +15,8 @@ import type { EventStore } from "../persistence/memory-event-store.js";
 import type { PreferencesStore } from "../persistence/preferences-store.js";
 import type { PiGateway } from "../pi/pi-gateway.js";
 import type { SessionManager } from "../session/memory-session-manager.js";
+import { compactReplayEvents } from "../session/replay-compact.js";
+import { truncateToolResultForReplay } from "../session/replay-truncate.js";
 import type { SessionOrderManager } from "../session/session-order-manager.js";
 // PendingLoadManager removed — server loads sessions directly via DirectoryService
 import { createHeadlessPidRegistry, type HeadlessPidRegistry } from "../spawn-process/headless-pid-registry.js";
@@ -517,10 +519,14 @@ export function createBrowserGateway(
             if (lastReplayedSeq > 0) {
               const catchUp = eventStore.getEvents(sessionId, lastReplayedSeq + 1);
               if (catchUp.length > 0) {
+                const compacted = compactReplayEvents(catchUp);
                 sendTo(targetWs, {
                   type: "event_replay",
                   sessionId,
-                  events: catchUp.map((e) => ({ seq: e.seq, event: e.event })),
+                  events: compacted.map((e) => ({
+                    seq: e.seq,
+                    event: truncateToolResultForReplay(e.event),
+                  })),
                   isLast: true,
                 });
               }

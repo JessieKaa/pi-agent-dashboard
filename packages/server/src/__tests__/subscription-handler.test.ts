@@ -216,6 +216,45 @@ describe("handleSubscribe — stale lastSeq detection", () => {
     const allEvents = replays.flatMap(([, msg]: any) => msg.events);
     expect(allEvents).toHaveLength(3);
   });
+
+  it("compacts completed message paint while preserving replay cursor and 50-event batches", async () => {
+    const clearReplaying = vi.fn();
+    const ctx = createMockContext({ clearReplaying });
+    const completedMessage = { role: "assistant", timestamp: 100, content: [{ type: "text", text: "final" }] };
+
+    ctx.eventStore.insertEvent("s1", {
+      eventType: "message_update",
+      timestamp: 1,
+      data: { message: completedMessage, assistantMessageEvent: { type: "text_delta", delta: "x" } },
+    });
+    ctx.eventStore.insertEvent("s1", {
+      eventType: "message_update",
+      timestamp: 2,
+      data: { message: completedMessage, assistantMessageEvent: { type: "toolcall_delta", delta: "y" } },
+    });
+    for (let i = 0; i < 50; i++) ctx.eventStore.insertEvent("s1", makeEvent(`keep-${i}`));
+    ctx.eventStore.insertEvent("s1", {
+      eventType: "message_end",
+      timestamp: 53,
+      data: { message: completedMessage },
+    });
+
+    handleSubscribe({ type: "subscribe", sessionId: "s1", lastSeq: 0 }, new Set(), ctx);
+    await vi.waitFor(() => {
+      expect(clearReplaying).toHaveBeenCalledWith(ctx.ws, "s1", 53);
+    });
+
+    const replays = ((ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>)
+      .map(([, msg]) => msg)
+      .filter((msg): msg is Extract<ServerToBrowserMessage, { type: "event_replay" }> => msg.type === "event_replay");
+    expect(replays).toHaveLength(2);
+    expect(replays.map((msg) => msg.events.length)).toEqual([50, 1]);
+    expect(replays.map((msg) => msg.isLast)).toEqual([false, true]);
+
+    const seqs = replays.flatMap((msg) => msg.events.map((event) => event.seq));
+    expect(seqs).toEqual([...Array.from({ length: 50 }, (_, i) => i + 3), 53]);
+    expect(clearReplaying).toHaveBeenCalledWith(ctx.ws, "s1", 53);
+  });
 });
 
 // chat-markdown-local-images-and-math

@@ -9,6 +9,8 @@ Files in this directory. One row per source file. See change: fold-oversized-age
 | `memory-session-manager.ts` | Pure in-memory session registry; replaces SQLite-backed session-manager. → see `memory-session-manager.ts.AGENTS.md` |
 | `reattach-placement.ts` | Reattach placement policy: decides how a re-registered session id (`registerReason: "reattach"`, dashboard… → see `reattach-placement.ts.AGENTS.md` |
 | `reconcile-session-order.ts` | Pure startup reconciliation of persisted `sessionOrder` map under all-status model. → see `reconcile-session-order.ts.AGENTS.md` |
+| `replay-compact.ts` | Replay-time compaction. Exports `compactReplayEvents(events)`: drops completed-message `text_*`/`toolcall_delta` paint updates while preserving thinking, tool boundaries, streaming tails, original seq values, and EventStore contents. |
+| `replay-compact.test.ts` | Unit coverage for replay compaction: completed paint removal, load-bearing update retention, streaming tails, malformed shapes, message identity isolation, and input immutability. |
 | `replay-truncate.ts` | truncateToolResultForReplay(event). Strategy B reconciled onto adopt-pi-071-072-073-features. → see `replay-truncate.ts.AGENTS.md` |
 | `resolve-order-key.ts` | Resolves `sessionOrder` map key for a session server-side. → see `resolve-order-key.ts.AGENTS.md` |
 | `session-api.ts` | REST wrappers for session control. Exports `registerSessionApi(fastify, deps)`. → see `session-api.ts.AGENTS.md` |
