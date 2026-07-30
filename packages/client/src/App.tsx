@@ -923,7 +923,7 @@ export default function App() {
           type: "subscribe",
           sessionId: sid,
           lastSeq,
-          historyWindow: { messages: 400, ...(firstSeq != null ? { firstSeq } : {}) },
+          historyWindow: { messages: 200, ...(firstSeq != null ? { firstSeq } : {}) },
         });
         // Enter LOADING. Covers warm (in-memory replay / reconnect re-subscribe)
         // and cold (disk-load) paths uniformly, since the warm path never sends
@@ -1504,7 +1504,7 @@ export default function App() {
             maxSeqMapRef.current.set(selectedId, 0);
             subscribedRef.current.delete(selectedId);
             subscribedRef.current.add(selectedId);
-            send({ type: "subscribe", sessionId: selectedId, lastSeq: 0 });
+            send({ type: "subscribe", sessionId: selectedId, lastSeq: 0, forceRefresh: true });
             clearHistoryWindow(selectedId);
             beginLoadingHistory(selectedId);
           },
@@ -1527,7 +1527,7 @@ export default function App() {
           maxSeqMapRef.current.set(selectedId, 0);
           subscribedRef.current.delete(selectedId);
           subscribedRef.current.add(selectedId);
-          send({ type: "subscribe", sessionId: selectedId, lastSeq: 0 });
+          send({ type: "subscribe", sessionId: selectedId, lastSeq: 0, forceRefresh: true });
           beginLoadingHistory(selectedId);
         }}
       />

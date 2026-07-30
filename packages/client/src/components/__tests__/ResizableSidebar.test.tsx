@@ -9,8 +9,10 @@ function makeSidebar(overrides: Partial<SidebarState> = {}): SidebarState {
   return {
     width: 256,
     collapsed: false,
+    compact: false,
     setWidth: vi.fn(),
     toggleCollapse: vi.fn(),
+    setCompact: vi.fn(),
     ...overrides,
   };
 }

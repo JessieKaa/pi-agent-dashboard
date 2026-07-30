@@ -236,7 +236,9 @@ export function handleSubscribe(
   piGateway.sendToSession(msg.sessionId, { type: "request_providers", sessionId: msg.sessionId });
   piGateway.sendToSession(msg.sessionId, { type: "request_roles", sessionId: msg.sessionId });
 
-  if (eventStore.hasEvents(msg.sessionId)) {
+  const forceRefresh = msg.forceRefresh === true;
+
+  if (eventStore.hasEvents(msg.sessionId) && !forceRefresh) {
     const lastSeq = msg.lastSeq ?? 0;
     const maxSeq = eventStore.getMaxSeq(msg.sessionId);
     const requestedWindow = msg.historyWindow?.messages;
@@ -343,6 +345,14 @@ export function handleSubscribe(
       directoryService.loadSessionEvents(msg.sessionId, session.sessionFile, session.contextWindow).then(async (result) => {
         stopHeartbeat();
         if (result.success) {
+          if (forceRefresh) {
+            eventStore.deleteEventsForSession(msg.sessionId);
+            for (const sub of getSubscribers(msg.sessionId)) {
+              if (sub.readyState === sub.OPEN) {
+                sendTo(sub, { type: "session_state_reset", sessionId: msg.sessionId });
+              }
+            }
+          }
           for (const evt of result.events) {
             eventStore.insertEvent(msg.sessionId, evt);
           }

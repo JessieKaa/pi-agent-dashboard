@@ -250,6 +250,35 @@ describe("memory-event-store", () => {
       expect(Buffer.byteLength(JSON.stringify(stored.data))).toBeLessThanOrEqual(20_000);
     });
 
+    it("preserves assistant text when thinking makes message events exceed the ceiling", () => {
+      const store = createMemoryEventStore(neverPinned);
+      const visibleText = "final assistant text";
+      const event: DashboardEvent = {
+        eventType: "message_end",
+        timestamp: Date.now(),
+        data: {
+          message: {
+            role: "assistant",
+            content: [
+              ...Array.from({ length: 11 }, () => ({
+                type: "thinking",
+                thinking: "T".repeat(40_000),
+                signature: "S".repeat(8_000),
+              })),
+              { type: "text", text: visibleText },
+            ],
+          },
+        },
+      };
+
+      store.insertEvent("s1", event);
+      const stored = store.getEvent("s1", 1) as any;
+      expect(stored.data.__truncated).toBeUndefined();
+      expect(stored.data.message.content).toContainEqual({ type: "text", text: visibleText });
+      expect(JSON.stringify(stored.data)).toContain(visibleText);
+      expect(Buffer.byteLength(JSON.stringify(stored.data))).toBeLessThanOrEqual(20_000);
+    });
+
     it("truncates other fields alongside preserved image data", () => {
       const store = createMemoryEventStore(neverPinned, 100, 5000, 100);
       const longBase64 = "C".repeat(500);

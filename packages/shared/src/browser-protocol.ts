@@ -951,6 +951,7 @@ export interface SubscribeMessage {
   type: "subscribe";
   sessionId: string;
   lastSeq?: number;
+  forceRefresh?: boolean;
   historyWindow?: {
     messages: number;
     firstSeq?: number;

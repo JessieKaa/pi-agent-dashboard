@@ -520,6 +520,33 @@ describe("handleSubscribe — cold-hydration heartbeat", () => {
     }
   });
 
+  it("force refresh rebuilds from disk even when memory already has events", async () => {
+    const stale = makeEvent("stale_memory_event");
+    const final = makeEvent("message_end");
+    final.data = { message: { role: "assistant", content: "final text from disk" } };
+    const loadSessionEvents = vi.fn(async () => ({ success: true, events: [final] }));
+    const ctx = createMockContext({ directoryService: { loadSessionEvents } as any });
+    ctx.getSubscribers = () => [ctx.ws];
+    restoreEnded(ctx, "s-force");
+    ctx.eventStore.insertEvent("s-force", stale);
+
+    handleSubscribe(
+      { type: "subscribe", sessionId: "s-force", lastSeq: 0, forceRefresh: true },
+      new Set(),
+      ctx,
+    );
+    await flush();
+
+    expect(loadSessionEvents).toHaveBeenCalledWith("s-force", "/sessions/s-force.jsonl", 200000);
+    const messages = ((ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>).map(([, msg]) => msg);
+    expect(messages).toContainEqual({ type: "session_state_reset", sessionId: "s-force" });
+    const replayed = messages
+      .filter((msg): msg is Extract<ServerToBrowserMessage, { type: "event_replay" }> => msg.type === "event_replay")
+      .flatMap((msg) => msg.events.map((event) => event.event.eventType));
+    expect(replayed).toContain("message_end");
+    expect(replayed).not.toContain("stale_memory_event");
+  });
+
   it("resets a mismatched cached boundary after cold hydration", async () => {
     const events: DashboardEvent[] = [];
     for (let turn = 0; turn < 4; turn++) {

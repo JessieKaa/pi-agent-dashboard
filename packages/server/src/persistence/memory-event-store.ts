@@ -654,6 +654,55 @@ export function reduceSubagentEvent(event: DashboardEvent, ceiling: number): Das
  * ceiling (`maxEventDataSize`); an over-ceiling event's data is replaced with a
  * bounded placeholder so it can never OOM the persist/broadcast path.
  */
+function reduceAssistantMessageEvent(event: DashboardEvent, maxEventDataSize: number): DashboardEvent | undefined {
+  if (
+    event.eventType !== "message_start" &&
+    event.eventType !== "message_update" &&
+    event.eventType !== "message_end"
+  ) {
+    return undefined;
+  }
+  const data = event.data;
+  if (!data || typeof data !== "object") return undefined;
+  const message = (data as Record<string, unknown>).message;
+  if (!message || typeof message !== "object") return undefined;
+  const msg = message as Record<string, unknown>;
+  if (msg.role !== "assistant") return undefined;
+  const content = msg.content;
+  if (!Array.isArray(content)) return undefined;
+
+  const compactContent = content.map((part) => {
+    if (!part || typeof part !== "object") return part;
+    const block = { ...(part as Record<string, unknown>) };
+    if (block.type === "thinking") {
+      delete block.signature;
+      if (typeof block.thinking === "string") block.thinking = capString(block.thinking, 500);
+    }
+    return block;
+  });
+  const compactEvent: DashboardEvent = {
+    ...event,
+    data: {
+      ...(data as Record<string, unknown>),
+      message: { ...msg, content: compactContent },
+    },
+  };
+  if (!exceedsSerializedSize(compactEvent.data, maxEventDataSize)) return compactEvent;
+
+  const visibleContent = compactContent.filter((part) => {
+    if (!part || typeof part !== "object") return true;
+    return (part as Record<string, unknown>).type !== "thinking";
+  });
+  const visibleEvent: DashboardEvent = {
+    ...event,
+    data: {
+      ...(data as Record<string, unknown>),
+      message: { ...msg, content: visibleContent },
+    },
+  };
+  return !exceedsSerializedSize(visibleEvent.data, maxEventDataSize) ? visibleEvent : undefined;
+}
+
 function createTruncator(maxStringSize: number, maxEventDataSize: number) {
   const stringPass = maxStringSize > 0;
   const sizePass = maxEventDataSize > 0;
@@ -675,6 +724,11 @@ function createTruncator(maxStringSize: number, maxEventDataSize: number) {
       ? (truncateStrings(data, maxStringSize) as Record<string, unknown>)
       : (data as Record<string, unknown>);
     if (sizePass && exceedsSerializedSize(truncated, maxEventDataSize)) {
+      const messageEvent = reduceAssistantMessageEvent(
+        truncated !== data ? { ...event, data: truncated } : event,
+        maxEventDataSize,
+      );
+      if (messageEvent) return messageEvent;
       return truncatedPlaceholder(event, maxEventDataSize);
     }
     return truncated !== data ? { ...event, data: truncated } : event;
