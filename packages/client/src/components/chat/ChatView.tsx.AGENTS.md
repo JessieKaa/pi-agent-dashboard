@@ -22,7 +22,7 @@ Renders `inlineTerminal` role via `InlineTerminalCard`; `onCloseInlineTerminal` 
 
 `bashOutput` branch renders `<MissingToolInlineError>` when `args.missingTool.kind==="missing-tool"`. See change: register-bash-and-tool-install-help.
 
-New optional prop `loadingHistory?: boolean`. Empty-state 3-way: `loadingHistory && messages empty` → spinner (`mdiLoading` animate-spin + i18n "Loading conversation…"); else messages empty → "No messages yet"; else bubbles. See change: show-chat-history-loading-indicator.
+New optional props `loadingHistory`, `historyWindow`, `onLoadFullHistory`. Empty-state 3-way preserves loading skeleton. When `historyWindow.hasOlder`, transcript top renders a disabled-during-load `Load full history` escape control outside message grouping/virtual rows.
 
 Wraps message list in `FilePreviewProvider`; renders single `FilePreviewHost`. See change: fix-file-preview-survives-message-churn.
 

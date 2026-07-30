@@ -318,6 +318,62 @@ describe("ChatView", () => {
     });
   });
 
+  describe("history window control", () => {
+    const historyWindow = {
+      requestedMessages: 200,
+      effectiveMessages: 205,
+      startSeq: 40,
+      endSeq: 900,
+      hasOlder: true,
+    };
+
+    it("shows the full-history escape and invokes it", () => {
+      const onLoadFullHistory = vi.fn();
+      const state = stateWithMessages([{ id: "1", role: "user", content: "hi" }]);
+      const { getByTestId } = render(
+        <ThemeProvider>
+          <ChatView
+            state={state}
+            toolContext={defaultToolContext}
+            historyWindow={historyWindow}
+            onLoadFullHistory={onLoadFullHistory}
+          />
+        </ThemeProvider>,
+      );
+
+      fireEvent.click(getByTestId("load-full-history"));
+      expect(onLoadFullHistory).toHaveBeenCalledTimes(1);
+    });
+
+    it("disables the escape while full history loads and hides it when complete", () => {
+      const state = stateWithMessages([{ id: "1", role: "user", content: "hi" }]);
+      const { getByTestId, queryByTestId, rerender } = render(
+        <ThemeProvider>
+          <ChatView
+            state={state}
+            toolContext={defaultToolContext}
+            loadingHistory={true}
+            historyWindow={historyWindow}
+            onLoadFullHistory={vi.fn()}
+          />
+        </ThemeProvider>,
+      );
+
+      expect((getByTestId("load-full-history") as HTMLButtonElement).disabled).toBe(true);
+      rerender(
+        <ThemeProvider>
+          <ChatView
+            state={state}
+            toolContext={defaultToolContext}
+            historyWindow={{ ...historyWindow, hasOlder: false }}
+            onLoadFullHistory={vi.fn()}
+          />
+        </ThemeProvider>,
+      );
+      expect(queryByTestId("history-window-control")).toBeNull();
+    });
+  });
+
   describe("scroll lock", () => {
     let scrollToSpy: ReturnType<typeof vi.fn>;
 

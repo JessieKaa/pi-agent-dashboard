@@ -123,11 +123,20 @@ export interface EventMessage {
   event: DashboardEvent;
 }
 
+export interface HistoryWindowMetadata {
+  requestedMessages: number;
+  effectiveMessages: number;
+  startSeq: number | null;
+  endSeq: number;
+  hasOlder: boolean;
+}
+
 export interface EventReplayMessage {
   type: "event_replay";
   sessionId: string;
   events: Array<{ seq: number; event: DashboardEvent }>;
   isLast: boolean;
+  historyWindow?: HistoryWindowMetadata;
 }
 
 export interface BrowserCommandsListMessage {
@@ -942,6 +951,10 @@ export interface SubscribeMessage {
   type: "subscribe";
   sessionId: string;
   lastSeq?: number;
+  historyWindow?: {
+    messages: number;
+    firstSeq?: number;
+  };
 }
 
 export interface UnsubscribeMessage {

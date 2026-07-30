@@ -217,6 +217,156 @@ describe("handleSubscribe — stale lastSeq detection", () => {
     expect(allEvents).toHaveLength(3);
   });
 
+  it("sends an opted-in tail window with terminal metadata", async () => {
+    const ctx = createMockContext();
+    for (let turn = 0; turn < 4; turn++) {
+      const userTs = turn * 10 + 1;
+      const assistantTs = turn * 10 + 2;
+      ctx.eventStore.insertEvent("s1", {
+        eventType: "message_start",
+        timestamp: userTs,
+        data: { message: { role: "user", timestamp: userTs, content: `user-${turn}` } },
+      });
+      ctx.eventStore.insertEvent("s1", {
+        eventType: "message_start",
+        timestamp: assistantTs,
+        data: { message: { role: "assistant", timestamp: assistantTs, content: [] } },
+      });
+      ctx.eventStore.insertEvent("s1", {
+        eventType: "message_end",
+        timestamp: assistantTs + 1,
+        data: { message: { role: "assistant", timestamp: assistantTs, content: [] } },
+      });
+    }
+
+    handleSubscribe(
+      { type: "subscribe", sessionId: "s1", lastSeq: 0, historyWindow: { messages: 2 } },
+      new Set(),
+      ctx,
+    );
+
+    await vi.waitFor(() => {
+      const replays = ((ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>)
+        .map(([, msg]) => msg)
+        .filter((msg): msg is Extract<ServerToBrowserMessage, { type: "event_replay" }> => msg.type === "event_replay");
+      expect(replays.at(-1)?.historyWindow).toEqual({
+        requestedMessages: 2,
+        effectiveMessages: 2,
+        startSeq: 10,
+        endSeq: 12,
+        hasOlder: true,
+      });
+    });
+
+    const messages = ((ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>).map(([, msg]) => msg);
+    expect(messages[0]).toEqual({ type: "session_state_reset", sessionId: "s1" });
+    const events = messages
+      .filter((msg): msg is Extract<ServerToBrowserMessage, { type: "event_replay" }> => msg.type === "event_replay")
+      .flatMap((msg) => msg.events);
+    expect(events.map((event) => event.seq)).toEqual([10, 11, 12]);
+  });
+
+  it("keeps legacy subscriptions on the full retained replay", async () => {
+    const ctx = createMockContext();
+    for (let i = 0; i < 12; i++) ctx.eventStore.insertEvent("s1", makeEvent(`e${i}`));
+
+    handleSubscribe({ type: "subscribe", sessionId: "s1", lastSeq: 0 }, new Set(), ctx);
+
+    await vi.waitFor(() => {
+      const events = ((ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>)
+        .map(([, msg]) => msg)
+        .filter((msg): msg is Extract<ServerToBrowserMessage, { type: "event_replay" }> => msg.type === "event_replay")
+        .flatMap((msg) => msg.events);
+      expect(events).toHaveLength(12);
+    });
+  });
+
+  it("clears a stale window preference when the same socket resubscribes as legacy", async () => {
+    const ctx = createMockContext();
+    handleSubscribe(
+      { type: "subscribe", sessionId: "s1", historyWindow: { messages: 2 } },
+      new Set(),
+      ctx,
+    );
+
+    const events: DashboardEvent[] = [];
+    for (let turn = 0; turn < 4; turn++) {
+      const timestamp = turn * 10 + 1;
+      events.push({
+        eventType: "message_start",
+        timestamp,
+        data: { message: { role: "user", timestamp, content: `user-${turn}` } },
+      });
+      events.push({
+        eventType: "message_end",
+        timestamp: timestamp + 1,
+        data: { message: { role: "assistant", timestamp: timestamp + 1, content: [] } },
+      });
+    }
+
+    ctx.sessionManager.restore({
+      id: "s1",
+      cwd: "/test",
+      source: "tui",
+      status: "ended",
+      startedAt: 1,
+      endedAt: 2,
+      tokensIn: 0,
+      tokensOut: 0,
+      cost: 0,
+      sessionFile: "/sessions/s1.jsonl",
+      sessionDir: "/sessions",
+      hidden: false,
+    } as any);
+    ctx.directoryService = {
+      loadSessionEvents: vi.fn(async () => ({ success: true, events })),
+    } as any;
+    ctx.getSubscribers = () => [ctx.ws];
+    vi.mocked(ctx.sendTo).mockClear();
+
+    handleSubscribe({ type: "subscribe", sessionId: "s1" }, new Set(), ctx);
+
+    await vi.waitFor(() => {
+      const replays = ((ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>)
+        .map(([, msg]) => msg)
+        .filter((msg): msg is Extract<ServerToBrowserMessage, { type: "event_replay" }> => msg.type === "event_replay" && msg.isLast);
+      expect(replays).toHaveLength(1);
+      expect(replays[0].historyWindow).toBeUndefined();
+      expect(replays[0].events).toHaveLength(8);
+    });
+  });
+
+  it("delta-replays when the cached window boundary matches", async () => {
+    const ctx = createMockContext();
+    for (let turn = 0; turn < 3; turn++) {
+      const ts = turn * 10 + 1;
+      ctx.eventStore.insertEvent("s1", {
+        eventType: "message_start",
+        timestamp: ts,
+        data: { message: { role: "user", timestamp: ts, content: `user-${turn}` } },
+      });
+      ctx.eventStore.insertEvent("s1", {
+        eventType: "message_end",
+        timestamp: ts + 1,
+        data: { message: { role: "assistant", timestamp: ts + 1, content: [] } },
+      });
+    }
+
+    handleSubscribe(
+      { type: "subscribe", sessionId: "s1", lastSeq: 5, historyWindow: { messages: 2, firstSeq: 5 } },
+      new Set(),
+      ctx,
+    );
+
+    await vi.waitFor(() => {
+      const messages = ((ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>).map(([, msg]) => msg);
+      expect(messages.filter((msg) => msg.type === "session_state_reset")).toHaveLength(0);
+      const replay = messages.find((msg): msg is Extract<ServerToBrowserMessage, { type: "event_replay" }> => msg.type === "event_replay");
+      expect(replay?.events.map((event) => event.seq)).toEqual([6]);
+      expect(replay?.historyWindow?.startSeq).toBe(5);
+    });
+  });
+
   it("compacts completed message paint while preserving replay cursor and 50-event batches", async () => {
     const clearReplaying = vi.fn();
     const ctx = createMockContext({ clearReplaying });
@@ -368,6 +518,76 @@ describe("handleSubscribe — cold-hydration heartbeat", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("resets a mismatched cached boundary after cold hydration", async () => {
+    const events: DashboardEvent[] = [];
+    for (let turn = 0; turn < 4; turn++) {
+      const timestamp = turn * 10 + 1;
+      events.push({
+        eventType: "message_start",
+        timestamp,
+        data: { message: { role: "user", timestamp, content: `user-${turn}` } },
+      });
+      events.push({
+        eventType: "message_end",
+        timestamp: timestamp + 1,
+        data: { message: { role: "assistant", timestamp: timestamp + 1, content: [] } },
+      });
+    }
+    const ctx = createMockContext({
+      directoryService: {
+        loadSessionEvents: vi.fn(async () => ({ success: true, events })),
+      } as any,
+    });
+    ctx.getSubscribers = () => [ctx.ws];
+    restoreEnded(ctx, "s-boundary");
+
+    handleSubscribe(
+      {
+        type: "subscribe",
+        sessionId: "s-boundary",
+        lastSeq: 4,
+        historyWindow: { messages: 2, firstSeq: 1 },
+      },
+      new Set(),
+      ctx,
+    );
+    await flush();
+
+    const messages = ((ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>).map(([, msg]) => msg);
+    expect(messages).toContainEqual({ type: "session_state_reset", sessionId: "s-boundary" });
+    const terminal = messages.find(
+      (msg): msg is Extract<ServerToBrowserMessage, { type: "event_replay" }> =>
+        msg.type === "event_replay" && msg.isLast,
+    );
+    expect(terminal?.historyWindow?.startSeq).toBe(7);
+    expect(terminal?.events.map((event) => event.seq)).toEqual([7, 8]);
+  });
+
+  it("suppresses live events while a windowed cold hydration replay is sent", async () => {
+    const events = [makeEvent("message_update"), makeEvent("message_end")];
+    const markReplaying = vi.fn();
+    const clearReplaying = vi.fn();
+    const ctx = createMockContext({
+      directoryService: {
+        loadSessionEvents: vi.fn(async () => ({ success: true, events })),
+      } as any,
+      markReplaying,
+      clearReplaying,
+    });
+    ctx.getSubscribers = () => [ctx.ws];
+    restoreEnded(ctx, "s-windowed");
+
+    handleSubscribe(
+      { type: "subscribe", sessionId: "s-windowed", historyWindow: { messages: 200 } },
+      new Set(),
+      ctx,
+    );
+    await flush();
+
+    expect(markReplaying).toHaveBeenCalledWith(ctx.ws, "s-windowed");
+    expect(clearReplaying).toHaveBeenCalledWith(ctx.ws, "s-windowed", 2);
   });
 
   it("4.9 heartbeat stops on failure and on cancelled", async () => {

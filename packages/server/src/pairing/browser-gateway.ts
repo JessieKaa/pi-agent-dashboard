@@ -69,7 +69,7 @@ import { handleAddFolderToWorkspace, handleCreateWorkspace, handleDeleteWorkspac
 import type { BrowserHandlerContext } from "../browser-handlers/handler-context.js";
 import { handleAbort, handleClearFollowupEntries, handleEditFollowupEntry, handleFlowControl, handleForceKill, handleKillProcess, handlePromoteFollowupEntry, handleRemoveFollowupEntry, handleResumeSession, handleSendPrompt, handleShutdown, handleSpawnSession, handleStopAfterTurn, handleSubagentResyncRequest } from "../browser-handlers/session-action-handler.js";
 import { handleAcceptReplaceProposal, handleAttachProposal, handleDetachProposal, handleDismissReplaceProposal, handleFetchContent, handleHideSession, handleListSessions, handleRemoveTagGlobally, handleRenameSession, handleSetSessionDisplayPrefs, handleSetSessionProcessDrawer, handleSetSessionTags, handleUnhideSession } from "../browser-handlers/session-meta-handler.js";
-import { handleSubscribe } from "../browser-handlers/subscription-handler.js";
+import { forgetHistoryWindow, handleSubscribe } from "../browser-handlers/subscription-handler.js";
 import { handleCloseInlineTerminal, handleCreateTerminal, handleKillTerminal, handleOpenInlineTerminal, handleRenameTerminal } from "../browser-handlers/terminal-handler.js";
 import { createPendingResumeRegistry, type PendingResumeRegistry } from "../pending/pending-resume-registry.js";
 import { createViewedSessionTracker, type ViewedSessionTracker } from "../session/viewed-session-tracker.js";
@@ -540,6 +540,7 @@ export function createBrowserGateway(
             break;
           case "unsubscribe":
             subs.delete(msg.sessionId);
+            forgetHistoryWindow(ws, msg.sessionId);
             // Cancel an in-flight hydration once the last subscriber leaves,
             // so clicking session A then B doesn't waste A's parse+replay and
             // deliver an event_replay to a now-unsubscribed ws. Guarded by the

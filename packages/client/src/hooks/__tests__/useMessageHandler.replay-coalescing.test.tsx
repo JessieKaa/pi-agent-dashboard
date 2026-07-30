@@ -41,6 +41,8 @@ describe("useMessageHandler — replay coalescing", () => {
   let nextRafId: number;
   let sessionStatesRef: { current: Map<string, SessionState> };
   let setSessionStates: ReturnType<typeof vi.fn>;
+  let historyWindowsRef: { current: Map<string, any> };
+  let setHistoryWindows: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     rafCallbacks = new Map();
@@ -58,6 +60,11 @@ describe("useMessageHandler — replay coalescing", () => {
       sessionStatesRef.current =
         typeof updater === "function" ? updater(sessionStatesRef.current) : updater;
     });
+    historyWindowsRef = { current: new Map() };
+    setHistoryWindows = vi.fn((updater: any) => {
+      historyWindowsRef.current =
+        typeof updater === "function" ? updater(historyWindowsRef.current) : updater;
+    });
   });
 
   afterEach(() => {
@@ -74,9 +81,12 @@ describe("useMessageHandler — replay coalescing", () => {
       drop: vi.fn(),
       flush: vi.fn(),
     };
-    const setters = new Proxy({ setSessionStates }, {
-      get: (target, prop) =>
-        prop === "setSessionStates" ? target.setSessionStates : vi.fn(),
+    const setters = new Proxy({ setSessionStates, setHistoryWindows }, {
+      get: (target, prop) => {
+        if (prop === "setSessionStates") return target.setSessionStates;
+        if (prop === "setHistoryWindows") return target.setHistoryWindows;
+        return vi.fn();
+      },
     }) as unknown as MessageHandlerSetters;
     const hook = renderHook(() => {
       const deps: any = {
@@ -133,6 +143,44 @@ describe("useMessageHandler — replay coalescing", () => {
         .messages.filter((message) => message.role === "toolResult")
         .map((message) => message.toolCallId),
     ).toEqual(["t1", "t2", "t3"]);
+  });
+
+  it("records terminal history-window metadata without forcing replay state publication", () => {
+    const { dispatch } = setup();
+    const historyWindow = {
+      requestedMessages: 200,
+      effectiveMessages: 207,
+      startSeq: 41,
+      endSeq: 900,
+      hasOlder: true,
+    };
+
+    dispatch({
+      type: "event_replay",
+      sessionId: "s1",
+      events: [],
+      isLast: true,
+      historyWindow,
+    });
+
+    expect(historyWindowsRef.current.get("s1")).toEqual(historyWindow);
+    expect(setSessionStates).not.toHaveBeenCalled();
+    expect(rafCallbacks).toHaveLength(0);
+  });
+
+  it("clears stale history-window metadata after an unwindowed terminal replay", () => {
+    const { dispatch } = setup();
+    historyWindowsRef.current.set("s1", {
+      requestedMessages: 200,
+      effectiveMessages: 207,
+      startSeq: 41,
+      endSeq: 900,
+      hasOlder: true,
+    });
+
+    dispatch({ type: "event_replay", sessionId: "s1", events: [], isLast: true });
+
+    expect(historyWindowsRef.current.has("s1")).toBe(false);
   });
 
   it("publishes once per frame when replay spans multiple frames", () => {

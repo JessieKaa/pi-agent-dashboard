@@ -4,6 +4,7 @@
  */
 
 import type {
+  HistoryWindowMetadata,
   PreflightReason,
   ServerToBrowserMessage,
   SpawnFailureCode,
@@ -113,6 +114,7 @@ export interface MessageHandlerSetters {
    * See change: show-chat-history-loading-indicator.
    */
   setLoadingHistory: React.Dispatch<React.SetStateAction<Map<string, boolean>>>;
+  setHistoryWindows?: React.Dispatch<React.SetStateAction<Map<string, HistoryWindowMetadata>>>;
   /**
    * Per-session auto-canvas state, folded from `canvas_intent` /
    * `canvas_server_chip` broadcasts. Coexists with the URL-driven preview
@@ -178,7 +180,7 @@ export function useMessageHandler(
     setFileResults, setChangedOnDisk, setOpenspecMap, setFolderGitMap, setOpenspecGroupsMap, setModelsMap, setRolesMap, setSpawnResult,
     setSessionOrderMap, setPinnedDirectories, setPinnedDirsLoaded, setFavoriteModels, setWorkspaces, setWorkspacesLoaded, setTerminals,
     setDiscoveredServers, setSpawnErrors, setResumeErrors,
-    setDisplayPrefs, setLoadingHistory, setCanvasMap,
+    setDisplayPrefs, setLoadingHistory, setHistoryWindows, setCanvasMap,
   } = setters;
   const { send, navigate, clearSpawningCwd, spawningCwdsRef, subscribedRef, pendingTerminalCwdRef, lastCreatedTerminalIdRef, maxSeqMapRef, selectedSessionIdRef, pendingSpawnsRef, loadingHistoryTimersRef, replayPersister, showToast } = deps;
   // One-shot per session: suppress a repeat auto-name toast for the same
@@ -788,6 +790,14 @@ export function useMessageHandler(
         } else if (msg.events.length === 0) {
           rearmLoadingHistory(setLoadingHistory, loadingHistoryTimersRef, msg.sessionId, HYDRATE_CEILING_MS);
         }
+        if (msg.isLast) {
+          setHistoryWindows?.((prev) => {
+            const next = new Map(prev);
+            if (msg.historyWindow) next.set(msg.sessionId, msg.historyWindow);
+            else next.delete(msg.sessionId);
+            return next;
+          });
+        }
         break;
       }
 
@@ -1216,5 +1226,5 @@ export function useMessageHandler(
         break;
       }
     }
-  }, [send, clearSpawningCwd, navigate, setSessions, setSessionStates, setSessionCommands, setFileResults, setChangedOnDisk, setOpenspecMap, setModelsMap, setRolesMap, setSpawnResult, setSessionOrderMap, setPinnedDirectories, setPinnedDirsLoaded, setFavoriteModels, setWorkspaces, setWorkspacesLoaded, setTerminals, setDiscoveredServers, setLoadingHistory, setCanvasMap, spawningCwdsRef, subscribedRef, pendingTerminalCwdRef, maxSeqMapRef, selectedSessionIdRef, loadingHistoryTimersRef, replayPersister, flushLiveEvents, scheduleLiveFlush, flushReplayEvents, scheduleReplayFlush]);
+  }, [send, clearSpawningCwd, navigate, setSessions, setSessionStates, setSessionCommands, setFileResults, setChangedOnDisk, setOpenspecMap, setModelsMap, setRolesMap, setSpawnResult, setSessionOrderMap, setPinnedDirectories, setPinnedDirsLoaded, setFavoriteModels, setWorkspaces, setWorkspacesLoaded, setTerminals, setDiscoveredServers, setLoadingHistory, setHistoryWindows, setCanvasMap, spawningCwdsRef, subscribedRef, pendingTerminalCwdRef, maxSeqMapRef, selectedSessionIdRef, loadingHistoryTimersRef, replayPersister, flushLiveEvents, scheduleLiveFlush, flushReplayEvents, scheduleReplayFlush]);
 }

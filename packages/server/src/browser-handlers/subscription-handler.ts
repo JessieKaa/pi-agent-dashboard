@@ -2,12 +2,17 @@
  * Subscription message handlers: subscribe, unsubscribe.
  */
 
-import type { BrowserToServerMessage, ServerToBrowserMessage } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
+import type {
+  BrowserToServerMessage,
+  HistoryWindowMetadata,
+  ServerToBrowserMessage,
+} from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
 import type { WebSocket } from "ws";
 import { extractStatsFromEvents } from "../session/event-status-extraction.js";
 import type { StoredEvent } from "../persistence/memory-event-store.js";
 import { pluginIntentCache } from "../plugin-intent-cache.js";
 import { compactReplayEvents } from "../session/replay-compact.js";
+import { selectReplayWindow } from "../session/replay-window.js";
 import { truncateToolResultForReplay } from "../session/replay-truncate.js";
 import type { BrowserHandlerContext } from "./handler-context.js";
 
@@ -25,6 +30,43 @@ const BACKPRESSURE_THRESHOLD = 1_024 * 1_024;
  */
 const HYDRATE_HEARTBEAT_MS = 10000;
 
+const subscriptionHistoryWindows = new WeakMap<
+  WebSocket,
+  Map<
+    string,
+    {
+      historyWindow: NonNullable<
+        Extract<BrowserToServerMessage, { type: "subscribe" }>["historyWindow"]
+      >;
+      lastSeq: number;
+    }
+  >
+>();
+
+function rememberHistoryWindow(
+  ws: WebSocket,
+  sessionId: string,
+  historyWindow: Extract<BrowserToServerMessage, { type: "subscribe" }>["historyWindow"],
+  lastSeq: number,
+): void {
+  const windows = subscriptionHistoryWindows.get(ws);
+  if (!historyWindow) {
+    windows?.delete(sessionId);
+    return;
+  }
+  const next = windows ?? new Map();
+  next.set(sessionId, { historyWindow, lastSeq });
+  subscriptionHistoryWindows.set(ws, next);
+}
+
+export function forgetHistoryWindow(ws: WebSocket, sessionId: string): void {
+  subscriptionHistoryWindows.get(ws)?.delete(sessionId);
+}
+
+function historyWindowFor(ws: WebSocket, sessionId: string) {
+  return subscriptionHistoryWindows.get(ws)?.get(sessionId);
+}
+
 /**
  * Send stored events to a WebSocket in batches with backpressure handling.
  * Yields between batches to let the event loop flush data and avoid OOM.
@@ -38,9 +80,20 @@ async function sendEventBatches(
   sessionId: string,
   stored: StoredEvent[],
   sendTo: (ws: WebSocket, msg: ServerToBrowserMessage) => void,
+  historyWindow?: HistoryWindowMetadata,
 ): Promise<number> {
-  const lastSent = stored.length > 0 ? stored[stored.length - 1].seq : 0;
+  const lastSent = stored.length > 0 ? stored[stored.length - 1].seq : historyWindow?.endSeq ?? 0;
   const events = compactReplayEvents(stored);
+  if (events.length === 0) {
+    sendTo(ws, {
+      type: "event_replay",
+      sessionId,
+      events: [],
+      isLast: true,
+      ...(historyWindow ? { historyWindow } : {}),
+    });
+    return lastSent;
+  }
   for (let i = 0; i < events.length; i += REPLAY_BATCH_SIZE) {
     if (ws.readyState !== ws.OPEN) return 0;
     const batch = events.slice(i, i + REPLAY_BATCH_SIZE);
@@ -53,6 +106,7 @@ async function sendEventBatches(
       // results and non-tool events pass through untouched.
       events: batch.map((e) => ({ seq: e.seq, event: truncateToolResultForReplay(e.event) })),
       isLast: i + REPLAY_BATCH_SIZE >= events.length,
+      ...(historyWindow && i + REPLAY_BATCH_SIZE >= events.length ? { historyWindow } : {}),
     });
     // Yield to event loop between batches to allow GC and buffer flushing
     if (ws.bufferedAmount > BACKPRESSURE_THRESHOLD) {
@@ -172,6 +226,7 @@ export function handleSubscribe(
 ): void {
   const { ws, sessionManager, eventStore, directoryService, piGateway, sendTo, broadcast, getSubscribers, replayPendingUiRequests, markReplaying, clearReplaying } = ctx;
   subs.add(msg.sessionId);
+  rememberHistoryWindow(ws, msg.sessionId, msg.historyWindow, msg.lastSeq ?? 0);
 
   // Request metadata from the extension so commands/flows/models/roles arrive
   // while the browser is actually subscribed (responses use sendToSubscribers).
@@ -184,6 +239,31 @@ export function handleSubscribe(
   if (eventStore.hasEvents(msg.sessionId)) {
     const lastSeq = msg.lastSeq ?? 0;
     const maxSeq = eventStore.getMaxSeq(msg.sessionId);
+    const requestedWindow = msg.historyWindow?.messages;
+    const selection = requestedWindow
+      ? selectReplayWindow(eventStore.getEvents(msg.sessionId, 1), requestedWindow)
+      : null;
+
+    if (selection) {
+      const firstSeq = msg.historyWindow?.firstSeq;
+      const boundaryMatches = firstSeq != null && firstSeq === selection.metadata.startSeq;
+      const cursorFits = lastSeq <= selection.metadata.endSeq;
+      const canDelta = boundaryMatches && cursorFits;
+      if (!canDelta) {
+        sendTo(ws, { type: "session_state_reset", sessionId: msg.sessionId });
+      }
+      const events = canDelta
+        ? selection.events.filter((event) => event.seq > lastSeq)
+        : selection.events;
+      replaySessionAssets(ws, msg.sessionId, ctx);
+      markReplaying(ws, msg.sessionId);
+      sendEventBatches(ws, msg.sessionId, events, sendTo, selection.metadata).then((lastSent) => {
+        clearReplaying(ws, msg.sessionId, lastSent);
+        replayPendingUiRequests(ws, msg.sessionId);
+        replayUiState(ws, msg.sessionId, ctx);
+      });
+      return;
+    }
 
     // Stale lastSeq: client has higher seq than server (e.g. server restarted)
     if (lastSeq > 0 && lastSeq > maxSeq) {
@@ -278,7 +358,28 @@ export function handleSubscribe(
           for (const sub of subscribers) {
             // Asset registry first — see change: chat-markdown-local-images-and-math.
             replaySessionAssets(sub, msg.sessionId, ctx);
-            await sendEventBatches(sub, msg.sessionId, stored, sendTo);
+            const preference = historyWindowFor(sub, msg.sessionId);
+            const selection = preference
+              ? selectReplayWindow(stored, preference.historyWindow.messages)
+              : null;
+            if (selection && preference) {
+              const boundaryMatches =
+                preference.historyWindow.firstSeq != null &&
+                preference.historyWindow.firstSeq === selection.metadata.startSeq;
+              const cursorFits = preference.lastSeq <= selection.metadata.endSeq;
+              if (!boundaryMatches || !cursorFits) {
+                sendTo(sub, { type: "session_state_reset", sessionId: msg.sessionId });
+              }
+            }
+            markReplaying(sub, msg.sessionId);
+            const lastSent = await sendEventBatches(
+              sub,
+              msg.sessionId,
+              selection?.events ?? stored,
+              sendTo,
+              selection?.metadata,
+            );
+            clearReplaying(sub, msg.sessionId, lastSent);
             replayPendingUiRequests(sub, msg.sessionId);
             replayUiState(sub, msg.sessionId, ctx);
           }

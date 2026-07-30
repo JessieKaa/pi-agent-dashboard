@@ -1,3 +1,4 @@
+import type { HistoryWindowMetadata } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
 import type { OpenSpecArtifact } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import { mdiRefresh } from "@mdi/js";
 import { Icon } from "@mdi/react";
@@ -587,6 +588,7 @@ export default function App() {
   // and the first content / terminal / failure / timeout. Drives the
   // ChatView loading indicator. See change: show-chat-history-loading-indicator.
   const [loadingHistory, setLoadingHistory] = useState<Map<string, boolean>>(new Map());
+  const [historyWindows, setHistoryWindows] = useState<Map<string, HistoryWindowMetadata>>(new Map());
   const loadingHistoryTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   // After overlay-url-routing: shell overlays are URL-driven via the
   // useRoute matches declared above. `previewState`, `specsBrowserCwd`,
@@ -630,6 +632,7 @@ export default function App() {
           // with a stale maxSeq against the now-empty sessionStates map.
           maxSeqMapRef.current.clear();
           rehydratedRef.current.clear();
+          setHistoryWindows(new Map());
           // A recovery offer is scoped to one server boot; drop it so a
           // stale offer from server A can't reopen IDs on server B.
           // See change: reopen-sessions-after-shutdown.
@@ -732,8 +735,18 @@ export default function App() {
     );
   }, []);
 
+  const loadFullHistory = useCallback(() => {
+    if (!selectedId || status !== "connected") return;
+    beginLoadingHistory(selectedId);
+    send({
+      type: "subscribe",
+      sessionId: selectedId,
+      lastSeq: 0,
+    });
+  }, [beginLoadingHistory, selectedId, send, status]);
+
   const handleMessage = useMessageHandler(
-    { setSessions, setSessionStates, setSessionCommands, setFileResults, setChangedOnDisk, setOpenspecMap, setFolderGitMap, setOpenspecGroupsMap, setModelsMap, setRolesMap, setSpawnResult, setSessionOrderMap, setPinnedDirectories, setPinnedDirsLoaded, setFavoriteModels, setWorkspaces, setWorkspacesLoaded, setTerminals, setDiscoveredServers, setSpawnErrors, setResumeErrors, setDisplayPrefs, setLoadingHistory, setCanvasMap },
+    { setSessions, setSessionStates, setSessionCommands, setFileResults, setChangedOnDisk, setOpenspecMap, setFolderGitMap, setOpenspecGroupsMap, setModelsMap, setRolesMap, setSpawnResult, setSessionOrderMap, setPinnedDirectories, setPinnedDirsLoaded, setFavoriteModels, setWorkspaces, setWorkspacesLoaded, setTerminals, setDiscoveredServers, setSpawnErrors, setResumeErrors, setDisplayPrefs, setLoadingHistory, setHistoryWindows, setCanvasMap },
     { send, navigate, clearSpawningCwd, spawningCwdsRef, subscribedRef, pendingTerminalCwdRef, lastCreatedTerminalIdRef, maxSeqMapRef, selectedSessionIdRef, pendingSpawnsRef, cwdVisibilityInputsRef, loadingHistoryTimersRef, replayPersister: replayPersisterRef.current, showToast },
   );
 
@@ -895,8 +908,13 @@ export default function App() {
       // Send subscribe with the resolved cursor, enter LOADING, and request
       // models if missing. Extracted so the cache-rehydrate path can call it
       // after the async IndexedDB read resolves.
-      const doSubscribe = (lastSeq: number) => {
-        send({ type: "subscribe", sessionId: sid, lastSeq });
+      const doSubscribe = (lastSeq: number, firstSeq?: number) => {
+        send({
+          type: "subscribe",
+          sessionId: sid,
+          lastSeq,
+          historyWindow: { messages: 200, ...(firstSeq != null ? { firstSeq } : {}) },
+        });
         // Enter LOADING. Covers warm (in-memory replay / reconnect re-subscribe)
         // and cold (disk-load) paths uniformly, since the warm path never sends
         // an empty `isLast:false` start marker.
@@ -926,7 +944,7 @@ export default function App() {
               });
               if (!maxSeqMapRef.current.has(sid)) maxSeqMapRef.current.set(sid, r.lastSeq);
               replayPersisterRef.current.seed(sid, r.events);
-              doSubscribe(maxSeqMapRef.current.get(sid) ?? r.lastSeq);
+              doSubscribe(maxSeqMapRef.current.get(sid) ?? r.lastSeq, r.events[0]?.seq);
             } else {
               doSubscribe(0);
             }
@@ -1626,7 +1644,7 @@ export default function App() {
             </div>
           }>
             <SessionAssetsProvider assets={selectedSession?.assets}>
-            <ChatView ref={chatViewRef} sessionId={selectedId} state={selectedState} toolContext={toolContext} onRespondToUi={handleRespondToUi} onAbort={handleAbort} onForceKill={handleForceKill} onForkFromMessage={selectedId ? handleForkFromMessage : undefined} onCloseInlineTerminal={selectedId ? handleCloseInlineTerminalForSelected : undefined} pendingSteering={selectedSession?.pendingQueues?.steering ?? EMPTY_STEERING} loadingHistory={selectedId ? loadingHistory.get(selectedId) ?? false : false} onCollapseStreamingThinking={selectedId ? handleCollapseStreamingThinking : undefined} />
+            <ChatView ref={chatViewRef} sessionId={selectedId} state={selectedState} toolContext={toolContext} onRespondToUi={handleRespondToUi} onAbort={handleAbort} onForceKill={handleForceKill} onForkFromMessage={selectedId ? handleForkFromMessage : undefined} onCloseInlineTerminal={selectedId ? handleCloseInlineTerminalForSelected : undefined} pendingSteering={selectedSession?.pendingQueues?.steering ?? EMPTY_STEERING} loadingHistory={selectedId ? loadingHistory.get(selectedId) ?? false : false} historyWindow={selectedId ? historyWindows.get(selectedId) : undefined} onLoadFullHistory={selectedId ? loadFullHistory : undefined} onCollapseStreamingThinking={selectedId ? handleCollapseStreamingThinking : undefined} />
             </SessionAssetsProvider>
           </ErrorBoundary>
           {/* Single-card error-lifecycle surface. Sticky above the command

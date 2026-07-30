@@ -77,6 +77,8 @@ interface Props {
    * session. See change: show-chat-history-loading-indicator.
    */
   loadingHistory?: boolean;
+  historyWindow?: import("@blackbelt-technology/pi-dashboard-shared/browser-protocol.js").HistoryWindowMetadata;
+  onLoadFullHistory?: () => void;
   /**
    * Client-only signal: the user manually collapsed the LIVE streaming
    * reasoning block. Sets `streamingThinkingCollapsed` on the session state so
@@ -238,7 +240,7 @@ export interface ChatViewHandle {
   scrollToTurn: (turnIndex: number) => void;
 }
 
-const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sessionId, state, toolContext, onRespondToUi, onAbort, onForceKill, onForkFromMessage, onCloseInlineTerminal, pendingSteering, loadingHistory, onCollapseStreamingThinking }, ref) {
+const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sessionId, state, toolContext, onRespondToUi, onAbort, onForceKill, onForkFromMessage, onCloseInlineTerminal, pendingSteering, loadingHistory, historyWindow, onLoadFullHistory, onCollapseStreamingThinking }, ref) {
   const scrollRef = useRef<HTMLDivElement>(null);
   // True when the user wants the chat to chase new content. Flips to false on
   // any real scroll-up gesture, on explicit navigation (scrollToTurn), and on
@@ -778,6 +780,21 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
         each synchronous measurement correction and race the next, reintroducing
         the scroll-to-top drift. See change: fix-chat-scroll-to-top-estimate-drift. */}
     <div ref={scrollRef} onScroll={handleScroll} onCopy={handleCopy} onWheel={cancelDescent} onTouchMove={cancelDescent} style={{ overflowAnchor: "none" }} data-testid="chat-scroll-container" className={`chat-cv h-full overflow-y-auto ${isMobile ? "p-2" : "p-4"}`}>
+      {historyWindow?.hasOlder && onLoadFullHistory && (
+        <div className="mb-3 flex justify-center" data-testid="history-window-control">
+          <button
+            type="button"
+            onClick={onLoadFullHistory}
+            disabled={loadingHistory}
+            data-testid="load-full-history"
+            className="rounded-full border border-[var(--border-secondary)] bg-[var(--bg-secondary)] px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-50"
+          >
+            {loadingHistory
+              ? i18nT("session.loadingFullHistory", undefined, "Loading full history…")
+              : i18nT("session.loadFullHistory", undefined, "Load full history")}
+          </button>
+        </div>
+      )}
       {/* Windowed historical rows (TanStack Virtual): only viewport + overscan
           are mounted. The spacer reserves getTotalSize(); each row is absolutely
           positioned + re-measured on mount. chat-cv-skip keeps Step A's
