@@ -8,8 +8,8 @@
  * reconnect's first batch may not start at `seq=1`.
  */
 
-import { describe, it, expect, vi } from "vitest";
-import { renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
 import { useMessageHandler } from "../useMessageHandler.js";
 import { createInitialState, type SessionState } from "../../lib/chat/event-reducer.js";
 import type { DashboardEvent } from "@blackbelt-technology/pi-dashboard-shared/types.js";
@@ -24,6 +24,12 @@ function makeStartEvt(toolCallId: string, ts: number): DashboardEvent {
 }
 
 function setup() {
+  const rafCallbacks: FrameRequestCallback[] = [];
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    rafCallbacks.push(callback);
+    return rafCallbacks.length;
+  });
+  vi.stubGlobal("cancelAnimationFrame", vi.fn());
   const sessionStatesRef = { current: new Map<string, SessionState>() };
   const maxSeqMap = new Map<string, number>();
 
@@ -70,8 +76,14 @@ function setup() {
 
   const { result } = renderHook(() => useMessageHandler(setters, deps));
   const dispatch = (msg: ServerToBrowserMessage) => result.current(msg);
+  const flushReplay = () => {
+    const callbacks = rafCallbacks.splice(0);
+    act(() => {
+      for (const callback of callbacks) callback(performance.now());
+    });
+  };
 
-  return { dispatch, sessionStatesRef, maxSeqMap };
+  return { dispatch, flushReplay, sessionStatesRef, maxSeqMap };
 }
 
 function replayMsg(sid: string, seqStart: number, events: DashboardEvent[]): ServerToBrowserMessage {
@@ -85,11 +97,15 @@ function replayMsg(sid: string, seqStart: number, events: DashboardEvent[]): Ser
 describe("useMessageHandler event_replay reset trigger", () => {
   const SID = "session-1";
 
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
   it("first replay (firstSeq=1) resets state and reduces events", () => {
-    const { dispatch, sessionStatesRef } = setup();
+    const { dispatch, flushReplay, sessionStatesRef } = setup();
     const events = [makeStartEvt("t1", 100), makeStartEvt("t2", 200)];
 
     dispatch(replayMsg(SID, 1, events));
+    flushReplay();
 
     const state = sessionStatesRef.current.get(SID);
     expect(state).toBeDefined();
@@ -97,23 +113,26 @@ describe("useMessageHandler event_replay reset trigger", () => {
   });
 
   it("replaying the same firstSeq=1 batch twice does NOT double messages[]", () => {
-    const { dispatch, sessionStatesRef } = setup();
+    const { dispatch, flushReplay, sessionStatesRef } = setup();
     const events = [makeStartEvt("t1", 100), makeStartEvt("t2", 200)];
 
     dispatch(replayMsg(SID, 1, events));
+    flushReplay();
     const lengthAfterFirst = sessionStatesRef.current.get(SID)!.messages.length;
 
     dispatch(replayMsg(SID, 1, events));
+    flushReplay();
     const lengthAfterSecond = sessionStatesRef.current.get(SID)!.messages.length;
 
     expect(lengthAfterSecond).toBe(lengthAfterFirst);
   });
 
   it("re-replay starting mid-stream (firstSeq <= maxSeq) resets and reduces from scratch", () => {
-    const { dispatch, sessionStatesRef } = setup();
+    const { dispatch, flushReplay, sessionStatesRef } = setup();
     // First connection: full replay 1..3
     const events1to3 = [makeStartEvt("t1", 100), makeStartEvt("t2", 200), makeStartEvt("t3", 300)];
     dispatch(replayMsg(SID, 1, events1to3));
+    flushReplay();
     expect(sessionStatesRef.current.get(SID)!.messages.filter((m) => m.role === "toolResult")).toHaveLength(3);
 
     // Reconnect: server sends a paginated re-replay starting at seq=2
@@ -121,6 +140,7 @@ describe("useMessageHandler event_replay reset trigger", () => {
     // 2 → 2 <= 3, must reset.
     const events2to3 = [makeStartEvt("t2", 200), makeStartEvt("t3", 300)];
     dispatch(replayMsg(SID, 2, events2to3));
+    flushReplay();
 
     const tools = sessionStatesRef.current.get(SID)!.messages.filter((m) => m.role === "toolResult");
     // After reset + reduce of 2 events, we expect exactly 2 tool rows
@@ -130,13 +150,15 @@ describe("useMessageHandler event_replay reset trigger", () => {
   });
 
   it("genuine tail extension (firstSeq > maxSeq) preserves state and appends", () => {
-    const { dispatch, sessionStatesRef } = setup();
+    const { dispatch, flushReplay, sessionStatesRef } = setup();
     const events1to2 = [makeStartEvt("t1", 100), makeStartEvt("t2", 200)];
     dispatch(replayMsg(SID, 1, events1to2));
+    flushReplay();
 
     // Tail batch — strictly new events, no overlap
     const events3to4 = [makeStartEvt("t3", 300), makeStartEvt("t4", 400)];
     dispatch(replayMsg(SID, 3, events3to4));
+    flushReplay();
 
     const tools = sessionStatesRef.current.get(SID)!.messages.filter((m) => m.role === "toolResult");
     expect(tools).toHaveLength(4);
@@ -144,8 +166,9 @@ describe("useMessageHandler event_replay reset trigger", () => {
   });
 
   it("empty replay preserves state", () => {
-    const { dispatch, sessionStatesRef } = setup();
+    const { dispatch, flushReplay, sessionStatesRef } = setup();
     dispatch(replayMsg(SID, 1, [makeStartEvt("t1", 100)]));
+    flushReplay();
     const before = sessionStatesRef.current.get(SID)!;
 
     dispatch({ type: "event_replay", sessionId: SID, events: [] } as any);

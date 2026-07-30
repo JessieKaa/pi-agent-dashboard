@@ -26,6 +26,13 @@ import { clearRecoveryOffer, setRecoveryOffer } from "../lib/state/recovery-offe
 import { pushSpawnErrorToast } from "../lib/state/spawn-error-toast-bus.js";
 import { isVisibleCwd } from "../lib/util/cwd-visibility.js";
 
+type ReplayEvent = Extract<ServerToBrowserMessage, { type: "event_replay" }>["events"][number];
+
+interface QueuedReplayBatch {
+  events: ReplayEvent[];
+  shouldReset: boolean;
+}
+
 /**
  * Rich spawn error detail stored per cwd.
  * `kind: "error"` is a normal spawn failure; `kind: "timeout"` is a
@@ -239,20 +246,112 @@ export function useMessageHandler(
     }
   }, [flushLiveEvents]);
 
+  const replayQueueRef = useRef<Map<string, QueuedReplayBatch[]>>(new Map());
+  const replayFlushRafRef = useRef<number | null>(null);
+  const replayFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flushReplayEvents = useCallback((sessionId?: string) => {
+    const queues = replayQueueRef.current;
+    const drained = new Map<string, QueuedReplayBatch[]>();
+    if (sessionId != null) {
+      const batches = queues.get(sessionId);
+      if (!batches) return;
+      drained.set(sessionId, batches);
+      queues.delete(sessionId);
+      if (queues.size === 0) {
+        if (replayFlushRafRef.current != null && typeof cancelAnimationFrame === "function") {
+          cancelAnimationFrame(replayFlushRafRef.current);
+          replayFlushRafRef.current = null;
+        }
+        if (replayFlushTimerRef.current != null) {
+          clearTimeout(replayFlushTimerRef.current);
+          replayFlushTimerRef.current = null;
+        }
+      }
+    } else {
+      if (replayFlushRafRef.current != null && typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(replayFlushRafRef.current);
+        replayFlushRafRef.current = null;
+      }
+      if (replayFlushTimerRef.current != null) {
+        clearTimeout(replayFlushTimerRef.current);
+        replayFlushTimerRef.current = null;
+      }
+      if (queues.size === 0) return;
+      for (const entry of queues) drained.set(...entry);
+      queues.clear();
+    }
+    setSessionStates((prev) => {
+      let next: Map<string, SessionState> | null = null;
+      for (const [sessionId, batches] of drained) {
+        if (batches.length === 0) continue;
+        const base = next ?? prev;
+        let current = base.get(sessionId) ?? createInitialState();
+        for (const batch of batches) {
+          if (batch.shouldReset) {
+            const carry = current.pendingPrompt;
+            current = createInitialState();
+            if (carry) current.pendingPrompt = carry;
+          }
+          for (const { event } of batch.events) {
+            current = reduceEvent(current, event);
+          }
+        }
+        if (!next) next = new Map(prev);
+        next.set(sessionId, current);
+      }
+      return next ?? prev;
+    });
+    for (const sessionId of drained.keys()) {
+      clearLoadingHistory(setLoadingHistory, loadingHistoryTimersRef, sessionId);
+    }
+  }, [loadingHistoryTimersRef, setLoadingHistory, setSessionStates]);
+
+  const scheduleReplayFlush = useCallback(() => {
+    if (replayFlushRafRef.current != null || replayFlushTimerRef.current != null) return;
+    if (typeof document !== "undefined" && document.hidden) {
+      replayFlushTimerRef.current = setTimeout(() => {
+        replayFlushTimerRef.current = null;
+        flushReplayEvents();
+      }, 0);
+    } else if (typeof requestAnimationFrame === "function") {
+      replayFlushRafRef.current = requestAnimationFrame(() => {
+        replayFlushRafRef.current = null;
+        flushReplayEvents();
+      });
+    } else {
+      replayFlushTimerRef.current = setTimeout(() => {
+        replayFlushTimerRef.current = null;
+        flushReplayEvents();
+      }, 0);
+    }
+  }, [flushReplayEvents]);
+
   useEffect(
     () => () => {
-      if (flushRafRef.current != null) cancelAnimationFrame(flushRafRef.current);
+      if (flushRafRef.current != null && typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(flushRafRef.current);
+      }
       if (flushTimerRef.current != null) clearTimeout(flushTimerRef.current);
+      if (replayFlushRafRef.current != null && typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(replayFlushRafRef.current);
+      }
+      if (replayFlushTimerRef.current != null) clearTimeout(replayFlushTimerRef.current);
+      liveQueueRef.current.clear();
+      replayQueueRef.current.clear();
     },
     [],
   );
 
   return useCallback((msg: ServerToBrowserMessage) => {
-    // Preserve strict ordering: any queued live events must apply before a
-    // non-`event` message can mutate the same session's state (reset, replay,
-    // interactive request, removal). Draining here keeps coalescing on the hot
-    // path (consecutive `event` bursts) while guaranteeing correctness.
-    if (msg.type !== "event" && liveQueueRef.current.size > 0) flushLiveEvents();
+    if (msg.type === "event_replay") {
+      if (liveQueueRef.current.size > 0) flushLiveEvents();
+    } else if (msg.type === "event") {
+      if (replayQueueRef.current.has(msg.sessionId)) flushReplayEvents(msg.sessionId);
+    } else {
+      if (liveQueueRef.current.size > 0) flushLiveEvents();
+      if (replayQueueRef.current.size > 0) flushReplayEvents();
+    }
     switch (msg.type) {
       case "session_added":
         setSessions((prev) => {
@@ -637,20 +736,13 @@ export function useMessageHandler(
         // See change: fix-replay-duplicates-tool-and-flushed-rows.
         const maxSeq = maxSeqMapRef.current.get(msg.sessionId) ?? 0;
         const shouldReset = firstSeq != null && (firstSeq === 1 || firstSeq <= maxSeq);
-        setSessionStates((prev) => {
-          const next = new Map(prev);
-          // Same rationale as session_state_reset: preserve optimistic
-          // pendingPrompt across the full-replay reset branch.
-          // See change: preserve-pending-prompt-across-replay.
-          const carry = shouldReset ? next.get(msg.sessionId)?.pendingPrompt : undefined;
-          let current = shouldReset ? createInitialState() : (next.get(msg.sessionId) ?? createInitialState());
-          if (carry) current.pendingPrompt = carry;
-          for (const { event } of msg.events) {
-            current = reduceEvent(current, event);
-          }
-          next.set(msg.sessionId, current);
-          return next;
-        });
+        if (msg.events.length > 0) {
+          const queued = replayQueueRef.current.get(msg.sessionId);
+          const batch = { events: msg.events, shouldReset };
+          if (queued) queued.push(batch);
+          else replayQueueRef.current.set(msg.sessionId, [batch]);
+          scheduleReplayFlush();
+        }
         // Mirror the replayed batch into the plugin-runtime per-session event
         // store so plugin slot consumers (flows card, goal chip) reading
         // `useSessionEvents` rehydrate on cold load — the live `event` path
@@ -681,19 +773,19 @@ export function useMessageHandler(
           if (shouldReset) replayPersister?.seed(msg.sessionId, msg.events);
           else replayPersister?.record(msg.sessionId, msg.events);
         }
-        // Exit LOADING: first content (clear immediately so partial history
-        // paints) OR terminal marker for a genuinely-empty session
+        // Exit LOADING when queued replay state is published, or immediately
+        // for a terminal marker from a genuinely-empty session
         // (`events:[], isLast:true` → falls through to "No messages yet").
-        // Else — the empty non-terminal marker (`events:[], isLast:false`) is the
+        // The empty non-terminal marker (`events:[], isLast:false`) is the
         // cold-hydration start marker AND every server heartbeat: re-arm the
         // short subscribe window to the longer hydration ceiling so a slow disk
         // parse never flashes "No messages yet". `rearmLoadingHistory` no-ops
         // unless a timer is armed (flag set), so warm/painted sessions are
         // unaffected. See change: show-chat-history-loading-indicator,
         // fix-history-loading-false-empty-flash.
-        if (msg.events.length > 0 || msg.isLast === true) {
+        if (msg.events.length === 0 && msg.isLast === true) {
           clearLoadingHistory(setLoadingHistory, loadingHistoryTimersRef, msg.sessionId);
-        } else {
+        } else if (msg.events.length === 0) {
           rearmLoadingHistory(setLoadingHistory, loadingHistoryTimersRef, msg.sessionId, HYDRATE_CEILING_MS);
         }
         break;
@@ -1124,5 +1216,5 @@ export function useMessageHandler(
         break;
       }
     }
-  }, [send, clearSpawningCwd, navigate, setSessions, setSessionStates, setSessionCommands, setFileResults, setChangedOnDisk, setOpenspecMap, setModelsMap, setRolesMap, setSpawnResult, setSessionOrderMap, setPinnedDirectories, setPinnedDirsLoaded, setFavoriteModels, setWorkspaces, setWorkspacesLoaded, setTerminals, setDiscoveredServers, setLoadingHistory, setCanvasMap, spawningCwdsRef, subscribedRef, pendingTerminalCwdRef, maxSeqMapRef, selectedSessionIdRef, loadingHistoryTimersRef, replayPersister, flushLiveEvents, scheduleLiveFlush]);
+  }, [send, clearSpawningCwd, navigate, setSessions, setSessionStates, setSessionCommands, setFileResults, setChangedOnDisk, setOpenspecMap, setModelsMap, setRolesMap, setSpawnResult, setSessionOrderMap, setPinnedDirectories, setPinnedDirsLoaded, setFavoriteModels, setWorkspaces, setWorkspacesLoaded, setTerminals, setDiscoveredServers, setLoadingHistory, setCanvasMap, spawningCwdsRef, subscribedRef, pendingTerminalCwdRef, maxSeqMapRef, selectedSessionIdRef, loadingHistoryTimersRef, replayPersister, flushLiveEvents, scheduleLiveFlush, flushReplayEvents, scheduleReplayFlush]);
 }

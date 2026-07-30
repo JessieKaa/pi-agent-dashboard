@@ -13,7 +13,7 @@
 
 import type { ServerToBrowserMessage } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
 import type { DashboardEvent } from "@blackbelt-technology/pi-dashboard-shared/types.js";
-import { renderHook } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearLoadingHistory, HYDRATE_CEILING_MS, SUBSCRIBE_ACK_MS } from "../../lib/replay/loading-history.js";
 import { useMessageHandler } from "../useMessageHandler.js";
@@ -27,6 +27,12 @@ function makeEvt(toolCallId: string, ts: number): DashboardEvent {
 }
 
 function setup() {
+  const rafCallbacks: FrameRequestCallback[] = [];
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    rafCallbacks.push(callback);
+    return rafCallbacks.length;
+  });
+  vi.stubGlobal("cancelAnimationFrame", vi.fn());
   const loadingHistoryRef = { current: new Map<string, boolean>() };
   const timersRef = { current: new Map<string, ReturnType<typeof setTimeout>>() };
 
@@ -71,14 +77,20 @@ function setup() {
 
   const { result } = renderHook(() => useMessageHandler(setters, deps));
   const dispatch = (msg: ServerToBrowserMessage) => result.current(msg);
-  return { dispatch, loadingHistoryRef, timersRef, setLoadingHistory };
+  const flushReplay = () => {
+    const callbacks = rafCallbacks.splice(0);
+    act(() => {
+      for (const callback of callbacks) callback(performance.now());
+    });
+  };
+  return { dispatch, flushReplay, loadingHistoryRef, timersRef, setLoadingHistory };
 }
 
 describe("useMessageHandler loading-history exit edges", () => {
   const SID = "session-1";
 
-  it("non-empty event_replay batch clears the loading flag and its timer", () => {
-    const { dispatch, loadingHistoryRef, timersRef } = setup();
+  it("non-empty event_replay batch clears loading when replay state flushes", () => {
+    const { dispatch, flushReplay, loadingHistoryRef, timersRef } = setup();
     loadingHistoryRef.current.set(SID, true);
     timersRef.current.set(SID, setTimeout(() => {}, 99999));
 
@@ -88,6 +100,11 @@ describe("useMessageHandler loading-history exit edges", () => {
       events: [{ seq: 1, event: makeEvt("t1", 100) }],
       isLast: false,
     } as ServerToBrowserMessage);
+
+    expect(loadingHistoryRef.current.get(SID)).toBe(true);
+    expect(timersRef.current.has(SID)).toBe(true);
+
+    flushReplay();
 
     expect(loadingHistoryRef.current.get(SID)).toBe(false);
     expect(timersRef.current.has(SID)).toBe(false);
@@ -174,12 +191,14 @@ describe("useMessageHandler two-stage safety net (re-arm)", () => {
   } as ServerToBrowserMessage;
 
   it("4.1 cold path: priming marker keeps flag set past 15s; content clears", () => {
-    const { dispatch, loadingHistoryRef, setLoadingHistory, timersRef } = setup();
+    const { dispatch, flushReplay, loadingHistoryRef, setLoadingHistory, timersRef } = setup();
     beginLoading(setLoadingHistory, timersRef);
     dispatch(primingMarker);
     vi.advanceTimersByTime(SUBSCRIBE_ACK_MS + 1000);
     expect(loadingHistoryRef.current.get(SID)).toBe(true);
     dispatch(contentBatch);
+    expect(loadingHistoryRef.current.get(SID)).toBe(true);
+    flushReplay();
     expect(loadingHistoryRef.current.get(SID)).toBe(false);
   });
 
@@ -228,10 +247,12 @@ describe("useMessageHandler two-stage safety net (re-arm)", () => {
   });
 
   it("4.6 warm regression: content-only replay clears on first content < 15s", () => {
-    const { dispatch, loadingHistoryRef, setLoadingHistory, timersRef } = setup();
+    const { dispatch, flushReplay, loadingHistoryRef, setLoadingHistory, timersRef } = setup();
     beginLoading(setLoadingHistory, timersRef);
     vi.advanceTimersByTime(5000);
     dispatch(contentBatch);
+    expect(loadingHistoryRef.current.get(SID)).toBe(true);
+    flushReplay();
     expect(loadingHistoryRef.current.get(SID)).toBe(false);
     expect(timersRef.current.has(SID)).toBe(false);
   });

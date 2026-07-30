@@ -963,6 +963,49 @@ describe("CommandInput — steering delivery mode keyboard shortcuts", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
+  it("Enter during IME composition does not send", () => {
+    const onDraftChange = vi.fn();
+    const { textarea, onSend } = renderInput({ draft: "拼音", onDraftChange });
+
+    fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onDraftChange).not.toHaveBeenCalled();
+  });
+
+  it("keyCode 229 during IME composition does not send", () => {
+    const { textarea, onSend } = renderInput({ draft: "拼音", onDraftChange: vi.fn() });
+
+    fireEvent.keyDown(textarea, { key: "Enter", keyCode: 229 });
+
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("sends once after composition ends", () => {
+    const { textarea, onSend } = renderInput({ draft: "中文", onDraftChange: vi.fn() });
+
+    fireEvent.compositionStart(textarea);
+    fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
+    fireEvent.compositionEnd(textarea);
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("中文", undefined, "steer");
+  });
+
+  it("composition Escape does not cancel a pending prompt", () => {
+    const onCancelPending = vi.fn();
+    const { textarea } = renderInput({
+      pendingPrompt: true,
+      sessionStatus: "streaming",
+      onCancelPending,
+    });
+
+    fireEvent.keyDown(textarea, { key: "Escape", isComposing: true });
+
+    expect(onCancelPending).not.toHaveBeenCalled();
+  });
+
   it("Send button click sends with delivery: steer", () => {
     const { container, onSend } = renderInput({
       draft: "hello world",

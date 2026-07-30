@@ -57,7 +57,7 @@ export function parseViewCommand(
   return null;
 }
 
-interface Props {
+export interface CommandInputProps {
   commands: CommandInfo[];
   onSend: (text: string, images?: ImageContent[], delivery?: "steer" | "followUp") => void;
   onListFiles?: (query: string) => void;
@@ -211,7 +211,7 @@ export function shouldWalkFileQuery(query: string): boolean {
 
 type StopState = "idle" | "aborting" | "killing";
 
-export function CommandInput({ commands: externalCommands, onSend, onListFiles, fileResults, disabled, sessionStatus, retrying, onAbort, onForceKill, onStopAfterTurn, pendingPrompt, onCancelPending, sessionId, draft, onDraftChange, history, images, onImagesChange, currentCwd, onViewLocal, onOpenInlineTerminal, sessionMessages, model, models, favorites, onToggleFavorite, thinkingLevel, onSelectModel, onSelectThinkingLevel, onRefreshModels, contextUsage }: Props) {
+export function CommandInput({ commands: externalCommands, onSend, onListFiles, fileResults, disabled, sessionStatus, retrying, onAbort, onForceKill, onStopAfterTurn, pendingPrompt, onCancelPending, sessionId, draft, onDraftChange, history, images, onImagesChange, currentCwd, onViewLocal, onOpenInlineTerminal, sessionMessages, model, models, favorites, onToggleFavorite, thinkingLevel, onSelectModel, onSelectThinkingLevel, onRefreshModels, contextUsage }: CommandInputProps) {
   const { t } = useI18n();
   // Treat retry-sleep as "still working" for Stop/Force-Stop visibility.
   const isWorking = sessionStatus === "streaming" || retrying === true;
@@ -495,6 +495,8 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+
       if (dropdownMode) {
         if (e.key === "ArrowDown") {
           e.preventDefault();

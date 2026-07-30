@@ -8,7 +8,7 @@ import { ArchiveBrowserView } from "./components/openspec/ArchiveBrowserView.js"
 import { CanvasDriver } from "./components/canvas/CanvasDriver.js";
 import { ChatView, type ChatViewHandle } from "./components/chat/ChatView.js";
 import { ChatViewMenu } from "./components/chat/ChatViewMenu.js";
-import { CommandInput } from "./components/chat/CommandInput.js";
+import { SessionCommandInput } from "./components/chat/SessionCommandInput.js";
 import { CommitDialogProvider } from "./components/worktree/CommitDialog.js";
 import { ComposerSessionActions } from "./components/session/ComposerSessionActions.js";
 import { ConnectionStatusBanner } from "./components/connectivity/ConnectionStatusBanner.js";
@@ -66,7 +66,7 @@ import { useStaleToolReconcile } from "./hooks/useStaleToolReconcile.js";
 import { useWebSocket } from "./hooks/useWebSocket.js";
 import { maybeAutoInitWorktreeOnSpawn } from "./lib/git/auto-init-worktree.js";
 import { EMPTY_CANVAS_STATE } from "./lib/canvas/canvas-gate.js";
-import { deleteDraft, readAllDrafts, writeDraft } from "./lib/state/draft-storage.js";
+import { clearDraft } from "./lib/state/draft-store.js";
 // SubagentPopoutPage no longer imported by the shell — it's registered via
 // the subagents-plugin's `shell-overlay-route` claim and mounted through
 // `<ShellOverlayRouteSlot>` below. See change: add-flow-agent-popout.
@@ -485,12 +485,6 @@ export default function App() {
   // `state.messages` by timestamp when passing to ChatView.
   // See change: render-file-previews.
 
-  // Per-session chat-input drafts. Hydrated once from localStorage on mount,
-  // then persisted (debounced) whenever the map changes.
-  const [drafts, setDrafts] = useState<Map<string, string>>(() => readAllDrafts());
-  // Track the previous drafts snapshot so the persist effect can compute a
-  // precise write-set (added/changed keys) and delete-set (removed/emptied keys).
-  const prevDraftsRef = useRef<Map<string, string>>(drafts);
   // Per-session pending pasted-image attachments. Lifted out of
   // useImagePaste's local useState into App so they survive the
   // unmount/remount of <CommandInput> caused by content-area route
@@ -955,8 +949,6 @@ export default function App() {
     ? sessionStates.get(selectedId) ?? createInitialState()
     : createInitialState();
 
-  // Per-session draft text + history recall for CommandInput.
-  const selectedDraft = selectedId ? (drafts.get(selectedId) ?? "") : "";
   // Per-session pending images. Returns the stable EMPTY_IMAGES ref
   // when the session has no entry, so unrelated re-renders don't
   // produce a fresh `[]` and re-render <CommandInput>.
@@ -980,56 +972,6 @@ export default function App() {
       ),
     [selectedState.messages],
   );
-
-  // Debounced persistence for drafts. When the map changes, diff against the
-  // previous snapshot and flush writes/deletes after a short idle window so we
-  // don't hammer localStorage on every keystroke.
-  useEffect(() => {
-    const prev = prevDraftsRef.current;
-    const timer = setTimeout(() => {
-      // Writes: new or changed entries.
-      for (const [sid, text] of drafts) {
-        if (text === "") {
-          // Empty string in the map = cleared draft, treat as delete.
-          if (prev.get(sid) !== undefined) deleteDraft(sid);
-          continue;
-        }
-        if (prev.get(sid) !== text) writeDraft(sid, text);
-      }
-      // Deletes: keys present before but gone now.
-      for (const sid of prev.keys()) {
-        if (!drafts.has(sid)) deleteDraft(sid);
-      }
-      prevDraftsRef.current = drafts;
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [drafts]);
-
-  const setDraftForSelected = useCallback(
-    (text: string) => {
-      if (!selectedId) return;
-      setDrafts((m) => {
-        const existing = m.get(selectedId) ?? "";
-        if (existing === text) return m;
-        const next = new Map(m);
-        next.set(selectedId, text);
-        return next;
-      });
-    },
-    [selectedId],
-  );
-
-  const clearDraftForSession = useCallback((sid: string) => {
-    setDrafts((m) => {
-      if (!m.has(sid)) return m;
-      const next = new Map(m);
-      next.delete(sid);
-      return next;
-    });
-    // Also clear from localStorage eagerly so a reload before the debounce
-    // window fires doesn't resurrect the cleared draft.
-    deleteDraft(sid);
-  }, []);
 
   // Per-session pending-image setter. Mutates pendingImagesMap for the
   // currently selected session. Deletes the entry when `next` is empty
@@ -1201,7 +1143,7 @@ export default function App() {
     // matches the composer button's open path. See change: add-inline-terminal-card.
     if (trimmed === "!!" && selectedId && selectedCwd) {
       handleOpenInlineTerminal(selectedId, selectedCwd);
-      clearDraftForSession(selectedId);
+      clearDraft(selectedId);
       clearImagesForSession(selectedId);
       return;
     }
@@ -1215,7 +1157,7 @@ export default function App() {
       if (match) {
         setExtensionModuleOpen({ sessionId: selectedId, moduleId: match.id });
         if (selectedId) {
-          clearDraftForSession(selectedId);
+          clearDraft(selectedId);
           clearImagesForSession(selectedId);
         }
         return;
@@ -1228,10 +1170,10 @@ export default function App() {
     }
     handleSend(text, images, delivery);
     if (selectedId) {
-      clearDraftForSession(selectedId);
+      clearDraft(selectedId);
       clearImagesForSession(selectedId);
     }
-  }, [handleSend, selectedId, selectedCwd, handleOpenInlineTerminal, clearDraftForSession, clearImagesForSession, sessions, BUILTIN_SLASH_COMMANDS]);
+  }, [handleSend, selectedId, selectedCwd, handleOpenInlineTerminal, clearImagesForSession, sessions, BUILTIN_SLASH_COMMANDS]);
 
   // wrappedHandleAbort removed. The yank-to-draft UX ("restoreQueuedMessages
   // ToEditor" parity) required pi to actually clear its queues on abort, which
@@ -1764,7 +1706,7 @@ export default function App() {
             onPromote={promoteFollowUpEntry}
             onClearAll={() => clearFollowUpEntries("all")}
           />
-          <CommandInput
+          <SessionCommandInput
             commands={selectedCommands}
             onSend={wrappedHandleSend}
             onListFiles={handleListFiles}
@@ -1778,8 +1720,6 @@ export default function App() {
             pendingPrompt={!!selectedState.pendingPrompt}
             onCancelPending={handleCancelPending}
             sessionId={selectedId}
-            draft={selectedDraft}
-            onDraftChange={setDraftForSelected}
             history={selectedHistory}
             images={selectedImages}
             onImagesChange={setImagesForSelected}
