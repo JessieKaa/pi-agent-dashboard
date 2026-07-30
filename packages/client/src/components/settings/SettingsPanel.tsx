@@ -285,7 +285,7 @@ function resolveSettingsPage(raw: string | undefined | null): string | null {
  */
 const BACK_SENTINEL = "@@back";
 
-export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd }: {
+export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd, compactSidebar = false, onCompactSidebarChange }: {
   availableModels?: Array<{ provider: string; id: string }>;
   /** Currently-selected session's cwd — backs the canvas-types project scope. */
   selectedCwd?: string;
@@ -297,6 +297,13 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd 
    * See change: fix-settings-back-to-launching-route.
    */
   onBack?: () => void;
+  /**
+   * Browser-local "compact workspace sidebar" preference, owned by App's
+   * `useSidebarState`. Applied immediately — not part of the config draft /
+   * Save flow. See change: compact-workspace-sidebar.
+   */
+  compactSidebar?: boolean;
+  onCompactSidebarChange?: (compact: boolean) => void;
 }) {
   const { language, setLanguage, t } = useI18n();
   const [, navigate] = useLocation();
@@ -870,6 +877,20 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd 
                     options={LANGUAGE_OPTIONS}
                     onChange={(v) => setLanguage(v as Language)}
                   />
+                  <div className="mt-3 pt-3 border-t border-[var(--border-subtle)] space-y-1.5">
+                    <ToggleField
+                      label={t("settings.compactWorkspaceSidebar", undefined, "Compact workspace sidebar")}
+                      value={compactSidebar}
+                      onChange={(value) => onCompactSidebarChange?.(value)}
+                    />
+                    <p className="text-xs text-[var(--text-tertiary)]">
+                      {t(
+                        "settings.compactWorkspaceSidebarDescription",
+                        undefined,
+                        "Hide folder creation and plugin sections while keeping project, Git, project actions, and session information.",
+                      )}
+                    </p>
+                  </div>
                 </Section>
                 <DisplayPrefsSection />
                 <SettingsSectionSlot tab="general" />

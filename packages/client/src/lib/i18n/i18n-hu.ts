@@ -1183,6 +1183,8 @@ export const huCatalog: Record<string, string> = {
   "settings.inSettingsOrPass": "a Beállításokban vagy add át",
   "settings.interface": "Felület",
   "settings.interfaceDescription": "Válaszd ki az irányítópult felületének nyelvét. A választás ebben a böngészőben mentődik.",
+  "settings.compactWorkspaceSidebar": "Kompakt munkaterület-oldalsáv",
+  "settings.compactWorkspaceSidebarDescription": "Elrejti a mappalétrehozást és a bővítményszakaszokat, miközben megtartja a projekt-, Git-, projektművelet- és munkamenetadatokat.",
   "settings.jitterSeconds060": "Ingadozás (másodperc, 0–60)",
   "settings.keepEditing": "Mégse",
   "settings.keepReasoningOpenUntilTurnEnds": "Az érvelés nyitva tartása a forduló végéig",

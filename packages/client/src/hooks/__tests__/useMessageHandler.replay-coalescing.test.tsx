@@ -168,19 +168,21 @@ describe("useMessageHandler — replay coalescing", () => {
     expect(rafCallbacks).toHaveLength(0);
   });
 
-  it("clears stale history-window metadata after an unwindowed terminal replay", () => {
+  it("preserves history-window metadata across an unwindowed live catch-up replay", () => {
     const { dispatch } = setup();
-    historyWindowsRef.current.set("s1", {
+    const historyWindow = {
       requestedMessages: 200,
       effectiveMessages: 207,
       startSeq: 41,
       endSeq: 900,
       hasOlder: true,
-    });
+    };
+    historyWindowsRef.current.set("s1", historyWindow);
 
-    dispatch({ type: "event_replay", sessionId: "s1", events: [], isLast: true });
+    dispatch(replay("s1", 901, [toolStart("catch-up", 901)], true));
+    flushFrame();
 
-    expect(historyWindowsRef.current.has("s1")).toBe(false);
+    expect(historyWindowsRef.current.get("s1")).toEqual(historyWindow);
   });
 
   it("publishes once per frame when replay spans multiple frames", () => {

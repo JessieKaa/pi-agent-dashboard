@@ -205,8 +205,9 @@ interface Props {
   resumeErrors?: Map<string, string>;
   /** Dismiss a resume error for a session */
   onDismissResumeError?: (sessionId: string) => void;
-  /**
-   * UI preference: show worktree spawn buttons (folder `+Worktree` and
+  /** Front-end-only compact folder presentation. Hidden surfaces remount when disabled. */
+  compactSidebar?: boolean;
+  /** UI preference: show worktree spawn buttons (folder `+Worktree` and
    * per-change `⥂2+`). Defaults to `true` when undefined. App wires this
    * from `/api/config.gitWorktreeEnabled`. See change:
    * openspec-worktree-spawn-button.
@@ -240,7 +241,7 @@ function ToggleButton({
   );
 }
 
-export function SessionList({ sessions, selectedId, onSelect, revealRequest, onSeekToCard, contextUsageMap, openspecMap, folderGitMap, openspecGroupsMap, sessionOrderMap, onReorderSessions, onSendPrompt, onOpenSpecRefresh, onAttachProposal, onDetachProposal, onReplaceProposal, onBulkArchive, onReadArtifact, onOpenPiResources, onRename, onShutdown, onResume, onResumeKeepPosition, onHideSession, onUnhideSession, onSpawnSession, spawningCwds, addSpawningCwd, clearSpawningCwd, spawnResult, onSpawnResultSeen, pinnedDirectories, onPinDirectory, onOpenPinDialog, onUnpinDirectory, onReorderPinnedDirs, onReorderWorkspaces, onReorderWorkspaceFolders, workspaces, onCreateWorkspace, onRenameWorkspace, onDeleteWorkspace, onSetWorkspaceCollapsed, onAddFolderToWorkspace, onRemoveFolderFromWorkspace, onKillTerminal, onRenameTerminal, onCollapseSidebar, commandsMap, onKillProcess, onSetProcessDrawer, onRemoveTagGlobally, inflightBashMap, onAbortTool, onOpenSpecs, onOpenArchive, onOpenBoard, headerExtra, errorSessionIds, retrySessionIds, noticeSessionIds, spawnErrors, onDismissSpawnError, resumeErrors, onDismissResumeError, gitWorktreeEnabled: gitWorktreeEnabledProp }: Props) {
+export function SessionList({ sessions, selectedId, onSelect, revealRequest, onSeekToCard, contextUsageMap, openspecMap, folderGitMap, openspecGroupsMap, sessionOrderMap, onReorderSessions, onSendPrompt, onOpenSpecRefresh, onAttachProposal, onDetachProposal, onReplaceProposal, onBulkArchive, onReadArtifact, onOpenPiResources, onRename, onShutdown, onResume, onResumeKeepPosition, onHideSession, onUnhideSession, onSpawnSession, spawningCwds, addSpawningCwd, clearSpawningCwd, spawnResult, onSpawnResultSeen, pinnedDirectories, onPinDirectory, onOpenPinDialog, onUnpinDirectory, onReorderPinnedDirs, onReorderWorkspaces, onReorderWorkspaceFolders, workspaces, onCreateWorkspace, onRenameWorkspace, onDeleteWorkspace, onSetWorkspaceCollapsed, onAddFolderToWorkspace, onRemoveFolderFromWorkspace, onKillTerminal, onRenameTerminal, onCollapseSidebar, commandsMap, onKillProcess, onSetProcessDrawer, onRemoveTagGlobally, inflightBashMap, onAbortTool, onOpenSpecs, onOpenArchive, onOpenBoard, headerExtra, errorSessionIds, retrySessionIds, noticeSessionIds, spawnErrors, onDismissSpawnError, resumeErrors, onDismissResumeError, compactSidebar = false, gitWorktreeEnabled: gitWorktreeEnabledProp }: Props) {
   const { t } = useI18n();
   // UI preference flag, default-on. Gates folder `+Worktree` and per-change
   // `⥂2+` buttons. See change: openspec-worktree-spawn-button.
@@ -900,24 +901,22 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
     const folderHasSessions = group.sessions.length > 0;
 
     return (
-      <div key={group.cwd} className="space-y-1">
-        {/* Folder-tab nub — a small tab peeking above the card's top-left
-            corner so the directory card reads as a folder. Sits behind the
-            bordered card (which paints on top, hiding the nub's lower edge)
-            and is non-interactive. The pt-[9px] on the wrapper reserves the
-            space the nub occupies above the card. See change: folder-card-tab-nub. */}
-        <div className="relative pt-[9px]">
+      <div key={group.cwd} className={compactSidebar ? "space-y-0" : "space-y-1"}>
+        <div className={compactSidebar ? "relative" : "relative pt-[9px]"}>
+        {!compactSidebar && (
         <div
           aria-hidden="true"
+          data-testid="folder-tab-nub"
           className="pointer-events-none absolute top-0 left-3.5 w-[78px] h-3 bg-[var(--bg-primary)] border border-[var(--border-subtle)] border-b-0 rounded-t-lg"
           style={folderTint}
         />
+        )}
         <div
-          className={`relative overflow-hidden bg-[var(--bg-primary)] border border-[var(--border-subtle)] p-1.5 ${isCollapsed ? "rounded-[14px] shadow-[inset_0_1px_0_var(--elevation-rim),0_2px_4px_var(--shadow-card)]" : "rounded-t-[14px] border-b-0 shadow-[inset_0_1px_0_var(--elevation-rim)]"}`}
+          className={`relative overflow-hidden bg-[var(--bg-primary)] border border-[var(--border-subtle)] ${compactSidebar ? "p-1" : "p-1.5"} ${isCollapsed ? "rounded-[14px] shadow-[inset_0_1px_0_var(--elevation-rim),0_2px_4px_var(--shadow-card)]" : "rounded-t-[14px] border-b-0 shadow-[inset_0_1px_0_var(--elevation-rim)]"}`}
           style={folderTint}
         >
         <div className="relative z-[1]">
-        <div className="flex gap-1.5 px-1 py-1 min-h-[44px] md:min-h-0 rounded">
+        <div className={`flex ${compactSidebar ? "gap-1 px-0.5 py-0.5 min-h-[36px]" : "gap-1.5 px-1 py-1 min-h-[44px]"} md:min-h-0 rounded`}>
           {/* Left gutter — chevron at top, drag-handle column extending below */}
           <FolderDragGutter
             isCollapsed={isCollapsed}
@@ -1053,7 +1052,7 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
               running / failed `WorktreeInitChip`, min-w ~240px) wraps to its own
               line instead of overflowing and overlapping the git row.
               See change: compact-folder-header-actions. */}
-          <div className="mt-1 flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+          <div className={`${compactSidebar ? "mt-0.5 gap-x-1.5 gap-y-0.5" : "mt-1 gap-x-2 gap-y-1"} flex flex-wrap items-center justify-between`}>
             <div className="min-w-0">
               <GroupGitInfo
                 sessions={group.sessions}
@@ -1079,7 +1078,8 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
               collapses to 1-col at mobile width. A section that renders null
               (plugin disabled / not yet loaded) simply leaves no cell.
               See change: redesign-directory-card. */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-2 gap-y-3 mt-3">
+          {!compactSidebar && (
+          <div data-testid="folder-aux-sections" className="grid grid-cols-1 sm:grid-cols-2 gap-x-2 gap-y-3 mt-3">
             <SidebarFolderSectionSlot folder={{ cwd: group.cwd }} />
             {/* Render for both initialized (full section) and pending (spinner).
                 See change: fix-cold-boot-openspec-protocol. */}
@@ -1094,6 +1094,7 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
               />
             )}
           </div>
+          )}
           </>)}
 
           </div>{/* end content column */}
@@ -1107,11 +1108,12 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
             seam. See change: folder-card-enclosure. */}
         {!isCollapsed && (
         <div
-          className="relative bg-[var(--bg-primary)] border border-[var(--border-subtle)] border-t-0 rounded-b-[14px] px-1.5 pb-1.5 shadow-[0_2px_4px_var(--shadow-card)]"
+          className={`relative flow-root bg-[var(--bg-primary)] border border-[var(--border-subtle)] border-t-0 rounded-b-[14px] ${compactSidebar ? "px-1 pb-1" : "px-1.5 pb-1.5"} shadow-[0_2px_4px_var(--shadow-card)]`}
           style={folderTint}
           data-testid={`folder-body-${group.cwd}`}
         >
           <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 h-2.5 shadow-[inset_0_6px_6px_-6px_var(--shadow-card)]" />
+          {!compactSidebar && (<>
             <div className="relative text-center text-[9.5px] font-semibold tracking-[.1em] uppercase text-[var(--text-muted)] my-2 before:content-[''] before:absolute before:top-1/2 before:left-0 before:w-[38%] before:h-px before:bg-[var(--border-subtle)] after:content-[''] after:absolute after:top-1/2 after:right-0 after:w-[38%] after:h-px after:bg-[var(--border-subtle)]">
               {t("sessionList.create", undefined, "Create")}
             </div>
@@ -1139,9 +1141,10 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
               {t("sessionList.sessions", undefined, "Sessions")}
             </div>
             )}
+          </>)}
         {/* Session + terminal cards */}
         <div className="group-collapse expanded">
-        <div className="space-y-1 pt-1">
+        <div className={compactSidebar ? "space-y-1" : "space-y-1 pt-1"}>
           {/* Spawn error banner — see change: spawn-failure-diagnostics */}
           {spawnErrors?.get(group.cwd) && (
             <SpawnErrorBanner
@@ -1532,7 +1535,7 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
         <div className="p-4 text-sm text-[var(--text-tertiary)]">{t("sessionList.noActiveSessions", undefined, "No active sessions")}</div>
       ) : (
         <DndContext sensors={sensors} collisionDetection={sameTypeClosestCenter} onDragStart={handleDragStart} onDragEnd={handleDragEnd} onDragCancel={handleDragCancel}>
-        <ul className="flex flex-col gap-2 p-2">
+        <ul className={`flex flex-col ${compactSidebar ? "gap-1 p-1.5" : "gap-2 p-2"}`}>
           {/* Elevated dashboard-scope add buttons: rendered as the FIRST list
               item, above workspace tiers and pinned folder groups.
               See change: elevate-dashboard-add-buttons. */}

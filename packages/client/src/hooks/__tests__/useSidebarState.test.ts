@@ -7,6 +7,7 @@ import {
   DEFAULT_WIDTH,
   WIDTH_KEY,
   COLLAPSED_KEY,
+  COMPACT_KEY,
 } from "../useSidebarState.js";
 
 beforeEach(() => {
@@ -82,5 +83,35 @@ describe("useSidebarState", () => {
     const { result } = renderHook(() => useSidebarState());
     expect(result.current.width).toBe(DEFAULT_WIDTH);
     expect(result.current.collapsed).toBe(false);
+  });
+
+  it("defaults compact=false when localStorage is empty", () => {
+    const { result } = renderHook(() => useSidebarState());
+    expect(result.current.compact).toBe(false);
+  });
+
+  it("reads persisted compact state from localStorage", () => {
+    localStorage.setItem(COMPACT_KEY, "true");
+    const { result } = renderHook(() => useSidebarState());
+    expect(result.current.compact).toBe(true);
+  });
+
+  it("falls back to compact=false on invalid localStorage value", () => {
+    localStorage.setItem(COMPACT_KEY, "garbage");
+    const { result } = renderHook(() => useSidebarState());
+    expect(result.current.compact).toBe(false);
+  });
+
+  it("setCompact updates state and persists to localStorage", () => {
+    const { result } = renderHook(() => useSidebarState());
+    expect(result.current.compact).toBe(false);
+
+    act(() => result.current.setCompact(true));
+    expect(result.current.compact).toBe(true);
+    expect(localStorage.getItem(COMPACT_KEY)).toBe("true");
+
+    act(() => result.current.setCompact(false));
+    expect(result.current.compact).toBe(false);
+    expect(localStorage.getItem(COMPACT_KEY)).toBe("false");
   });
 });

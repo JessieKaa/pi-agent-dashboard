@@ -790,11 +790,10 @@ export function useMessageHandler(
         } else if (msg.events.length === 0) {
           rearmLoadingHistory(setLoadingHistory, loadingHistoryTimersRef, msg.sessionId, HYDRATE_CEILING_MS);
         }
-        if (msg.isLast) {
+        if (msg.isLast && msg.historyWindow) {
           setHistoryWindows?.((prev) => {
             const next = new Map(prev);
-            if (msg.historyWindow) next.set(msg.sessionId, msg.historyWindow);
-            else next.delete(msg.sessionId);
+            next.set(msg.sessionId, msg.historyWindow!);
             return next;
           });
         }

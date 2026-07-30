@@ -2,6 +2,7 @@ import { useState, useCallback } from "react";
 
 const WIDTH_KEY = "dashboard:sidebar-width";
 const COLLAPSED_KEY = "dashboard:sidebar-collapsed";
+const COMPACT_KEY = "dashboard:compact-sidebar";
 const DEFAULT_WIDTH = 500;
 const MIN_WIDTH = 180;
 const MAX_WIDTH = 500;
@@ -34,13 +35,16 @@ function readBoolean(key: string, fallback: boolean): boolean {
 export interface SidebarState {
   width: number;
   collapsed: boolean;
+  compact: boolean;
   setWidth: (w: number) => void;
   toggleCollapse: () => void;
+  setCompact: (compact: boolean) => void;
 }
 
 export function useSidebarState(): SidebarState {
   const [width, setWidthRaw] = useState(() => clamp(readNumber(WIDTH_KEY, DEFAULT_WIDTH)));
   const [collapsed, setCollapsed] = useState(() => readBoolean(COLLAPSED_KEY, false));
+  const [compact, setCompactRaw] = useState(() => readBoolean(COMPACT_KEY, false));
 
   const setWidth = useCallback((w: number) => {
     const clamped = clamp(w);
@@ -56,8 +60,13 @@ export function useSidebarState(): SidebarState {
     });
   }, []);
 
-  return { width, collapsed, setWidth, toggleCollapse };
+  const setCompact = useCallback((value: boolean) => {
+    setCompactRaw(value);
+    try { localStorage.setItem(COMPACT_KEY, String(value)); } catch { /* noop */ }
+  }, []);
+
+  return { width, collapsed, compact, setWidth, toggleCollapse, setCompact };
 }
 
 // Exported for testing
-export { MIN_WIDTH, MAX_WIDTH, DEFAULT_WIDTH, WIDTH_KEY, COLLAPSED_KEY };
+export { MIN_WIDTH, MAX_WIDTH, DEFAULT_WIDTH, WIDTH_KEY, COLLAPSED_KEY, COMPACT_KEY };

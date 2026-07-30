@@ -170,6 +170,22 @@ describe("SessionList elevated spawn buttons", () => {
     expect(body?.querySelector('[data-testid="folder-spawn-session-btn"]')).toBeTruthy();
   });
 
+  it("contains the Create divider margin inside the folder body", () => {
+    const { container } = render(
+      <TestRouter>
+        <ThemeProvider>
+          <SessionList
+            sessions={[makeSession({ cwd: "/my/project" })]}
+            onSelect={() => {}}
+            onSpawnSession={() => {}}
+          />
+        </ThemeProvider>
+      </TestRouter>,
+    );
+    const body = container.querySelector('[data-testid="folder-body-/my/project"]');
+    expect(body?.classList.contains("flow-root")).toBe(true);
+  });
+
   it("tints a top-level folder but not a workspace-grouped one (change: folder-card-enclosure)", () => {
     const { container } = render(
       <TestRouter>
@@ -189,6 +205,73 @@ describe("SessionList elevated spawn buttons", () => {
     const rootBody = container.querySelector('[data-testid="folder-body-/root/proj"]') as HTMLElement | null;
     expect(rootBody).toBeTruthy();
     expect(rootBody?.getAttribute("style") ?? "").toContain("--accent-blue");
+  });
+});
+
+describe("SessionList compact workspace sidebar", () => {
+  function renderCompact(compactSidebar: boolean) {
+    return render(
+      <TestRouter>
+        <ThemeProvider>
+          <SessionList
+            sessions={[makeSession({
+              cwd: "/my/project",
+              name: "Compact mode session",
+              gitBranch: "feature/compact-sidebar",
+            })]}
+            onSelect={() => {}}
+            onSpawnSession={() => {}}
+            onOpenPiResources={() => {}}
+            compactSidebar={compactSidebar}
+          />
+        </ThemeProvider>
+      </TestRouter>,
+    );
+  }
+
+  it("keeps the folder header, Git info, project actions, body, and session card", () => {
+    const { container } = renderCompact(true);
+
+    expect(screen.getByTestId("folder-toggle-btn")).toBeTruthy();
+    expect(screen.getAllByText("feature/compact-sidebar").length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "Directory Settings" })).toBeTruthy();
+    expect(container.querySelector('[data-testid="folder-body-/my/project"]')).toBeTruthy();
+    expect(container.querySelector('[data-session-id="test-session-1"]')).toBeTruthy();
+  });
+
+  it("hides auxiliary sections, creation tray, separators, and folder tab", () => {
+    const { container } = renderCompact(true);
+
+    expect(screen.queryByTestId("folder-aux-sections")).toBeNull();
+    expect(screen.queryByTestId("folder-spawn-session-btn")).toBeNull();
+    expect(screen.queryByText("Create")).toBeNull();
+    expect(screen.queryByText("Sessions")).toBeNull();
+    expect(container.querySelector('[data-testid="folder-tab-nub"]')).toBeNull();
+  });
+
+  it("restores all hidden folder UI when compact mode is disabled", () => {
+    const view = renderCompact(true);
+    expect(screen.queryByTestId("folder-spawn-session-btn")).toBeNull();
+
+    view.rerender(
+      <TestRouter>
+        <ThemeProvider>
+          <SessionList
+            sessions={[makeSession({ cwd: "/my/project", name: "Compact mode session", gitBranch: "feature/compact-sidebar" })]}
+            onSelect={() => {}}
+            onSpawnSession={() => {}}
+            onOpenPiResources={() => {}}
+            compactSidebar={false}
+          />
+        </ThemeProvider>
+      </TestRouter>,
+    );
+
+    expect(screen.getByTestId("folder-aux-sections")).toBeTruthy();
+    expect(screen.getByTestId("folder-spawn-session-btn")).toBeTruthy();
+    expect(screen.getByText("Create")).toBeTruthy();
+    expect(screen.getByText("Sessions")).toBeTruthy();
+    expect(view.container.querySelector('[data-testid="folder-tab-nub"]')).toBeTruthy();
   });
 });
 

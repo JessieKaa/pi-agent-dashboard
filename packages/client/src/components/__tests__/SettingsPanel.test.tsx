@@ -222,6 +222,50 @@ describe("SettingsPanel", () => {
     expect(screen.getByText("Loading settings...")).toBeTruthy();
   });
 
+  describe("compact workspace sidebar toggle", () => {
+    it("renders the compact toggle in the Interface section", async () => {
+      global.fetch = mockFetchConfig();
+      render(<SettingsPanel />);
+      await waitFor(() => expect(screen.getByText("Interface")).toBeTruthy());
+      expect(screen.getByText("Compact workspace sidebar")).toBeTruthy();
+    });
+
+    it("calls the controlled callback without writing /api/config or showing the save bar", async () => {
+      const fetchMock = mockFetchConfig();
+      global.fetch = fetchMock;
+      const onCompactSidebarChange = vi.fn();
+
+      render(<SettingsPanel compactSidebar={false} onCompactSidebarChange={onCompactSidebarChange} />);
+      await waitFor(() => expect(screen.getByText("Compact workspace sidebar")).toBeTruthy());
+
+      const label = screen.getByText("Compact workspace sidebar");
+      const toggle = label.parentElement!.querySelector("button")!;
+      fireEvent.click(toggle);
+
+      expect(onCompactSidebarChange).toHaveBeenCalledWith(true);
+      // No config write was issued.
+      const configWrites = fetchMock.mock.calls.filter(
+        ([url, options]: any[]) => url === "/api/config" && options?.method === "PUT",
+      );
+      expect(configWrites).toHaveLength(0);
+      // Immediate browser-local preference: no save/discard bar appears.
+      expect(screen.queryByTestId("settings-save-bar")).toBeNull();
+    });
+
+    it("reflects the enabled state on rerender", async () => {
+      global.fetch = mockFetchConfig();
+      const { rerender } = render(<SettingsPanel compactSidebar={false} />);
+      await waitFor(() => expect(screen.getByText("Compact workspace sidebar")).toBeTruthy());
+
+      rerender(<SettingsPanel compactSidebar={true} />);
+      await waitFor(() => {
+        const label = screen.getByText("Compact workspace sidebar");
+        const toggle = label.parentElement!.querySelector("button")!;
+        expect(toggle.className).toContain("bg-blue-600");
+      });
+    });
+  });
+
   it("renders each section on exactly one page (dedup)", async () => {
     global.fetch = mockFetchConfig();
 

@@ -29,7 +29,7 @@
 
 ### Scope
 
-- [x] Client opts into `historyWindow.messages: 200` by default.
+- [x] Client opts into `historyWindow.messages: 400` by default.
 - [x] `BrowserToServerMessage` subscribe request carries optional history-window intent.
 - [x] Server selects safe replay boundary.
 - [x] Server never starts inside message lifecycle.
@@ -78,20 +78,20 @@
 
 ### Validation
 
-- Default client subscribe requests `historyWindow.messages: 200`.
+- Default client subscribe requests `historyWindow.messages: 400`.
 - Legacy clients omit `historyWindow`.
 - Legacy clients retain full replay.
 - Safe boundary can overshoot requested logical count.
-- Session `019fad0e-9980-76f5-b366-ba3de1e598f9` returns `effectiveMessages: 265`.
-- Session `019fad0e-9980-76f5-b366-ba3de1e598f9` returns `startSeq: 1014`.
-- Session `019fad0e-9980-76f5-b366-ba3de1e598f9` returns `endSeq: 1652`.
-- Session `019fad0e-9980-76f5-b366-ba3de1e598f9` returns `hasOlder: true`.
-- Isolated production cold load uses `http://127.0.0.1:8000`.
-- Cold load transfers 639 compacted events.
-- Cold load transfers 13 batches.
-- Cold load transfers approximately 1.32 MB.
-- Cold load reaches terminal replay in approximately 677 ms.
-- Cold load records LCP 394 ms.
+- Earlier 200-window baseline session `019fad0e-9980-76f5-b366-ba3de1e598f9` returns `effectiveMessages: 265`.
+- Earlier 200-window baseline session `019fad0e-9980-76f5-b366-ba3de1e598f9` returns `startSeq: 1014`.
+- Earlier 200-window baseline session `019fad0e-9980-76f5-b366-ba3de1e598f9` returns `endSeq: 1652`.
+- Earlier 200-window baseline session `019fad0e-9980-76f5-b366-ba3de1e598f9` returns `hasOlder: true`.
+- Earlier 200-window baseline cold load uses `http://127.0.0.1:8000`.
+- Earlier 200-window baseline cold load transfers 639 compacted events.
+- Earlier 200-window baseline cold load transfers 13 batches.
+- Earlier 200-window baseline cold load transfers approximately 1.32 MB.
+- Earlier 200-window baseline cold load reaches terminal replay in approximately 677 ms.
+- Earlier 200-window baseline cold load records LCP 394 ms.
 - Prior full retained baseline transfers 833 events.
 - Prior full retained baseline transfers 18 batches.
 - Prior full retained baseline transfers approximately 1.75 MB after prior compaction/coalescing.

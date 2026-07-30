@@ -735,15 +735,25 @@ export default function App() {
     );
   }, []);
 
+  const clearHistoryWindow = useCallback((id: string) => {
+    setHistoryWindows((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Map(prev);
+      next.delete(id);
+      return next;
+    });
+  }, []);
+
   const loadFullHistory = useCallback(() => {
     if (!selectedId || status !== "connected") return;
     beginLoadingHistory(selectedId);
+    clearHistoryWindow(selectedId);
     send({
       type: "subscribe",
       sessionId: selectedId,
       lastSeq: 0,
     });
-  }, [beginLoadingHistory, selectedId, send, status]);
+  }, [beginLoadingHistory, clearHistoryWindow, selectedId, send, status]);
 
   const handleMessage = useMessageHandler(
     { setSessions, setSessionStates, setSessionCommands, setFileResults, setChangedOnDisk, setOpenspecMap, setFolderGitMap, setOpenspecGroupsMap, setModelsMap, setRolesMap, setSpawnResult, setSessionOrderMap, setPinnedDirectories, setPinnedDirsLoaded, setFavoriteModels, setWorkspaces, setWorkspacesLoaded, setTerminals, setDiscoveredServers, setSpawnErrors, setResumeErrors, setDisplayPrefs, setLoadingHistory, setHistoryWindows, setCanvasMap },
@@ -913,7 +923,7 @@ export default function App() {
           type: "subscribe",
           sessionId: sid,
           lastSeq,
-          historyWindow: { messages: 200, ...(firstSeq != null ? { firstSeq } : {}) },
+          historyWindow: { messages: 400, ...(firstSeq != null ? { firstSeq } : {}) },
         });
         // Enter LOADING. Covers warm (in-memory replay / reconnect re-subscribe)
         // and cold (disk-load) paths uniformly, since the warm path never sends
@@ -1377,6 +1387,7 @@ export default function App() {
       onKillTerminal={handleKillTerminal}
       onRenameTerminal={handleRenameTerminal}
       onCollapseSidebar={sidebar.toggleCollapse}
+      compactSidebar={sidebar.compact}
       commandsMap={sessionCommands}
       onKillProcess={handleKillProcess}
       onSetProcessDrawer={(sessionId, collapsed) => send({ type: "set_session_process_drawer", sessionId, collapsed })}
@@ -1494,6 +1505,7 @@ export default function App() {
             subscribedRef.current.delete(selectedId);
             subscribedRef.current.add(selectedId);
             send({ type: "subscribe", sessionId: selectedId, lastSeq: 0 });
+            clearHistoryWindow(selectedId);
             beginLoadingHistory(selectedId);
           },
         } : undefined}
@@ -2041,7 +2053,13 @@ export default function App() {
           }
           detailPanel={
             settingsMatch ? (
-              <SettingsPanel onMessage={onMessage} onBack={goBack} selectedCwd={selectedCwd} />
+              <SettingsPanel
+                onMessage={onMessage}
+                onBack={goBack}
+                selectedCwd={selectedCwd}
+                compactSidebar={sidebar.compact}
+                onCompactSidebarChange={sidebar.setCompact}
+              />
             ) : tunnelSetupMatch ? (
               <ZrokInstallGuide onBack={goBack} />
             ) : pluginOverlayMatched ? (
@@ -2250,7 +2268,7 @@ export default function App() {
             }
           }
           return models;
-        })()} onMessage={onMessage} onBack={goBack} selectedCwd={selectedCwd} />}
+        })()} onMessage={onMessage} onBack={goBack} selectedCwd={selectedCwd} compactSidebar={sidebar.compact} onCompactSidebarChange={sidebar.setCompact} />}
         {tunnelSetupMatch && <ZrokInstallGuide onBack={goBack} />}
       </div>
       {artifactDialog && (
