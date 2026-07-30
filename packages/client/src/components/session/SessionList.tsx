@@ -936,10 +936,15 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
             title={t("sessionList.openFolderHome", undefined, "Open folder home")}
             data-testid={`folder-home-row-${group.cwd}`}
           >
-            <span className="text-xs font-medium text-[var(--text-secondary)] truncate flex items-center gap-1">
+            <span className="text-xs font-medium text-[var(--text-secondary)] min-w-0 flex items-center gap-1">
               <Icon path={isCollapsed ? mdiFolder : mdiFolderOpen} size={0.5} className="shrink-0" />
-              <span className="truncate">{parentPath}</span>
-              <span className="font-bold text-base truncate">{lastSegment}</span>
+              <span className="truncate min-w-0">{parentPath}</span>
+              <span
+                className={`font-bold text-base ${compactSidebar ? "shrink-0 whitespace-nowrap" : "truncate"}`}
+                data-testid={`folder-name-${group.cwd}`}
+              >
+                {lastSegment}
+              </span>
             </span>
             <span className="text-[10px] text-[var(--text-muted)]">({group.sessions.length})</span>
             {/* Needs-you rollup: count of chat-routed ask_user children.

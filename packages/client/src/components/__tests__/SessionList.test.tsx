@@ -249,6 +249,15 @@ describe("SessionList compact workspace sidebar", () => {
     expect(container.querySelector('[data-testid="folder-tab-nub"]')).toBeNull();
   });
 
+  it("keeps the folder name untruncated in compact mode", () => {
+    const { container } = renderCompact(true);
+    const folderName = container.querySelector('[data-testid="folder-name-/my/project"]');
+
+    expect(folderName?.textContent).toBe("project");
+    expect(folderName?.classList.contains("truncate")).toBe(false);
+    expect(folderName?.classList.contains("whitespace-nowrap")).toBe(true);
+  });
+
   it("restores all hidden folder UI when compact mode is disabled", () => {
     const view = renderCompact(true);
     expect(screen.queryByTestId("folder-spawn-session-btn")).toBeNull();
