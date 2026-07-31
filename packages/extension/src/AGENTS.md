@@ -10,7 +10,7 @@ Files in this directory. One row per source file.
 | `ask-user-attachments.ts` | Persist image attachments for ask_user input responses. Exports `attachmentDirForSession`,… → see `ask-user-attachments.ts.AGENTS.md` |
 | `ask-user-tool.ts` | Register `ask_user` pi tool at `session_start` (avoids static-name conflict). Exports `registerAskUserTool`. → see `ask-user-tool.ts.AGENTS.md` |
 | `auto-session-namer.ts` | Automatic session topic-naming (bridge-side). Pure helpers `shouldSkipByPrefilter`, `parseTitle`,… → see `auto-session-namer.ts.AGENTS.md` |
-| `bridge-context.ts` | Shared mutable bridge state + pure predicates. Exports `BridgeContext`, `DASHBOARD_NATIVE_COMMANDS`,… → see `bridge-context.ts.AGENTS.md` |
+| `bridge-context.ts` | Shared mutable bridge state + pure predicates. Exports `BridgeContext`, `DASHBOARD_NATIVE_COMMANDS`, `consumeSessionReplacementHandoff` (one-shot owner-bound session replacement guard),… → see `bridge-context.ts.AGENTS.md` |
 | `bridge-default-model-gate.ts` | Pure predicate `shouldApplyDefaultModel({reason, entryCount, hasModelRegistry, hasDefaultModel})`. → see `bridge-default-model-gate.ts.AGENTS.md` |
 | `bridge.ts` | Main bridge extension entry (default export). Connects to dashboard server, forwards pi events via… → see `bridge.ts.AGENTS.md` |
 | `command-handler.ts` | Command routing: `!`/`!!` bash, `/compact`, slash commands. → see `command-handler.ts.AGENTS.md` |

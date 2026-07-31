@@ -123,6 +123,7 @@ export interface SessionRegisterMessage {
 export interface SessionUnregisterMessage {
   type: "session_unregister";
   sessionId: string;
+  reason?: "session_change" | "quit";
 }
 
 export interface ProcessMetrics {

@@ -111,6 +111,34 @@ describe("sendStateSync", () => {
 });
 
 describe("handleSessionChange", () => {
+  it("unregisters the old session once with session_change reason", () => {
+    const bc = createMockBridgeContext({ sessionId: "sess-old" } as any);
+
+    const ctx = {
+      cwd: "/proj",
+      sessionManager: {
+        getSessionId: () => "sess-new",
+        getSessionFile: () => "/path/new.json",
+        getSessionDir: () => "/path",
+        getBranch: () => [],
+        getEntries: () => [],
+      },
+    };
+
+    handleSessionChange(bc, ctx as any, () => []);
+
+    const unregisterMessages = (bc as any)._sent.filter(
+      (m: any) => m.type === "session_unregister",
+    );
+    expect(unregisterMessages).toEqual([
+      {
+        type: "session_unregister",
+        sessionId: "sess-old",
+        reason: "session_change",
+      },
+    ]);
+  });
+
   it("always tags registerReason: spawn even after reattach", () => {
     const bc = createMockBridgeContext({ hasRegisteredOnce: true } as any);
 
@@ -132,6 +160,35 @@ describe("handleSessionChange", () => {
     expect(registerMsg).toBeDefined();
     expect(registerMsg.sessionId).toBe("sess-new");
     expect(registerMsg.registerReason).toBe("spawn");
+  });
+
+  it("uses the replacement context before reading its model", () => {
+    const staleCtx: Record<string, unknown> = {};
+    Object.defineProperty(staleCtx, "model", {
+      get: () => {
+        throw new Error("stale context");
+      },
+    });
+    const replacementCtx = {
+      cwd: "/proj",
+      model: { provider: "anthropic", id: "claude-sonnet-4-6" },
+      sessionManager: {
+        getSessionId: () => "sess-new",
+        getSessionFile: () => "/path/new.json",
+        getSessionDir: () => "/path",
+        getBranch: () => [],
+        getEntries: () => [],
+      },
+    };
+    const bc = createMockBridgeContext({
+      cachedCtx: staleCtx,
+      sessionId: "sess-old",
+    } as any);
+
+    handleSessionChange(bc, replacementCtx as any, () => []);
+
+    expect(bc.cachedCtx).toBe(replacementCtx);
+    expect(bc.lastModel).toBe("anthropic/claude-sonnet-4-6");
   });
 });
 

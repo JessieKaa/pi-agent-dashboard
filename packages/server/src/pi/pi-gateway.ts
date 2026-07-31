@@ -57,6 +57,10 @@ export function createPiGateway(
 
   // Map sessionId → WebSocket
   const connections = new Map<string, WebSocket>();
+  // Current owner for a session id. Generation distinguishes stale timers on
+  // the same WebSocket from timers created after a later register.
+  const owners = new Map<string, { ws: WebSocket; generation: number }>();
+  const ownerGenerations = new Map<string, number>();
   // Track connection liveness for WS ping/pong (miss counter: kill after 2 consecutive misses)
   const aliveMisses = new Map<WebSocket, number>();
   // Map sessionId → heartbeat timeout
@@ -77,7 +81,54 @@ export function createPiGateway(
     }
   }
 
+  function claimOwner(sessionId: string, ws: WebSocket): number {
+    const existing = owners.get(sessionId);
+    if (existing?.ws === ws) {
+      connections.set(sessionId, ws);
+      return existing.generation;
+    }
+
+    const generation = (ownerGenerations.get(sessionId) ?? 0) + 1;
+    ownerGenerations.set(sessionId, generation);
+    owners.set(sessionId, { ws, generation });
+    connections.set(sessionId, ws);
+    return generation;
+  }
+
+  function isCurrentOwner(sessionId: string, ws: WebSocket, generation?: number): boolean {
+    const owner = owners.get(sessionId);
+    return owner?.ws === ws && (generation === undefined || owner.generation === generation);
+  }
+
+  function clearHeartbeat(sessionId: string): void {
+    const timer = heartbeatTimers.get(sessionId);
+    if (timer) clearTimeout(timer);
+    heartbeatTimers.delete(sessionId);
+    heartbeatMeta.delete(sessionId);
+  }
+
+  function clearCurrentOwner(sessionId: string, ws: WebSocket, generation?: number): boolean {
+    if (!isCurrentOwner(sessionId, ws, generation)) return false;
+    connections.delete(sessionId);
+    owners.delete(sessionId);
+    ownerGenerations.delete(sessionId);
+    clearHeartbeat(sessionId);
+    checkEmpty();
+    return true;
+  }
+
+  function unregisterCurrentOwner(sessionId: string, ws: WebSocket, generation: number, detail: string): void {
+    if (!isCurrentOwner(sessionId, ws, generation)) return;
+    console.error(`[gateway] session timed out: ${sessionId} (${detail})`);
+    sessionManager.unregister(sessionId);
+    clearCurrentOwner(sessionId, ws, generation);
+  }
+
   function resetHeartbeat(sessionId: string) {
+    const owner = owners.get(sessionId);
+    if (!owner) return;
+    const { ws, generation } = owner;
+
     const existing = heartbeatTimers.get(sessionId);
     if (existing) clearTimeout(existing);
 
@@ -87,20 +138,13 @@ export function createPiGateway(
     heartbeatTimers.set(
       sessionId,
       setTimeout(() => {
-        // If the WebSocket TCP connection is still open, don't kill the session.
-        // The bridge is just busy (e.g. running a long tool execution) and can't
-        // send heartbeats, but the connection itself is alive. Reschedule.
-        const ws = connections.get(sessionId);
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (!isCurrentOwner(sessionId, ws, generation)) return;
+        if (ws.readyState === WebSocket.OPEN) {
           console.error(`[gateway] heartbeat timeout but WS still OPEN for ${sessionId}, rescheduling`);
           resetHeartbeat(sessionId);
           return;
         }
-        // Session status check: if the session is still streaming/active
-        // (not manually ended), give it more time to reconnect.
-        // Forked child processes (vitest) can kill the WS connection by
-        // inheriting and closing the FD, but the bridge will reconnect
-        // once the event loop is free.
+
         const session = sessionManager.get(sessionId);
         const meta = heartbeatMeta.get(sessionId);
         if (session && session.status !== "ended" && !meta?.sleepRetried) {
@@ -112,22 +156,17 @@ export function createPiGateway(
           heartbeatTimers.set(
             sessionId,
             setTimeout(() => {
-              const ws2 = connections.get(sessionId);
-              if (ws2 && ws2.readyState === WebSocket.OPEN) {
+              if (!isCurrentOwner(sessionId, ws, generation)) return;
+              if (ws.readyState === WebSocket.OPEN) {
                 resetHeartbeat(sessionId);
                 return;
               }
-              console.error(`[gateway] session timed out: ${sessionId} (reconnect grace period expired)`);
-              sessionManager.unregister(sessionId);
-              connections.delete(sessionId);
-              heartbeatTimers.delete(sessionId);
-              heartbeatMeta.delete(sessionId);
-              checkEmpty();
+              unregisterCurrentOwner(sessionId, ws, generation, "reconnect grace period expired");
             }, hbTimeout),
           );
           return;
         }
-        console.error(`[gateway] heartbeat timeout, WS state=${ws?.readyState} for ${sessionId}`);
+        console.error(`[gateway] heartbeat timeout, WS state=${ws.readyState} for ${sessionId}`);
 
         const meta2 = heartbeatMeta.get(sessionId);
         const elapsed = Date.now() - (meta2?.setAt ?? now);
@@ -140,28 +179,18 @@ export function createPiGateway(
           heartbeatTimers.set(
             sessionId,
             setTimeout(() => {
-              const ws2 = connections.get(sessionId);
-              if (ws2 && ws2.readyState === WebSocket.OPEN) {
+              if (!isCurrentOwner(sessionId, ws, generation)) return;
+              if (ws.readyState === WebSocket.OPEN) {
                 resetHeartbeat(sessionId);
                 return;
               }
-              console.error(`[gateway] session timed out: ${sessionId} (sleep recovery failed)`);
-              sessionManager.unregister(sessionId);
-              connections.delete(sessionId);
-              heartbeatTimers.delete(sessionId);
-              heartbeatMeta.delete(sessionId);
-              checkEmpty();
+              unregisterCurrentOwner(sessionId, ws, generation, "sleep recovery failed");
             }, hbTimeout),
           );
           return;
         }
 
-        console.error(`[gateway] session timed out: ${sessionId} (no heartbeat for ${hbTimeout}ms)`);
-        sessionManager.unregister(sessionId);
-        connections.delete(sessionId);
-        heartbeatTimers.delete(sessionId);
-        heartbeatMeta.delete(sessionId);
-        checkEmpty();
+        unregisterCurrentOwner(sessionId, ws, generation, `no heartbeat for ${hbTimeout}ms`);
       }, hbTimeout)
     );
   }
@@ -227,13 +256,11 @@ export function createPiGateway(
             
             for (const [sid, ws] of connections) {
               if (ws === client) {
+                const owner = owners.get(sid);
+                if (!owner || owner.ws !== client) break;
                 console.error(`[gateway] connection dead (ping timeout, ${misses} misses): ${sid}`);
                 sessionManager.unregister(sid);
-                connections.delete(sid);
-                const timer = heartbeatTimers.get(sid);
-                if (timer) clearTimeout(timer);
-                heartbeatTimers.delete(sid);
-                heartbeatMeta.delete(sid);
+                clearCurrentOwner(sid, client, owner.generation);
                 break;
               }
             }
@@ -249,6 +276,7 @@ export function createPiGateway(
 
       wss.on("connection", (ws) => {
         let currentSessionId: string | null = null;
+        let currentGeneration: number | null = null;
         aliveMisses.set(ws, 0);
         ws.on("pong", () => { aliveMisses.set(ws, 0); });
 
@@ -262,7 +290,7 @@ export function createPiGateway(
             if (!currentSessionId && "sessionId" in msg && (msg as any).sessionId) {
               const sid: string = (msg as any).sessionId;
               currentSessionId = sid;
-              connections.set(sid, ws);
+              currentGeneration = claimOwner(sid, ws);
               // Auto-create a placeholder session so events aren't lost
               if (!sessionManager.get(sid)) {
                 sessionManager.register({
@@ -276,6 +304,17 @@ export function createPiGateway(
               onConnection?.();
             }
 
+            if (
+              "sessionId" in msg &&
+              (msg as any).sessionId &&
+              msg.type !== "session_register" &&
+              msg.type !== "session_unregister" &&
+              !isCurrentOwner((msg as any).sessionId, ws)
+            ) {
+              console.error(`[gateway] ignored stale ${msg.type}: ${(msg as any).sessionId}`);
+              return;
+            }
+
             if (msg.type === "session_register") {
               // Clear spawn-register watchdog BEFORE any throwing logic. See change: spawn-failure-diagnostics.
               // Priority: token > pid > cwd. Token is the strongest identity
@@ -286,18 +325,29 @@ export function createPiGateway(
               if (msg.pid !== undefined) watchdog.clearByPid(msg.pid);
               watchdog.clearByCwd(msg.cwd);
 
-              // If session ID changed (e.g., after /reload), clean up the old placeholder
-              if (currentSessionId && currentSessionId !== msg.sessionId) {
+              if (
+                currentSessionId === msg.sessionId &&
+                currentGeneration !== null &&
+                !isCurrentOwner(msg.sessionId, ws, currentGeneration)
+              ) {
+                console.error(`[gateway] ignored stale session_register: ${msg.sessionId}`);
+                return;
+              }
+
+              // If session ID changed (e.g., /resume), clean up this socket's old placeholder only.
+              if (currentSessionId && currentSessionId !== msg.sessionId && currentGeneration !== null) {
                 const oldSession = sessionManager.get(currentSessionId);
-                // Clean up if it's an auto-created placeholder (source unknown)
-                // or a ghost session (no sessionFile, created by duplicate bridge)
-                if (oldSession && (oldSession.source === "unknown" || !oldSession.sessionFile)) {
+                if (
+                  oldSession &&
+                  (oldSession.source === "unknown" || !oldSession.sessionFile) &&
+                  isCurrentOwner(currentSessionId, ws, currentGeneration)
+                ) {
                   sessionManager.unregister(currentSessionId);
-                  connections.delete(currentSessionId);
+                  clearCurrentOwner(currentSessionId, ws, currentGeneration);
                 }
               }
               currentSessionId = msg.sessionId;
-              connections.set(msg.sessionId, ws);
+              currentGeneration = claimOwner(msg.sessionId, ws);
 
               sessionManager.register({
                 id: msg.sessionId,
@@ -332,6 +382,7 @@ export function createPiGateway(
             }
 
             if (msg.type === "session_heartbeat" && msg.sessionId) {
+              if (!isCurrentOwner(msg.sessionId, ws)) return;
               resetHeartbeat(msg.sessionId);
               // Store process metrics on the session if provided
               if (msg.metrics) {
@@ -346,16 +397,15 @@ export function createPiGateway(
             }
 
             if (msg.type === "session_unregister" && msg.sessionId) {
-              console.error(`[gateway] session unregistered: ${msg.sessionId} (explicit)`);
-              sessionManager.unregister(msg.sessionId);
-              connections.delete(msg.sessionId);
-              const timer = heartbeatTimers.get(msg.sessionId);
-              if (timer) {
-                clearTimeout(timer);
-                heartbeatTimers.delete(msg.sessionId);
+              const reason = msg.reason ? ` reason=${msg.reason}` : "";
+              if (!isCurrentOwner(msg.sessionId, ws)) {
+                console.error(`[gateway] ignored stale session_unregister: ${msg.sessionId}${reason}`);
+                return;
+              } else {
+                console.error(`[gateway] session unregistered: ${msg.sessionId} (explicit${reason})`);
+                sessionManager.unregister(msg.sessionId);
+                clearCurrentOwner(msg.sessionId, ws);
               }
-              heartbeatMeta.delete(msg.sessionId);
-              checkEmpty();
             }
 
             if (msg.type === "model_update") {
@@ -379,32 +429,30 @@ export function createPiGateway(
 
         ws.on("close", () => {
           if (currentSessionId) {
-            console.error(`[gateway] connection closed: ${currentSessionId}`);
-            // Headless automation runs are one-shot and never reconnect.
-            // Treating a WS close as terminal for them finalizes the run
-            // immediately instead of holding it in the human-oriented
-            // reconnect-grace path (which would leave the run `running` for
-            // the full heartbeat window and starve `concurrency: skip`).
-            // Every other session keeps the grace behavior unchanged.
-            // See change: finalize-automation-run-on-session-death.
-            const session = sessionManager.get(currentSessionId);
-            if (session?.kind === "automation" && session.status !== "ended") {
-              console.error(`[gateway] automation session ${currentSessionId} closed; finalizing now (no reconnect grace)`);
-              const timer = heartbeatTimers.get(currentSessionId);
-              if (timer) clearTimeout(timer);
-              heartbeatTimers.delete(currentSessionId);
-              heartbeatMeta.delete(currentSessionId);
-              connections.delete(currentSessionId);
-              onDisconnect?.(currentSessionId);
-              // unregister LAST: it fires onUnregister → plugin onSessionEnded
-              // → engine finalize; do it after local cleanup so the death
-              // signal sees a fully torn-down connection.
-              sessionManager.unregister(currentSessionId);
-              checkEmpty();
-            } else {
-              // Don't immediately unregister - wait for heartbeat timeout
-              // This handles temporary disconnects
-              onDisconnect?.(currentSessionId);
+            const isOwner = currentGeneration !== null && isCurrentOwner(currentSessionId, ws, currentGeneration);
+            console.error(`[gateway] connection closed: ${currentSessionId}${isOwner ? "" : " (stale)"}`);
+            if (isOwner) {
+              // Headless automation runs are one-shot and never reconnect.
+              // Treating a WS close as terminal for them finalizes the run
+              // immediately instead of holding it in the human-oriented
+              // reconnect-grace path (which would leave the run `running` for
+              // the full heartbeat window and starve `concurrency: skip`).
+              // Every other session keeps the grace behavior unchanged.
+              // See change: finalize-automation-run-on-session-death.
+              const session = sessionManager.get(currentSessionId);
+              if (session?.kind === "automation" && session.status !== "ended") {
+                console.error(`[gateway] automation session ${currentSessionId} closed; finalizing now (no reconnect grace)`);
+                clearCurrentOwner(currentSessionId, ws, currentGeneration ?? undefined);
+                onDisconnect?.(currentSessionId);
+                // unregister LAST: it fires onUnregister → plugin onSessionEnded
+                // → engine finalize; do it after local cleanup so the death
+                // signal sees a fully torn-down connection.
+                sessionManager.unregister(currentSessionId);
+              } else {
+                // Don't immediately unregister - wait for heartbeat timeout
+                // This handles temporary disconnects
+                onDisconnect?.(currentSessionId);
+              }
             }
           }
           aliveMisses.delete(ws);
@@ -422,6 +470,8 @@ export function createPiGateway(
       }
       heartbeatTimers.clear();
       heartbeatMeta.clear();
+      owners.clear();
+      ownerGenerations.clear();
       aliveMisses.clear();
       // Forcibly terminate all extension connections
       for (const ws of connections.values()) {
@@ -496,7 +546,6 @@ export function createPiGateway(
       const ws = connections.get(sessionId);
       if (ws) {
         ws.close();
-        connections.delete(sessionId);
         return true;
       }
       return false;

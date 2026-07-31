@@ -547,6 +547,71 @@ describe("handleSubscribe — cold-hydration heartbeat", () => {
     expect(replayed).not.toContain("stale_memory_event");
   });
 
+  it("force refresh preserves live events inserted while disk hydration is pending", async () => {
+    let resolveLoad!: (value: { success: true; events: DashboardEvent[] }) => void;
+    const disk = makeEvent("disk_message_end");
+    const live = makeEvent("live_message_end");
+    const loadSessionEvents = vi.fn(() =>
+      new Promise<{ success: true; events: DashboardEvent[] }>((resolve) => {
+        resolveLoad = resolve;
+      }),
+    );
+    const ctx = createMockContext({ directoryService: { loadSessionEvents } as any });
+    ctx.getSubscribers = () => [ctx.ws];
+    restoreEnded(ctx, "s-force-live");
+    ctx.eventStore.insertEvent("s-force-live", makeEvent("stale_memory_event"));
+
+    handleSubscribe(
+      { type: "subscribe", sessionId: "s-force-live", lastSeq: 0, forceRefresh: true },
+      new Set(),
+      ctx,
+    );
+    ctx.eventStore.insertEvent("s-force-live", live);
+    resolveLoad({ success: true, events: [disk] });
+    await flush();
+
+    const messages = ((ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>).map(([, msg]) => msg);
+    const replayed = messages
+      .filter((msg): msg is Extract<ServerToBrowserMessage, { type: "event_replay" }> => msg.type === "event_replay")
+      .flatMap((msg) => msg.events.map((event) => event.event.eventType));
+    expect(replayed).toContain("disk_message_end");
+    expect(replayed).toContain("live_message_end");
+    expect(replayed).not.toContain("stale_memory_event");
+  });
+
+  it("force refresh falls back to memory replay when no session file exists", async () => {
+    const ctx = createMockContext({ directoryService: { loadSessionEvents: vi.fn() } as any });
+    ctx.getSubscribers = () => [ctx.ws];
+    ctx.sessionManager.restore({
+      id: "s-memory-only",
+      cwd: "/test",
+      source: "tui",
+      status: "active",
+      startedAt: 1000,
+      hidden: false,
+    } as any);
+    ctx.eventStore.insertEvent("s-memory-only", makeEvent("memory_message_end"));
+
+    handleSubscribe(
+      { type: "subscribe", sessionId: "s-memory-only", lastSeq: 0, forceRefresh: true },
+      new Set(),
+      ctx,
+    );
+    await flush();
+
+    expect((ctx.directoryService as any).loadSessionEvents).not.toHaveBeenCalled();
+    const messages = ((ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>).map(([, msg]) => msg);
+    const replayed = messages
+      .filter((msg): msg is Extract<ServerToBrowserMessage, { type: "event_replay" }> => msg.type === "event_replay")
+      .flatMap((msg) => msg.events.map((event) => event.event.eventType));
+    expect(replayed).toContain("memory_message_end");
+    expect(messages).not.toContainEqual({
+      type: "session_updated",
+      sessionId: "s-memory-only",
+      updates: { dataUnavailable: true },
+    });
+  });
+
   it("resets a mismatched cached boundary after cold hydration", async () => {
     const events: DashboardEvent[] = [];
     for (let turn = 0; turn < 4; turn++) {

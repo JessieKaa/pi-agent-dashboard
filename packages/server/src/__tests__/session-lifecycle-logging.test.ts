@@ -61,12 +61,43 @@ describe("Session lifecycle logging", () => {
       type: "session_register", sessionId: "log-unreg", cwd: "/tmp", source: "tui",
     }));
     await delay(100);
-    ws.send(JSON.stringify({ type: "session_unregister", sessionId: "log-unreg" }));
+    ws.send(JSON.stringify({ type: "session_unregister", sessionId: "log-unreg", reason: "quit" }));
     await delay(100);
 
     const logs = errorSpy.mock.calls.map((c: any) => c[0]);
-    expect(logs).toContainEqual(expect.stringContaining("[gateway] session unregistered: log-unreg (explicit)"));
+    expect(logs).toContainEqual(expect.stringContaining("[gateway] session unregistered: log-unreg (explicit reason=quit)"));
     ws.close();
+  }, 10000);
+
+  it("should log and ignore stale explicit session_unregister", async () => {
+    errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const sessionManager = createMemorySessionManager();
+    gateway = createPiGateway(sessionManager, { heartbeatTimeout: 5000 });
+    const port = portCounter++;
+    gateway.start(port);
+
+    const stale = new WebSocket(`ws://localhost:${port}`);
+    await waitForOpen(stale);
+    stale.send(JSON.stringify({
+      type: "session_register", sessionId: "log-stale", cwd: "/old", source: "tui",
+    }));
+    await delay(100);
+
+    const current = new WebSocket(`ws://localhost:${port}`);
+    await waitForOpen(current);
+    current.send(JSON.stringify({
+      type: "session_register", sessionId: "log-stale", cwd: "/new", source: "tui",
+    }));
+    await delay(100);
+
+    stale.send(JSON.stringify({ type: "session_unregister", sessionId: "log-stale", reason: "quit" }));
+    await delay(100);
+
+    const logs = errorSpy.mock.calls.map((c: any) => c[0]);
+    expect(logs).toContainEqual(expect.stringContaining("[gateway] ignored stale session_unregister: log-stale reason=quit"));
+    expect(sessionManager.get("log-stale")?.status).toBe("active");
+    current.close();
+    stale.close();
   }, 10000);
 
   it("should log on heartbeat timeout", async () => {

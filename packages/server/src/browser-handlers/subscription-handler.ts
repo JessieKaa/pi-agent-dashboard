@@ -237,8 +237,11 @@ export function handleSubscribe(
   piGateway.sendToSession(msg.sessionId, { type: "request_roles", sessionId: msg.sessionId });
 
   const forceRefresh = msg.forceRefresh === true;
+  const session = sessionManager.get(msg.sessionId);
+  const canForceRefreshFromDisk = forceRefresh && Boolean(session?.sessionFile);
+  const forceRefreshBaseSeq = canForceRefreshFromDisk ? eventStore.getMaxSeq(msg.sessionId) : undefined;
 
-  if (eventStore.hasEvents(msg.sessionId) && !forceRefresh) {
+  if (eventStore.hasEvents(msg.sessionId) && !canForceRefreshFromDisk) {
     const lastSeq = msg.lastSeq ?? 0;
     const maxSeq = eventStore.getMaxSeq(msg.sessionId);
     const requestedWindow = msg.historyWindow?.messages;
@@ -316,7 +319,6 @@ export function handleSubscribe(
       }
     }
   } else if (directoryService) {
-    const session = sessionManager.get(msg.sessionId);
     if (session?.sessionFile) {
       sendTo(ws, {
         type: "event_replay",
@@ -346,15 +348,25 @@ export function handleSubscribe(
         stopHeartbeat();
         if (result.success) {
           if (forceRefresh) {
+            const liveEvents = forceRefreshBaseSeq !== undefined
+              ? eventStore.getEvents(msg.sessionId, forceRefreshBaseSeq + 1)
+              : [];
             eventStore.deleteEventsForSession(msg.sessionId);
             for (const sub of getSubscribers(msg.sessionId)) {
               if (sub.readyState === sub.OPEN) {
                 sendTo(sub, { type: "session_state_reset", sessionId: msg.sessionId });
               }
             }
-          }
-          for (const evt of result.events) {
-            eventStore.insertEvent(msg.sessionId, evt);
+            for (const evt of result.events) {
+              eventStore.insertEvent(msg.sessionId, evt);
+            }
+            for (const evt of liveEvents) {
+              eventStore.insertEvent(msg.sessionId, evt.event);
+            }
+          } else {
+            for (const evt of result.events) {
+              eventStore.insertEvent(msg.sessionId, evt);
+            }
           }
           const statsUpdates = extractStatsFromEvents(result.events);
           const metaUpdates: Record<string, unknown> = { dataUnavailable: false, ...statsUpdates };

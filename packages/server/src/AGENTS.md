@@ -4,6 +4,7 @@ Files in this directory. One row per source file.
 
 | File | Purpose |
 |------|---------|
+| `__tests__/pi-gateway-session-identity.test.ts` | Regression tests for pi-gateway owner identity. Stale socket register/messages/unregister/close/heartbeat timers cannot affect current owner; current owner quit and automation close still end. See change: reload-resume-lifecycle. |
 | `browse.ts` | Directory-browse logic: `listDirectories` (readdir + tiered rank filter, cap 200, opt-in `.git`/`.pi` flag… → see `browse.ts.AGENTS.md` |
 | `cli.ts` | `pi-dashboard` CLI entry. Exports `parseArgs` (subcommand + flags), `buildConfig` (CLI+env+file merge →… → see `cli.ts.AGENTS.md` |
 | `commit-draft-relay.ts` | Correlates `POST /api/git/commit-draft` → bridge `git_commit_draft_result`. → see `commit-draft-relay.ts.AGENTS.md` |

@@ -170,6 +170,39 @@ export function isHeadlessRpcSession(
   return false;
 }
 
+/**
+ * Consume the one-shot handoff that allows a fresh extension instance to
+ * replace the bridge after a pi session replacement. Without the handoff, a
+ * different ExtensionAPI is treated as an in-process subagent and cannot take
+ * ownership.
+ */
+export function consumeSessionReplacementHandoff<T>(
+  state: { sessionReplacementHandoff?: { owner: T; expiresAt: number } },
+  previousOwner: T | undefined,
+  nextOwner: T,
+  now = Date.now(),
+): boolean {
+  const differentOwner = previousOwner !== undefined && previousOwner !== nextOwner;
+  const handoff = state.sessionReplacementHandoff;
+
+  if (!differentOwner) {
+    if (handoff) delete state.sessionReplacementHandoff;
+    return true;
+  }
+
+  if (
+    !handoff ||
+    handoff.owner !== previousOwner ||
+    handoff.expiresAt <= now
+  ) {
+    if (handoff) delete state.sessionReplacementHandoff;
+    return false;
+  }
+
+  delete state.sessionReplacementHandoff;
+  return true;
+}
+
 /** Extract first user message text from session entries */
 export function extractFirstMessage(ctx: any): string | undefined {
   try {

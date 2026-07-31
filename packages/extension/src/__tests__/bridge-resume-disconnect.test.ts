@@ -157,9 +157,8 @@ function registeredFor(ws: FakeWebSocket | undefined, sessionId: string): boolea
   return registerFrameFor(ws, sessionId) !== undefined;
 }
 
-/** Model a session_shutdown that ends by disconnecting (replacement reason). */
-async function shutdownThenDisconnect(conn: ConnectionManager, sessionId: string): Promise<void> {
-  conn.send({ type: "session_unregister", sessionId });
+/** Model a replacement session_shutdown that only disconnects. */
+async function shutdownThenDisconnect(conn: ConnectionManager): Promise<void> {
   await new Promise((r) => setTimeout(r, 0)); // mirror the 100 ms settle window
   conn.disconnect();
 }
@@ -182,7 +181,7 @@ describe("bridge resume/switch/fork survives session replacement (#393)", () => 
         expect(conn.isConnected).toBe(true);
 
         // session_shutdown(reason) — full disconnect completes first.
-        await shutdownThenDisconnect(conn, "A");
+        await shutdownThenDisconnect(conn);
         expect(conn.isConnected).toBe(false);
 
         // session_start(reason) for B: handleSessionChange BEFORE connect().
@@ -215,7 +214,7 @@ describe("bridge resume/switch/fork survives session replacement (#393)", () => 
       await waitForConnected(conn);
       expect(conn.isConnected).toBe(true);
 
-      await shutdownThenDisconnect(conn, "A");
+      await shutdownThenDisconnect(conn);
       expect(conn.isConnected).toBe(false);
 
       // The documented fault: ctx.cwd throws once the session is replaced.
@@ -253,8 +252,7 @@ describe("bridge resume/switch/fork survives session replacement (#393)", () => 
       await waitForConnected(conn);
       expect(conn.isConnected).toBe(true);
 
-      // session_shutdown(reason: "reload") → state.cleanup disconnects.
-      conn.send({ type: "session_unregister", sessionId: "A" });
+      // session_shutdown(reason: "reload") → no unregister; state.cleanup disconnects.
       conn.disconnect();
       expect(conn.isConnected).toBe(false);
 
@@ -281,7 +279,7 @@ describe("bridge resume/switch/fork survives session replacement (#393)", () => 
     const attachmentsCleaned = vi.fn();
 
     // Model session_shutdown(reason: "quit") cleanup (bridge.ts inline handler).
-    conn.send({ type: "session_unregister", sessionId: "A" });
+    conn.send({ type: "session_unregister", sessionId: "A", reason: "quit" });
     timers.metrics = timers.heartbeat = timers.gitPoll = false;
     subagentBufferReset();
     attachmentsCleaned();
@@ -289,7 +287,12 @@ describe("bridge resume/switch/fork survives session replacement (#393)", () => 
     conn.disconnect(); // teardown is permitted for quit — MAY close.
 
     const first = FakeWebSocket.instances[0];
-    expect(first.sent.some((s) => JSON.parse(s).type === "session_unregister")).toBe(true);
+    expect(
+      first.sent.some((s) => {
+        const msg = JSON.parse(s);
+        return msg.type === "session_unregister" && msg.reason === "quit";
+      }),
+    ).toBe(true);
     expect(timers).toEqual({ metrics: false, heartbeat: false, gitPoll: false });
     expect(subagentBufferReset).toHaveBeenCalledTimes(1);
     expect(attachmentsCleaned).toHaveBeenCalledTimes(1);
@@ -308,7 +311,6 @@ describe("bridge resume/switch/fork survives session replacement (#393)", () => 
       const attachmentsCleaned = vi.fn();
 
       // session_shutdown(reason) — the always-run cleanup.
-      conn.send({ type: "session_unregister", sessionId: `A-${reason}` });
       timers.metrics = timers.heartbeat = timers.gitPoll = false;
       subagentBufferReset();
       attachmentsCleaned();

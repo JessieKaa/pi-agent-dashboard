@@ -643,7 +643,7 @@ flowchart TD
     H -->|No| J[Error logged to bridge stderr<br/>User must bootstrap via TUI]
 ```
 
-**Why two paths?** pi-coding-agent's `ExtensionContext` (delivered to `session_start` handlers) has no `reload()` method — only `ExtensionCommandContext` (given to command handlers) does. Bridge workaround: registers `__dashboard_reload` as command, captures `ctx.reload` into `globalThis[RELOAD_KEY]` when user first invokes in pi's TUI. Headless sessions have no TUI, so capture never happens. Server-side interception is transparent kill-and-respawn achieving same user-visible outcome (fresh settings, extensions, skills/prompts/themes) without in-process reload. `memorySessionManager.register` carries accumulated state when same `sessionId` re-registers, so user sees brief reconnect flicker but keeps tokens, cost, context usage, attached proposal. See change: headless-reload-via-respawn.
+**Why two paths?** pi-coding-agent's `ExtensionContext` (delivered to `session_start` handlers) has no `reload()` method — only `ExtensionCommandContext` (given to command handlers) does. Bridge workaround: registers `__dashboard_reload` as command, captures `ctx.reload` into `globalThis[RELOAD_KEY]` when user first invokes in pi's TUI. Headless sessions have no TUI, so capture never happens. Server-side interception is transparent kill-and-respawn achieving same user-visible outcome (fresh settings, extensions, skills/prompts/themes) without in-process reload. `memorySessionManager.register` carries accumulated state when same `sessionId` re-registers, so user sees brief reconnect flicker but keeps tokens, cost, context usage, attached proposal. `/reload` does NOT send `session_unregister`; reconnect keeps the current session owner. Stale bridge messages cannot replace the current owner during reload. See change: headless-reload-via-respawn.
 
 ### Server Restart (single-orchestrator path)
 
@@ -1174,6 +1174,11 @@ The web client includes a Settings panel (gear icon in sidebar header → `/sett
 3. Browser's event reducer processes replay, rebuilding state
 
 ### Bridge Reconnection (State Reset)
+
+`packages/extension/src/session-sync.ts::handleSessionChange` sends old-session `session_unregister` with `reason: "session_change"` before `/resume`, `/new`, or `/fork` registers the replacement session. `packages/extension/src/bridge.ts` sends `reason: "quit"` on terminal `session_shutdown`. Legacy unregister messages without `reason` remain terminal.
+
+`packages/server/src/pi/pi-gateway.ts` tracks each session owner as `{ws, generation}`. Owner guard rejects stale `session_register` and every stale non-unregister session message. Stale socket unregister, close, and heartbeat callbacks cannot unregister or delete the current owner for the same `sessionId`. `ownerGenerations` is deleted with owner cleanup. Current-owner quit or terminal unregister ends the session. Current-owner automation close finalizes immediately. Other current-owner close events keep reconnect-grace behavior. `closeSession()` closes the socket only; the owner close handler performs disconnect and automation finalization.
+
 When a bridge extension reconnects (e.g., after `pnpm run reload` or network recovery):
 1. Bridge sends `session_register` with `eventCount` to re-register the session
 2. Server checks `canSkipWipe`: if the bridge's `eventCount` matches the server's `lastEntryCount` and events exist in the store, the wipe is skipped (fast reconnect path)
@@ -1207,6 +1212,8 @@ When a browser subscribes to a session whose events have been evicted from memor
 4. Server sends `event_replay` in async batches with backpressure to all waiting browsers
 5. If the session file is missing or corrupt, server sends `dataUnavailable: true`
 6. Concurrent loads for the same session are deduplicated
+
+**`forceRefresh` replay:** `subscription-handler.ts` bypasses memory only when `sessionFile` exists. Memory-only sessions replay from memory. Disk hydration captures the base sequence first and preserves events inserted after that sequence; post-base live events are not lost while hydration is pending.
 
 ### Flows Refresh Deduplication
 When a session sends `flows_list`, the server notifies other sessions in the same cwd to rediscover flows. To prevent infinite loops (A→refresh B→B sends flows→refresh A→...), a per-session 5-second cooldown (`recentFlowsRefresh` set) suppresses duplicate refresh requests.

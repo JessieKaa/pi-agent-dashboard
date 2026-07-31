@@ -27,7 +27,7 @@ import {
 import { registerAskUserTool } from "./ask-user-tool.js";
 import { type AutoNamer, createAutoNamer, type StreamSimpleFn } from "./auto-session-namer.js";
 import type { BridgeContext } from "./bridge-context.js";
-import { extractFirstAssistantReply, extractFirstMessage, filterHiddenCommands, getCurrentModelString, isHeadlessRpcSession, safeCwd } from "./bridge-context.js";
+import { extractFirstAssistantReply, extractFirstMessage, filterHiddenCommands, getCurrentModelString, isHeadlessRpcSession, safeCwd, consumeSessionReplacementHandoff } from "./bridge-context.js";
 import { shouldApplyDefaultModel } from "./bridge-default-model-gate.js";
 import { registerCanvasTool } from "./canvas-tool.js";
 import { createCommandHandler, tryExecSlashTemplate } from "./command-handler.js";
@@ -70,6 +70,7 @@ import { buildVisibilityRegisterFields } from "./visibility-intent.js";
 
 const HEARTBEAT_INTERVAL = 15_000;
 const GIT_POLL_INTERVAL = 30_000;
+const RELOAD_HANDOFF_TTL = 5_000;
 // Platform-aware process scan cadence. Windows keeps the original 10 s /
 // 30 s floor because PowerShell Get-CimInstance is expensive and can flash consoles;
 // Unix uses 5 s / 5 s so legitimate bash subprocesses surface while still
@@ -96,6 +97,8 @@ interface BridgeState {
   connections?: ConnectionManager[];
   /** All interval timers from any bridge incarnation (for cleanup) */
   timers?: ReturnType<typeof setInterval>[];
+  /** One-shot handoff for the next extension instance created by pi session replacement. */
+  sessionReplacementHandoff?: { owner: ExtensionAPI; expiresAt: number };
   /** True when the agent is currently in a turn (between agent_start and agent_end) */
   isAgentStreaming?: boolean;
   /**
@@ -156,11 +159,12 @@ export default function (pi: ExtensionAPI) {
 
 function initBridge(pi: ExtensionAPI) {
   const prev = getBridgeState();
+  const handoffAccepted = consumeSessionReplacementHandoff(prev, prev.pi, pi);
 
   // If bridge is already active for a different pi instance (e.g. a subagent
-  // loading extensions in the same process), skip initialization to avoid
-  // invalidating the parent session's bridge connection and event forwarding.
-  if (prev.generation && prev.generation > 0 && prev.pi && prev.pi !== pi) {
+  // loading extensions in the same process), skip initialization unless the
+  // previous instance explicitly handed ownership to pi's `/reload` replacement.
+  if (!handoffAccepted) {
     return;
   }
 
@@ -2706,8 +2710,15 @@ function initBridge(pi: ExtensionAPI) {
 
   }));
 
-  pi.on("session_shutdown", safe(async () => {
+  pi.on("session_shutdown", safe(async (_event: any) => {
     if (!isActive()) return;
+    const reason = _event?.reason;
+    if (reason === "reload" || reason === "resume" || reason === "new" || reason === "fork") {
+      getBridgeState().sessionReplacementHandoff = {
+        owner: pi,
+        expiresAt: Date.now() + RELOAD_HANDOFF_TTL,
+      };
+    }
     getBridgeState().isAgentStreaming = false;
     stopMetricsMonitor();
     if (heartbeatTimer) {
@@ -2718,10 +2729,19 @@ function initBridge(pi: ExtensionAPI) {
       clearInterval(gitPollTimer);
       gitPollTimer = null;
     }
-    connection.send({
-      type: "session_unregister",
-      sessionId,
-    });
+
+    if (reason === "quit") {
+      connection.send({
+        type: "session_unregister",
+        sessionId,
+        reason: "quit",
+      });
+    } else if (reason !== "reload" && reason !== "resume" && reason !== "new" && reason !== "fork") {
+      connection.send({
+        type: "session_unregister",
+        sessionId,
+      });
+    }
 
     // Drop retained subagent frames/snapshots on shutdown.
     // See change: fix-subagent-live-detail-reliability.

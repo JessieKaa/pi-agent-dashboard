@@ -197,7 +197,16 @@ export function handleSessionChange(
   ctx: any,
   getFlowsList: () => FlowInfo[],
 ): void {
-  bc.connection.send({ type: "session_unregister", sessionId: bc.sessionId });
+  // The caller invokes this before replacing its captured context. Use the new
+  // session context for model/state reads; the previous context is stale after
+  // Pi invalidates the old ExtensionRunner.
+  bc.cachedCtx = ctx;
+
+  bc.connection.send({
+    type: "session_unregister",
+    sessionId: bc.sessionId,
+    reason: "session_change",
+  });
 
   bc.sessionId = ctx.sessionManager.getSessionId();
   bc.lastSessionFile = ctx.sessionManager.getSessionFile?.() ?? undefined;
