@@ -21,6 +21,8 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "toolResult" | "thinking" | "bashOutput" | "commandFeedback" | "interactiveUi" | "turnSeparator" | "rawEvent" | "inlineTerminal";
   content: string;
+  /** Number of image attachments received with this user prompt. */
+  imageCount?: number;
   images?: ChatImage[];
   toolName?: string;
   toolCallId?: string;
@@ -186,8 +188,7 @@ const MAX_TURN_STATS = 50;
 
 export interface PendingPrompt {
   text: string;
-  images?: ChatImage[];
-  /** Delivery mode set by the sender. "steer" = after current turn, "followUp" = after agent finishes. See change: add-steering-message. */
+  imageCount?: number;
   delivery?: "steer" | "followUp";
   /**
    * Progress state of the optimistic (idle-scoped) prompt bubble.
@@ -981,30 +982,25 @@ export function dismissInteractiveRequest(
 }
 
 /**
- * Find the most recent `user`-role ChatMessage and return its content + images
- * mapped to the wire-format `ImageContent[]` shape (adds `type: "image"`).
+ * Find the most recent `user`-role ChatMessage and return its text.
  *
  * Used by the Retry-after-error button to re-send the failed turn via
- * `send_prompt` (which routes to `pi.sendUserMessage` in the bridge). Skips
- * non-user roles like `interactiveUi`, so an `ask_user` response cannot be
- * mistaken for a prompt.
+ * `send_prompt` (which routes to `pi.sendUserMessage` in the bridge). User
+ * image payloads are intentionally not returned because the browser only keeps
+ * an attachment count after the message is settled.
  *
- * Returns `null` when no user message exists in history.
+ * non-user roles like `interactiveUi`, so an `ask_user` response cannot be
+ * mistaken for a prompt. Returns `null` when no user message exists in history.
  *
  * See change: fix-retry-resends-last-user-message.
  */
 export function findLastUserPrompt(
   messages: readonly ChatMessage[],
-): { text: string; images?: { type: "image"; data: string; mimeType: string }[] } | null {
+): { text: string } | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!;
     if (m.role !== "user") continue;
-    const images = m.images?.map((img) => ({
-      type: "image" as const,
-      data: img.data,
-      mimeType: img.mimeType,
-    }));
-    return { text: m.content, ...(images && images.length > 0 ? { images } : {}) };
+    return { text: m.content };
   }
   return null;
 }
@@ -1224,20 +1220,14 @@ export function reduceEvent(
       if (msg?.role === "user") {
         next.pendingPrompt = undefined;
         let text = "";
-        let images: ChatImage[] | undefined;
+        let imageCount = typeof data.imageCount === "number" ? data.imageCount : 0;
         if (Array.isArray(msg.content)) {
           text = msg.content
             .filter((c: any) => c.type === "text")
             .map((c: any) => c.text)
             .join("");
-          const imgBlocks = msg.content.filter(
-            (c: any) => c.type === "image" && c.data && c.mimeType,
-          );
-          if (imgBlocks.length > 0) {
-            images = imgBlocks.map((c: any) => ({
-              data: c.data,
-              mimeType: c.mimeType,
-            }));
+          if (imageCount === 0) {
+            imageCount = msg.content.filter((c: any) => c.type === "image").length;
           }
         } else {
           text = String(msg.content ?? "");
@@ -1288,9 +1278,9 @@ export function reduceEvent(
             id: `msg-${next.messages.length}`,
             role: "user",
             content: text,
+            ...(imageCount > 0 ? { imageCount } : {}),
             ...(skill ? { skill } : {}),
             ...(retriedFrom ? { retriedFrom } : {}),
-            images,
             timestamp: event.timestamp,
             // entryId from data.entryId is correct ONLY for replayed events
             // (state-replay attaches the persisted id). For LIVE user

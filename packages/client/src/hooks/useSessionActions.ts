@@ -205,7 +205,15 @@ export function useSessionActions(deps: SessionActionDeps) {
         if (current && (current.isStreaming || current.status === "streaming")) return prev;
         const base = current ?? createInitialState();
         const next = new Map(prev);
-        next.set(selectedId, { ...base, pendingPrompt: { text, images, delivery, status: "sending" } });
+        next.set(selectedId, {
+          ...base,
+          pendingPrompt: {
+            text,
+            ...(images && images.length > 0 ? { imageCount: images.length } : {}),
+            delivery,
+            status: "sending",
+          },
+        });
         return next;
       });
     }
@@ -264,7 +272,14 @@ export function useSessionActions(deps: SessionActionDeps) {
         if (current && (current.isStreaming || current.status === "streaming")) return prev;
         const base = current ?? createInitialState();
         const next = new Map(prev);
-        next.set(sessionId, { ...base, pendingPrompt: { text, images, status: "sending" } });
+        next.set(sessionId, {
+          ...base,
+          pendingPrompt: {
+            text,
+            ...(images && images.length > 0 ? { imageCount: images.length } : {}),
+            status: "sending",
+          },
+        });
         return next;
       });
     },

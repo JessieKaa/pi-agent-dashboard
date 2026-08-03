@@ -1066,6 +1066,7 @@ export const huCatalog: Record<string, string> = {
   "session.newSession2": "Új munkamenet",
   "session.nextFollowUpEntry": "Következő utókérési bejegyzés",
   "session.noActiveSessions": "Nincs aktív munkamenet",
+  "session.attachedImages": "Csatolt képek: {count}",
   "session.noMessagesYet": "Még nincsenek üzenetek",
   "session.noMessagesYetBody": "Küldjön egy kérést alább a beszélgetés megkezdéséhez.",
   "session.noProjectsWithActiveSessions": "Nincs aktív munkamenettel rendelkező projekt.",

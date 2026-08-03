@@ -52,7 +52,8 @@ export function virtualRowKey(item: BurstItem, index: number): string {
  * `textChars` is the row's precomputed aggregate rendered text length (see
  * `computeRowTextChars`), passed in so this stays **O(1) per row, pure, memo-
  * safe** — it is called during windowing on every scroll pass and MUST NOT
- * walk content blocks. Image presence is read O(1) from `item.images`.
+ * walk content blocks. Tool-result image presence is read O(1) from
+ * `item.images`; user attachment notices are small badges.
  *
  * Constants derived from the repro height distribution (session `019f43e4`):
  * 9240 chars -> ~2300px and 24071 chars -> ~6000px both give ~0.25 px/char,
@@ -70,11 +71,9 @@ const LINE_PX = 20;
  */
 const TEXT_RESERVE_CLAMP = 8000;
 /**
- * Per-renderer-kind image reserve. Caps differ by render path (verified):
- * user attachments `max-h-[300px]` (ChatView ImageAttachments), tool-result
- * images `max-h-[512px]` (ToolResultImages). NOT one global constant.
+ * Per-renderer-kind image reserve. Tool-result images use their existing
+ * `max-h-[512px]` reserve; user attachment notices are small badges.
  */
-const IMAGE_RESERVE_USER = 300;
 const IMAGE_RESERVE_TOOL_RESULT = 512;
 
 /** Base (chrome) height per row type, before the text/image reserve. */
@@ -113,8 +112,8 @@ export function estimateVirtualRowSize(item: BurstItem, textChars = 0): number {
   const msg = item as ChatMessage;
   const textReserve = Math.min(Math.ceil(textChars / CHARS_PER_LINE) * LINE_PX, TEXT_RESERVE_CLAMP);
   let size = baseRowSize(msg.role) + textReserve;
-  if (msg.images && msg.images.length > 0) {
-    size += msg.role === "toolResult" ? IMAGE_RESERVE_TOOL_RESULT : IMAGE_RESERVE_USER;
+  if (msg.role === "toolResult" && msg.images && msg.images.length > 0) {
+    size += IMAGE_RESERVE_TOOL_RESULT;
   }
   return size;
 }

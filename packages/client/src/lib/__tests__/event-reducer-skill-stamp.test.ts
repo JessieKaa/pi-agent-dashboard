@@ -46,18 +46,16 @@ describe("event-reducer message_start: skill-block stamping", () => {
     expect(last.content).toBe("Hello world");
   });
 
-  it("preserves images alongside the skill stamp", () => {
+  it("summarizes image attachments alongside the skill stamp", () => {
     const wrapped = `<skill name="foo" location="/p">\nbody\n</skill>\n\nfoo`;
     const event: DashboardEvent = {
       eventType: "message_start",
       timestamp: 1,
       data: {
+        imageCount: 1,
         message: {
           role: "user",
-          content: [
-            { type: "text", text: wrapped },
-            { type: "image", data: "fake-base64", mimeType: "image/png" },
-          ],
+          content: [{ type: "text", text: wrapped }],
         },
       },
     } as DashboardEvent;
@@ -65,8 +63,8 @@ describe("event-reducer message_start: skill-block stamping", () => {
     const last = state.messages[state.messages.length - 1];
     expect(last.skill).toBeDefined();
     expect(last.skill!.name).toBe("foo");
-    expect(last.images).toHaveLength(1);
-    expect(last.images![0].mimeType).toBe("image/png");
+    expect(last.imageCount).toBe(1);
+    expect(last.images).toBeUndefined();
   });
 
   it("string-content (non-array) shape also stamps skill when wrapped", () => {

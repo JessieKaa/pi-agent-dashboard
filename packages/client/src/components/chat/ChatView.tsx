@@ -17,7 +17,7 @@ import { findActiveInteractiveToolResultIds, findRetriedErrorIds, findSurfaceSup
 // RetryBanner + ErrorBanner replaced by the unified SessionBanner mounted
 // in App.tsx (sticky above the command input). See change:
 // unify-status-banner-and-terminal-limit-stop.
-import type { ChatImage, InteractiveUiRequest, SessionState } from "../../lib/chat/event-reducer.js";
+import type { InteractiveUiRequest, SessionState } from "../../lib/chat/event-reducer.js";
 import { formatMessageTime } from "../../lib/util/format.js";
 import { type BurstItem, groupToolBursts, type ToolBurstGroup as ToolBurstGroupData } from "../../lib/chat/group-tool-bursts.js";
 import type { ToolCallGroup } from "../../lib/chat/group-tool-calls.js";
@@ -31,7 +31,6 @@ import { CommandFeedbackCard } from "./CommandFeedbackCard.js";
 import { CopyButton } from "../primitives/CopyButton.js";
 import { MissingToolInlineError } from "./MissingToolInlineError.js";
 import { FilePreviewHost, FilePreviewProvider } from "../preview/FilePreviewContext.js";
-import { ImageLightbox } from "../preview/ImageLightbox.js";
 import { InlineTerminalCard } from "../terminal/InlineTerminalCard.js";
 import { getInteractiveRenderer } from "../interactive-renderers/registry.js";
 import { MarkdownContent } from "../preview/MarkdownContent.js";
@@ -98,49 +97,15 @@ interface Props {
   /** Current sparse override for the session, or `undefined`. */
 }
 
-function ImageAttachments({
-  images,
-  onImageLoad,
-}: {
-  images: ChatImage[];
-  /**
-   * Fired when an attached `<img>` finishes decoding. In the virtualized
-   * transcript the owning row is first measured pre-decode (img ~0px); this
-   * signal lets ChatView re-measure the row at its true post-decode height so
-   * the message cannot stay collapsed and overlap its neighbour (issue #267).
-   */
-  onImageLoad?: (e: React.SyntheticEvent<HTMLImageElement>) => void;
-}) {
-  const [lightboxSrc, setLightboxSrc] = useState<{ src: string; alt: string } | null>(null);
-  // Track decoded images so the reserved loading box is dropped once the real
-  // intrinsic size is known (a bounded box avoids the near-zero pre-decode
-  // measurement without distorting small decoded images).
-  const [loaded, setLoaded] = useState<Set<number>>(() => new Set());
+function AttachmentNotice({ count }: { count: number }) {
   return (
-    <>
-      <div className="flex gap-2 flex-wrap mb-2">
-        {images.map((img, i) => {
-          const src = `data:${img.mimeType};base64,${img.data}`;
-          const reserve = !loaded.has(i) ? "min-w-[80px] min-h-[80px]" : "";
-          return (
-            <img
-              key={i}
-              src={src}
-              alt={`Attachment ${i + 1}`}
-              className={`max-w-[300px] max-h-[300px] ${reserve} rounded border border-white/20 object-contain cursor-pointer`}
-              onLoad={(e) => {
-                setLoaded((prev) => (prev.has(i) ? prev : new Set(prev).add(i)));
-                onImageLoad?.(e);
-              }}
-              onClick={() => setLightboxSrc({ src, alt: `Attachment ${i + 1}` })}
-            />
-          );
-        })}
-      </div>
-      {lightboxSrc && (
-        <ImageLightbox src={lightboxSrc.src} alt={lightboxSrc.alt} onClose={() => setLightboxSrc(null)} />
-      )}
-    </>
+    <div
+      className="mb-2 inline-flex items-center rounded border border-blue-400/30 bg-blue-400/10 px-2 py-1 text-xs text-blue-200/80"
+      data-testid="image-attachment-notice"
+      data-copy-exclude="true"
+    >
+      {i18nT("session.attachedImages", { count }, "Attached {count} image(s)")}
+    </div>
   );
 }
 
@@ -853,10 +818,8 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
               <div className="mt-4 mb-4 flex flex-col items-end" {...(msg.turnIndex != null ? { "data-turn": msg.turnIndex } : {})}>
                 {msg.streamingBehavior && <StreamingBehaviorBadge behavior={msg.streamingBehavior} />}
                 <div className={bubbleMax}>
-                  {msg.images && msg.images.length > 0 && (
-                    <div className="mb-2">
-                      <ImageAttachments images={msg.images} onImageLoad={(e) => requestRowMeasure(e.currentTarget)} />
-                    </div>
+                  {msg.imageCount && msg.imageCount > 0 && (
+                    <AttachmentNotice count={msg.imageCount} />
                   )}
                   <SkillInvocationCard
                     skill={msg.skill}
@@ -876,8 +839,8 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
             <div className="mt-4 mb-4 flex flex-col items-end" {...(msg.turnIndex != null ? { "data-turn": msg.turnIndex } : {})}>
               {msg.streamingBehavior && <StreamingBehaviorBadge behavior={msg.streamingBehavior} />}
               <div className={`bg-blue-500/10 border border-blue-500/20 border-l-2 border-l-blue-400 rounded-xl shadow-md px-4 py-2 ${bubbleMax}`}>
-                {msg.images && msg.images.length > 0 && (
-                  <ImageAttachments images={msg.images} onImageLoad={(e) => requestRowMeasure(e.currentTarget)} />
+                {msg.imageCount && msg.imageCount > 0 && (
+                  <AttachmentNotice count={msg.imageCount} />
                 )}
                 {msg.content && (
                   <MessageBubble
@@ -1136,8 +1099,8 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
       {state.pendingPrompt && (
         <div data-testid="pending-prompt-card" data-status={state.pendingPrompt.status} className="mt-4 mb-4 flex justify-end">
           <div className={`bg-blue-500/10 border border-blue-500/20 border-l-2 border-l-blue-400 rounded-xl shadow-md px-4 py-2 ${bubbleMax} ${state.pendingPrompt.status === "sending" ? "opacity-60 prompt-sending-fx prompt-edge-pulse" : ""}`}>
-            {state.pendingPrompt.images && state.pendingPrompt.images.length > 0 && (
-              <ImageAttachments images={state.pendingPrompt.images} />
+            {state.pendingPrompt.imageCount && state.pendingPrompt.imageCount > 0 && (
+              <AttachmentNotice count={state.pendingPrompt.imageCount} />
             )}
             <div className="flex items-start gap-2">
               <div className="flex-1">

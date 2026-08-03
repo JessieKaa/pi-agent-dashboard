@@ -5,6 +5,7 @@ import {
   createMemoryEventStore,
   exceedsSerializedSize,
   measureBytes,
+  projectUserImageAttachments,
   reduceSubagentEvent,
   shrinkEntryToBudget,
 } from "../persistence/memory-event-store.js";
@@ -159,20 +160,19 @@ describe("memory-event-store", () => {
       const store = createMemoryEventStore(neverPinned, 100, 5000, 100);
       const longBase64 = "A".repeat(500);
       const event: DashboardEvent = {
-        eventType: "message_start",
+        eventType: "test",
         timestamp: Date.now(),
         data: {
-          message: {
-            role: "user",
-            content: [
-              { type: "image", data: longBase64, mimeType: "image/png" },
-            ],
+          payload: {
+            type: "image",
+            data: longBase64,
+            mimeType: "image/png",
           },
         },
       };
       store.insertEvent("s1", event);
       const stored = store.getEvent("s1", 1);
-      const content = (stored as any).data.message.content[0];
+      const content = (stored as any).data.payload;
       expect(content.data).toBe(longBase64);
       expect(content.data).toHaveLength(500);
     });
@@ -221,15 +221,7 @@ describe("memory-event-store", () => {
       expect(content.length).toBeLessThan(10_000);
     });
 
-    it("large pasted image over the ceiling is now byte-detected and placeholdered", () => {
-      // Behavior REVERSAL (intended): the size walk used to exempt base64 image
-      // `data` (counted 8 bytes), letting an image-bearing event escape the
-      // ceiling and then OOM the broadcast JSON.stringify. It now counts the
-      // image at its REAL byte size, so an over-ceiling image-bearing event
-      // correctly trips the ceiling and gets the {__truncated} placeholder.
-      // See change: head-tail-truncate-subagent-event-timeline (D8).
-      const store = createMemoryEventStore(neverPinned); // production defaults
-      const bigImage = "A".repeat(100_000); // > 20KB ceiling
+    it("projects user image blocks to an attachment count without mutating the input", () => {
       const event: DashboardEvent = {
         eventType: "message_start",
         timestamp: Date.now(),
@@ -238,16 +230,86 @@ describe("memory-event-store", () => {
             role: "user",
             content: [
               { type: "text", text: "here is the screenshot" },
-              { type: "image", data: bigImage, mimeType: "image/png" },
+              { type: "image", data: "A".repeat(100_000), mimeType: "image/png" },
+              { type: "image", data: "B".repeat(100_000), mimeType: "image/jpeg" },
+            ],
+            entryId: "entry-1",
+          },
+        },
+      };
+      const originalContent = (event.data as any).message.content;
+      const projected = projectUserImageAttachments(event);
+      const projectedData = projected.data as any;
+
+      expect((event.data as any).message.content).toBe(originalContent);
+      expect(projected).not.toBe(event);
+      expect(projectedData.imageCount).toBe(2);
+      expect(projectedData.message).toMatchObject({ role: "user", entryId: "entry-1" });
+      expect(projectedData.message.content).toEqual([{ type: "text", text: "here is the screenshot" }]);
+    });
+
+    it("keeps a large user message visible in the event store", () => {
+      const store = createMemoryEventStore(neverPinned);
+      const event: DashboardEvent = {
+        eventType: "message_start",
+        timestamp: Date.now(),
+        data: {
+          message: {
+            role: "user",
+            content: [
+              { type: "text", text: "here is the screenshot" },
+              { type: "image", data: "A".repeat(100_000), mimeType: "image/png" },
             ],
           },
         },
       };
+
       store.insertEvent("s1", event);
       const stored = store.getEvent("s1", 1) as any;
-      expect(stored.data.__truncated).toBe(true);
-      expect(stored.data.eventType).toBe("message_start");
-      expect(Buffer.byteLength(JSON.stringify(stored.data))).toBeLessThanOrEqual(20_000);
+
+      expect(stored.data.__truncated).toBeUndefined();
+      expect(stored.data.imageCount).toBe(1);
+      expect(stored.data.message.content).toEqual([{ type: "text", text: "here is the screenshot" }]);
+      expect(JSON.stringify(stored.data)).not.toContain("A".repeat(100));
+    });
+
+    it("does not project user image blocks outside message_start", () => {
+      const assistant: DashboardEvent = {
+        eventType: "message_end",
+        timestamp: Date.now(),
+        data: {
+          message: {
+            role: "assistant",
+            content: [{ type: "image", data: "assistant-image", mimeType: "image/png" }],
+          },
+        },
+      };
+      const toolResult: DashboardEvent = {
+        eventType: "tool_execution_end",
+        timestamp: Date.now(),
+        data: {
+          message: {
+            role: "toolResult",
+            content: [{ type: "image", data: "tool-image", mimeType: "image/png" }],
+          },
+        },
+      };
+
+      expect(projectUserImageAttachments(assistant)).toBe(assistant);
+      expect(projectUserImageAttachments(toolResult)).toBe(toolResult);
+    });
+
+    it("is idempotent after user image blocks have already been projected", () => {
+      const projected: DashboardEvent = {
+        eventType: "message_start",
+        timestamp: Date.now(),
+        data: {
+          imageCount: 2,
+          message: { role: "user", content: [{ type: "text", text: "caption" }] },
+        },
+      };
+
+      expect(projectUserImageAttachments(projected)).toBe(projected);
     });
 
     it("preserves assistant text when thinking makes message events exceed the ceiling", () => {
@@ -279,7 +341,7 @@ describe("memory-event-store", () => {
       expect(Buffer.byteLength(JSON.stringify(stored.data))).toBeLessThanOrEqual(20_000);
     });
 
-    it("truncates other fields alongside preserved image data", () => {
+    it("truncates other fields while projecting user image data", () => {
       const store = createMemoryEventStore(neverPinned, 100, 5000, 100);
       const longBase64 = "C".repeat(500);
       const longThinking = "D".repeat(5000);
@@ -290,6 +352,7 @@ describe("memory-event-store", () => {
           message: {
             role: "user",
             content: [
+              { type: "text", text: "caption" },
               { type: "image", data: longBase64, mimeType: "image/png" },
             ],
           },
@@ -297,12 +360,12 @@ describe("memory-event-store", () => {
         },
       };
       store.insertEvent("s1", event);
-      const stored = store.getEvent("s1", 1);
-      const content = (stored as any).data.message.content[0];
-      expect(content.data).toBe(longBase64); // preserved
-      const thinking = (stored as any).data.thinking as string;
-      expect(thinking).toContain("truncated"); // truncated
-      expect(thinking.length).toBeLessThan(longThinking.length); // shorter than original
+      const stored = store.getEvent("s1", 1) as any;
+      expect(stored.data.imageCount).toBe(1);
+      expect(stored.data.message.content).toEqual([{ type: "text", text: "caption" }]);
+      const thinking = stored.data.thinking as string;
+      expect(thinking).toContain("truncated");
+      expect(thinking.length).toBeLessThan(longThinking.length);
     });
   });
 
@@ -793,7 +856,7 @@ describe("memory-event-store", () => {
       expect(Buffer.byteLength(JSON.stringify(entry))).toBeLessThanOrEqual(B);
     });
 
-    it("E11: image-bearing NON-subagent event is byte-detected → {__truncated}", () => {
+    it("E11: projects a large user image event to a bounded attachment summary", () => {
       const store = createMemoryEventStore(neverPinned);
       const event: DashboardEvent = {
         eventType: "message_start",
@@ -801,13 +864,18 @@ describe("memory-event-store", () => {
         data: {
           message: {
             role: "user",
-            content: [{ type: "image", data: "A".repeat(2_000_000), mimeType: "image/png" }],
+            content: [
+              { type: "text", text: "screenshot" },
+              { type: "image", data: "A".repeat(2_000_000), mimeType: "image/png" },
+            ],
           },
         },
       };
       store.insertEvent("s1", event);
       const stored = store.getEvent("s1", 1) as any;
-      expect(stored.data.__truncated).toBe(true);
+      expect(stored.data.__truncated).toBeUndefined();
+      expect(stored.data.imageCount).toBe(1);
+      expect(stored.data.message.content).toEqual([{ type: "text", text: "screenshot" }]);
       expect(bytesOf(stored.data)).toBeLessThanOrEqual(CEIL);
     });
 

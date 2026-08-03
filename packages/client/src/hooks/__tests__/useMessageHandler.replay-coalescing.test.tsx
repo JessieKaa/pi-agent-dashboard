@@ -200,7 +200,7 @@ describe("useMessageHandler — replay coalescing", () => {
 
   it("applies reset and continuation batches in arrival order while preserving pendingPrompt", () => {
     const initial = createInitialState();
-    initial.pendingPrompt = { text: "keep me", images: undefined, status: "sending" };
+    initial.pendingPrompt = { text: "keep me", imageCount: 1, status: "sending" };
     initial.messages.push({ id: "stale", role: "user", content: "stale", timestamp: 1 });
     const { dispatch } = setup(new Map([["s1", initial]]));
 

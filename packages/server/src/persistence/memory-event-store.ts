@@ -133,6 +133,39 @@ function isImageBlock(obj: object): boolean {
 }
 
 /**
+ * Remove user image payloads from browser-bound events while preserving the
+ * attachment count. Pi JSONL and the original bridge event remain unchanged.
+ */
+export function projectUserImageAttachments(event: DashboardEvent): DashboardEvent {
+  if (event.eventType !== "message_start") return event;
+  const data = event.data;
+  if (!data || typeof data !== "object") return event;
+  const message = (data as Record<string, unknown>).message;
+  if (!message || typeof message !== "object") return event;
+  const msg = message as Record<string, unknown>;
+  if (msg.role !== "user" || !Array.isArray(msg.content)) return event;
+
+  const imageCount = msg.content.filter(
+    (part) => part && typeof part === "object" && (part as Record<string, unknown>).type === "image",
+  ).length;
+  if (imageCount === 0) return event;
+
+  return {
+    ...event,
+    data: {
+      ...(data as Record<string, unknown>),
+      imageCount,
+      message: {
+        ...msg,
+        content: msg.content.filter(
+          (part) => !(part && typeof part === "object" && (part as Record<string, unknown>).type === "image"),
+        ),
+      },
+    },
+  };
+}
+
+/**
  * Anchored match of a `/skill:<name>` invocation envelope
  * (`<skill name=".." location="..">\nbody\n</skill>[\n\nargs]`) — the shape
  * pi's `_expandSkillCommand` + the bridge's prompt-expander emit as the USER
@@ -802,7 +835,8 @@ export function createMemoryEventStore(
     insertEvent(sessionId: string, event: DashboardEvent): number {
       const buf = getOrCreate(sessionId);
       const seq = buf.nextSeq++;
-      buf.events.push({ seq, event: truncateEventData(event) });
+      const projectedEvent = projectUserImageAttachments(event);
+      buf.events.push({ seq, event: truncateEventData(projectedEvent) });
       // Trim over the per-session limit (0 = unlimited). Hysteresis: only
       // reclaim once the buffer overshoots the cap by TRIM_SLACK, then trim
       // back to the cap in one O(n) pass. This amortizes the trim cost to O(1)

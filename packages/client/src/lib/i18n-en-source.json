@@ -399,6 +399,7 @@
   "common.noMarkdownFiles": "No markdown files",
   "common.noMatches": "No matches.",
   "common.noMatchingChanges": "No matching changes",
+  "session.attachedImages": "Attached {count} image(s)",
   "session.noMessagesYet": "No messages yet",
   "session.noMessagesYetBody": "Send a prompt below to start the conversation.",
   "common.noModelsMatch": "No models match",

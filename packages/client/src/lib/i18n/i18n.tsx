@@ -634,6 +634,7 @@ const zhCN: Record<string, string> = {
   "session.newSession2": "新建会话",
   "session.nextFollowUpEntry": "下一条后续消息",
   "session.noActiveSessions": "暂无活动会话",
+  "session.attachedImages": "已附加 {count} 张图片",
   "session.noMessagesYet": "暂无消息",
   "session.noProjectsWithActiveSessions": "没有包含活动会话的项目。",
   "session.noSessionSelected": "未选择会话",

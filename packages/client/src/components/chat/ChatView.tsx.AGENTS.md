@@ -8,7 +8,7 @@ Reads `prefs = useDisplayPrefs(sessionId)`; gates `<ThinkingBlock>` on `prefs.th
 
 Passes `showResultBody={prefs.toolResultBodies}` to `<ToolCallStep>`.
 
-See change: configurable-chat-display.
+**User attachments:** settled and pending user prompts render a localized `imageCount` notice only; no user `<img>`/data URL is created. Tool-result `images` still pass to `ToolCallStep`. See change: summarize-user-image-attachments.
 
 Sticky-bottom auto-scroll via `useLayoutEffect` (synchronizes scroll before paint, avoids per-line jumps). `stickToBottomRef` chases new content until scroll-up or `scrollToTurn`; re-arms on scroll-to-bottom button or near-bottom (`SCROLL_THRESHOLD`). Scroll-to-bottom uses `behavior: "instant"` while `streamingText`/`streamingThinking`/`pendingSteering` active, else `"smooth"`. Scroll container `overflowAnchor: "auto"`. Per-session scroll position persisted across switches. Replaces old `markProgrammatic`/`programmaticScroll` suppression window. See change: fix-chat-scroll-race-during-replay.
 

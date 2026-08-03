@@ -59,7 +59,30 @@ describe("eventReducer", () => {
     expect(state.messages[0].images).toBeUndefined();
   });
 
-  it("should extract images from user message content", () => {
+  it("should summarize user image blocks without retaining image data", () => {
+    const state = applyEvents([
+      {
+        eventType: "message_start",
+        timestamp: Date.now(),
+        data: {
+          imageCount: 2,
+          message: {
+            role: "user",
+            content: [
+              { type: "text", text: "Check these images" },
+            ],
+          },
+        },
+      },
+    ]);
+
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0].content).toBe("Check these images");
+    expect(state.messages[0].imageCount).toBe(2);
+    expect(state.messages[0].images).toBeUndefined();
+  });
+
+  it("should derive image count from legacy user image blocks", () => {
     const state = applyEvents([
       {
         eventType: "message_start",
@@ -76,36 +99,12 @@ describe("eventReducer", () => {
       },
     ]);
 
-    expect(state.messages).toHaveLength(1);
     expect(state.messages[0].content).toBe("Check this image");
-    expect(state.messages[0].images).toHaveLength(1);
-    expect(state.messages[0].images![0]).toEqual({ data: "abc123", mimeType: "image/png" });
+    expect(state.messages[0].imageCount).toBe(1);
+    expect(state.messages[0].images).toBeUndefined();
   });
 
-  it("should skip image blocks with missing data or mimeType", () => {
-    const state = applyEvents([
-      {
-        eventType: "message_start",
-        timestamp: Date.now(),
-        data: {
-          message: {
-            role: "user",
-            content: [
-              { type: "text", text: "test" },
-              { type: "image", data: "", mimeType: "image/png" },
-              { type: "image", data: "valid", mimeType: undefined },
-              { type: "image", data: "good", mimeType: "image/jpeg" },
-            ],
-          },
-        },
-      },
-    ]);
-
-    expect(state.messages[0].images).toHaveLength(1);
-    expect(state.messages[0].images![0]).toEqual({ data: "good", mimeType: "image/jpeg" });
-  });
-
-  it("should handle user message with string content (no array)", () => {
+  it("should handle user message with string content (no image count)", () => {
     const state = applyEvents([
       {
         eventType: "message_start",
@@ -120,6 +119,7 @@ describe("eventReducer", () => {
     ]);
 
     expect(state.messages[0].content).toBe("plain string message");
+    expect(state.messages[0].imageCount).toBeUndefined();
     expect(state.messages[0].images).toBeUndefined();
   });
 
@@ -2949,18 +2949,15 @@ describe("findLastUserPrompt (Retry button)", () => {
     expect(result).toEqual({ text: "real prompt" });
   });
 
-  it("includes images mapped to wire shape with type:'image'", () => {
+  it("does not include image data in retry payloads", () => {
     const result = findLastUserPrompt([
       make({
         role: "user",
         content: "caption",
-        images: [{ data: "AAAA", mimeType: "image/png" }],
+        imageCount: 1,
       }),
     ]);
-    expect(result).toEqual({
-      text: "caption",
-      images: [{ type: "image", data: "AAAA", mimeType: "image/png" }],
-    });
+    expect(result).toEqual({ text: "caption" });
   });
 
   it("omits the images key when the user message had none", () => {

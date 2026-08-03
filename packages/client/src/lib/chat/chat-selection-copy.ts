@@ -61,6 +61,7 @@ function serializeFragment(root: Node): string {
     }
     if (node.nodeType !== Node.ELEMENT_NODE) return;
     const el = node as Element;
+    if (el.getAttribute("data-copy-exclude") === "true") return;
     if (el.tagName === "BR") {
       out += "\n";
       return;

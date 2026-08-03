@@ -118,13 +118,13 @@ describe("estimateVirtualRowSize (task 2.2)", () => {
     expect(estimateVirtualRowSize(msg({ id: "u", role: "user" }), 0)).toBe(96);
   });
 
-  it("adds the user image reserve (300) for an image-bearing user row", () => {
+  it("does not reserve image height for a user attachment notice", () => {
     const withText = estimateVirtualRowSize(msg({ id: "u", role: "user" }), 1000);
-    const withImage = estimateVirtualRowSize(
-      msg({ id: "u", role: "user", images: [{ data: "x", mimeType: "image/png" }] }),
+    const withNotice = estimateVirtualRowSize(
+      msg({ id: "u", role: "user", imageCount: 1 }),
       1000,
     );
-    expect(withImage - withText).toBe(300);
+    expect(withNotice).toBe(withText);
   });
 
   it("adds the larger tool-result image reserve (512) for an image-bearing toolResult row", () => {

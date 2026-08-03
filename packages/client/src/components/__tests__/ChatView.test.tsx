@@ -241,37 +241,25 @@ describe("ChatView", () => {
     expect(card).toBeNull();
   });
 
-  it("renders pending prompt card with images", () => {
+  it("renders an attachment notice without loading a user image", () => {
     const state = createInitialState();
     state.pendingPrompt = {
       text: "Check this",
       status: "sending",
-      images: [{ data: "abc123", mimeType: "image/png" }],
+      imageCount: 1,
     };
-    const { container } = render(<ThemeProvider><ChatView state={state} toolContext={defaultToolContext} /></ThemeProvider>);
-    const card = container.querySelector('[data-testid="pending-prompt-card"]');
-    expect(card).not.toBeNull();
-    const img = card!.querySelector("img");
-    expect(img).not.toBeNull();
-    expect(img!.getAttribute("src")).toContain("data:image/png;base64,abc123");
-  });
-
-  it("opens lightbox when clicking a user message image", () => {
-    const state = createInitialState();
     state.messages.push({
       id: "img-msg",
       role: "user",
       content: "See this",
+      imageCount: 2,
       timestamp: Date.now(),
-      images: [{ data: "abc123", mimeType: "image/png" }],
     });
     const { container } = render(<ThemeProvider><ChatView state={state} toolContext={defaultToolContext} /></ThemeProvider>);
-    const img = container.querySelector("img");
-    expect(img).not.toBeNull();
-    expect(img!.className).toContain("cursor-pointer");
-    fireEvent.click(img!);
-    const lightbox = document.body.querySelector("[data-testid='lightbox-backdrop']");
-    expect(lightbox).not.toBeNull();
+    expect(container.querySelectorAll('[data-testid="image-attachment-notice"]')).toHaveLength(2);
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).toContain("Attached 1 image(s)");
+    expect(container.textContent).toContain("Attached 2 image(s)");
   });
 
   it("hides empty-state message when pendingPrompt is set", () => {
