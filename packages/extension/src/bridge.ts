@@ -44,6 +44,7 @@ import { FLOW_EVENT_MAP, registerFlowEventListeners, SUBAGENT_EVENT_MAP } from "
 import { runGitPollTick } from "./git-poll.js";
 import { flipHasUI } from "./hasui-flip.js";
 import { inlineMessageText, type ReadFileOutcome } from "./markdown-image-inliner.js";
+import { COALESCE_WINDOW_MS, MessageUpdateCoalescer, type MessageKey } from "./message-update-coalescer.js";
 import { resetReconnectCaches as _resetReconnectCaches, sendCwdMissingIfChanged as _sendCwdMissingIfChanged, sendGitInfoIfChanged as _sendGitInfoIfChanged, sendModelUpdateIfChanged as _sendModelUpdateIfChanged, sendPiVersionIfChanged as _sendPiVersionIfChanged, sendSessionNameIfChanged as _sendSessionNameIfChanged, defaultReadPiVersion } from "./model-tracker.js";
 import { decodeMultiselectAnswer } from "./multiselect-decode.js";
 import { collectMetrics, startMetricsMonitor, stopMetricsMonitor } from "./process-metrics.js";
@@ -78,6 +79,12 @@ const RELOAD_HANDOFF_TTL = 5_000;
 const PROCESS_SCAN_INTERVAL = process.platform === "win32" ? 10_000 : 5_000; // platform-branch-ok: top-level cadence tuning; Windows uses costly PowerShell Get-CimInstance
 const PROCESS_MIN_ELAPSED_MS = process.platform === "win32" ? 30_000 : 5_000; // platform-branch-ok: matches PROCESS_SCAN_INTERVAL's Windows-safe defaults
 
+function messageKeyOf(message: unknown): MessageKey | undefined {
+  if (!message || typeof message !== "object") return undefined;
+  const value = message as { role?: unknown; timestamp?: unknown };
+  if (typeof value.role !== "string" || typeof value.timestamp !== "number") return undefined;
+  return `${value.role}:${value.timestamp}`;
+}
 
 
 // Use `process` (not `globalThis`) to survive jiti module cache invalidation
@@ -248,8 +255,35 @@ function initBridge(pi: ExtensionAPI) {
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let gitPollTimer: ReturnType<typeof setInterval> | null = null;
   let processScanTimer: ReturnType<typeof setInterval> | null = null;
+  let updateCoalesceTimer: ReturnType<typeof setInterval> | null = null;
+  // Window-timer sweep for the session-scoped message_update coalescer. One
+  // 50ms interval runs ALL sessions' pending slots (each slot tracks its own
+  // arm time, so a single timer cannot delay a window). The coalescer also
+  // owns a private fallback timeout; lifecycle cleanup cancels both.
+  // See change: coalesce-message-update-text-snapshots.
+  let activeUpdateCoalescers = new Set<MessageUpdateCoalescer>();
+  function sweepUpdateCoalescers(): void {
+    for (const c of activeUpdateCoalescers) c.flush();
+  }
   let previousProcessPids: string = ""; // JSON-stringified PID set for diff
   const trackedPgids = new Set<number>(); // PGIDs captured during bash tool calls
+  // Generation of the assistant message currently streaming (stale-drop
+  // barrier for the message_update coalescer). Increments on EVERY assistant
+  // message_start — including user prompts (retry chains and new turns both
+  // reset the barrier so a straggler from a previous message can never leak
+  // into the new one).
+  let assistantMessageGen = 0;
+  // Session-scoped message_update coalescer (re-created on each session_start
+  // for a fresh slot + stale-drop barrier). Handlers run against the CURRENT
+  // session's instance — safe because events never cross a session boundary,
+  // and the sweep timer iterates a Set of live instances.
+  // See change: coalesce-message-update-text-snapshots.
+  let updateCoalescer = new MessageUpdateCoalescer({
+    send: (event) => {
+      maybeInlineAssistantImages(event);
+      connection.send(mapEventToProtocol(sessionId, event));
+    },
+  });
   // PIDs of subprocesses the bridge has spawned itself (dashboard server,
   // RPC keeper). Threaded into `scanChildProcesses` as `excludedPgids` so
   // bridge infrastructure never surfaces in the process list.
@@ -1071,6 +1105,11 @@ function initBridge(pi: ExtensionAPI) {
     }),
     onReconnect: safe(() => {
       if (!isActive()) return; // Stale listener guard
+      // Flush the live session's pending text snapshot before state sync and
+      // replay. Reconnect is a transport boundary, not a session boundary;
+      // keep valid live content, but never let it appear after historical
+      // replay. See change: coalesce-message-update-text-snapshots.
+      updateCoalescer.flush();
       // Reset caches that aren't persisted server-side so the upcoming
       // 30s tick (and the inline calls below) re-emit the live state.
       const _bc = syncBc();
@@ -1497,6 +1536,16 @@ function initBridge(pi: ExtensionAPI) {
       cachedCtx = ctx;
       // Don't send events before session_start has established the correct session ID
       if (!sessionReady) return;
+      // Hard invariant: a parked message_update text snapshot MUST land on
+      // the wire BEFORE any non-update event (message_end clears
+      // streamingText on the client; a late update would re-fill it as a
+      // ghost streaming bubble). This runs at the entry of EVERY handler —
+      // including the branches that early-return below (model_select,
+      // turn_end, message_end, message_start, pass-through sends).
+      // See change: coalesce-message-update-text-snapshots.
+      if (eventType !== "message_update") {
+        updateCoalescer.flush();
+      }
       // Track agent streaming state (survives reconnect/reload)
       if (eventType === "agent_start") {
         getBridgeState().isAgentStreaming = true;
@@ -1670,6 +1719,16 @@ function initBridge(pi: ExtensionAPI) {
           const enriched = { ...event, nonce };
           const msg = mapEventToProtocol(sessionId, enriched);
           const role = (messageRef as any).role;
+          const messageKey = messageKeyOf(messageRef);
+          // Stale-drop barrier for the message_update coalescer: EVERY
+          // message_start advances the generation so a straggler update from
+          // a previous message is dropped — user prompts (retry chains, new
+          // turns) and assistant messages alike. The stable role/timestamp
+          // key also rejects an update from a different message that happens
+          // to arrive under the current generation. See change:
+          // coalesce-message-update-text-snapshots.
+          assistantMessageGen++;
+          updateCoalescer.messageStart(assistantMessageGen, messageKey);
           // Abort latch (resumption + clear hooks). A USER message_start is a
           // deliberate new turn — clear the latch so it is never aborted. An
           // ASSISTANT message_start while the latch is set is the aborted
@@ -1754,6 +1813,7 @@ function initBridge(pi: ExtensionAPI) {
       if (eventType === "message_end") {
         wrapAppendMessageForCtx(ctx);
         const messageRef = (event as any).message;
+        updateCoalescer.messageEnd(assistantMessageGen, messageKeyOf(messageRef));
         const nonce = messageRef && typeof messageRef === "object"
           ? (pendingNonces.get(messageRef as object) ?? nextNonce())
           : nextNonce();
@@ -1798,11 +1858,16 @@ function initBridge(pi: ExtensionAPI) {
         return;
       }
 
-      // Apply markdown image inliner to assistant message_update events.
-      // For other event types this is a no-op (role check inside the helper).
-      // See change: chat-markdown-local-images-and-math.
+      // Split-flow message_update coalescing: contiguous text snapshot events
+      // park in a single slot and flush after a fixed 50 ms window; thinking,
+      // toolcall, and unknown sub-events flush any preceding text first, then
+      // forward immediately so the source order is preserved. The inliner runs
+      // on the event at flush time (once per window) inside the coalescer send
+      // callback; the message_end inliner below is KEPT for final-content
+      // replacement. See change: coalesce-message-update-text-snapshots.
       if (eventType === "message_update") {
-        maybeInlineAssistantImages(event);
+        updateCoalescer.update(event, assistantMessageGen, messageKeyOf((event as any).message));
+        return;
       }
 
       // Inline path-referenced image tool results (e.g. browser `screenshot`)
@@ -1876,6 +1941,10 @@ function initBridge(pi: ExtensionAPI) {
       if (!isActive()) return;
       cachedCtx = ctx;
       if (!sessionReady) return;
+      // A pass-through event is a non-update event: any parked text snapshot
+      // must land first (hard invariant — see handler entry above).
+      // See change: coalesce-message-update-text-snapshots.
+      updateCoalescer.flush();
       const msg = mapEventToProtocol(sessionId, event);
       connection.send(msg);
     }));
@@ -1962,6 +2031,10 @@ function initBridge(pi: ExtensionAPI) {
   function flushPendingSubagentFrames(): void {
     const drained = subagentFrameBuffer.drain();
     if (drained.length === 0) return;
+    // Any parked message_update text snapshot must land before subagent
+    // frames (a frame can arrive after its parent message ended).
+    // See change: coalesce-message-update-text-snapshots.
+    updateCoalescer.flush();
     for (const { channel, data } of drained) {
       try { sendEventForward(channel, data); } catch { /* keep flushing */ }
     }
@@ -1993,6 +2066,10 @@ function initBridge(pi: ExtensionAPI) {
           // than risking eviction from the shared ring.
           // See change: fix-subagent-live-detail-reliability (D1/D2).
           if (sessionReady && isActive() && connection.isConnected) {
+            // Any parked message_update text snapshot must land before this
+            // frame — a subagent/flow frame can be a boundary event.
+            // See change: coalesce-message-update-text-snapshots.
+            updateCoalescer.flush();
             sendEventForward(channel, eventData);
             subagentFrameBuffer.markForwarded(channel, eventData);
           } else if (!subagentFrameBuffer.buffer(channel, eventData)) {
@@ -2001,6 +2078,7 @@ function initBridge(pi: ExtensionAPI) {
             );
           }
         } else if (sessionReady && isActive()) {
+          updateCoalescer.flush();
           sendEventForward(channel, eventData);
         }
       } catch { /* forwarding failure must never break the original emit */ }
@@ -2623,6 +2701,19 @@ function initBridge(pi: ExtensionAPI) {
     }, PROCESS_SCAN_INTERVAL);
     getBridgeState().timers!.push(processScanTimer);
 
+    // Window sweep for the message_update coalescer: one 50ms interval drains
+    // the parked text snapshot once per window (each slot tracks its own arm
+    // time, so a single timer cannot delay a window).
+    // See change: coalesce-message-update-text-snapshots.
+    activeUpdateCoalescers.add(updateCoalescer);
+    if (updateCoalesceTimer === null) {
+      updateCoalesceTimer = setInterval(() => {
+        if (!isActive()) return;
+        sweepUpdateCoalescers();
+      }, COALESCE_WINDOW_MS);
+      getBridgeState().timers!.push(updateCoalesceTimer);
+    }
+
     // Register flow event listeners (pi-flows emits these via pi.events)
     registerFlowEventListeners(syncBc(), () => sessionReady, getFlowsList);
 
@@ -2643,6 +2734,13 @@ function initBridge(pi: ExtensionAPI) {
     // sessionId on its session_register. See change: inject-session-context-into-agent.
     attachedChange = null;
     getBridgeState().attachedChange = null;
+    // Drop any parked message_update text snapshot + raise the stale-drop
+    // barrier on a real session switch — the new session's stream must not
+    // inherit a straggler from the outgoing one. The session-scoped
+    // coalescer is re-created on the next session_start.
+    // See change: coalesce-message-update-text-snapshots.
+    updateCoalescer.clear(assistantMessageGen);
+    activeUpdateCoalescers.delete(updateCoalescer);
     // Drop retained subagent frames/snapshots on a real session switch — the
     // new/fork/resumed session's subagents are unrelated to the outgoing one.
     // See change: fix-subagent-live-detail-reliability.
@@ -2721,6 +2819,11 @@ function initBridge(pi: ExtensionAPI) {
     }
     getBridgeState().isAgentStreaming = false;
     stopMetricsMonitor();
+    // Drop any parked message_update text snapshot on shutdown — a late
+    // flush after disconnect would buffer into the send ring for nothing.
+    // See change: coalesce-message-update-text-snapshots.
+    updateCoalescer.clear(assistantMessageGen);
+    activeUpdateCoalescers.delete(updateCoalescer);
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
       heartbeatTimer = null;
@@ -2728,6 +2831,11 @@ function initBridge(pi: ExtensionAPI) {
     if (gitPollTimer) {
       clearInterval(gitPollTimer);
       gitPollTimer = null;
+    }
+    if (updateCoalesceTimer) {
+      clearInterval(updateCoalesceTimer);
+      updateCoalesceTimer = null;
+      activeUpdateCoalescers = new Set();
     }
 
     if (reason === "quit") {
@@ -2785,6 +2893,16 @@ function initBridge(pi: ExtensionAPI) {
     s.hasUI = cachedHasUI;
     if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
     if (gitPollTimer) { clearInterval(gitPollTimer); gitPollTimer = null; }
+    // Drop any parked message_update text snapshot and cancel its private
+    // timeout before disconnecting the old bridge during reload.
+    // See change: coalesce-message-update-text-snapshots.
+    updateCoalescer.clear(assistantMessageGen);
+    activeUpdateCoalescers.delete(updateCoalescer);
+    if (updateCoalesceTimer) {
+      clearInterval(updateCoalesceTimer);
+      updateCoalesceTimer = null;
+      activeUpdateCoalescers = new Set();
+    }
 
     // Dev build & restart: rebuild client and stop server before reload
     if (config.devBuildOnReload) {

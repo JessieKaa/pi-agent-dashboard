@@ -28,6 +28,7 @@ Files in this directory. One row per source file.
 | `git-poll.ts` | Exports `runGitPollTick(deps)` + `GitPollDeps` interface. Pure git + name/model poll-tick body. → see `git-poll.ts.AGENTS.md` |
 | `hasui-flip.ts` | Flip `ctx.hasUI` to `true` after bridge patches `ctx.ui.*`. Exports `flipHasUI`. → see `hasui-flip.ts.AGENTS.md` |
 | `markdown-image-inliner.ts` | Bridge helper rewriting assistant `![alt](path)` → `![alt](pi-asset:<hash>)` (SHA-256/16, MIME allowlist, 5… → see `markdown-image-inliner.ts.AGENTS.md` |
+| `message-update-coalescer.ts` | Bridge message_update coalescing state machine: contiguous text snapshots use a single-slot 50 ms fixed window; thinking/toolcall/unknown updates flush first to preserve order; message open/close generation + stable-key barrier drops late updates; `clear()` cancels private timers. Exports `MessageUpdateCoalescer`, `COALESCE_WINDOW_MS`. → see `message-update-coalescer.ts.AGENTS.md` |
 | `model-tracker.ts` | Diff-and-send trackers for model / session name / git info / pi version / cwd-missing. → see `model-tracker.ts.AGENTS.md` |
 | `multiselect-decode.ts` | Pure helper decoding `PromptResponse` into `string[] | undefined`. → see `multiselect-decode.ts.AGENTS.md` |
 | `multiselect-list.ts` | TUI multi-select component implementing pi-tui `ComponentLike`. Exports `MultiSelectList`, `ComponentLike`. → see `multiselect-list.ts.AGENTS.md` |
