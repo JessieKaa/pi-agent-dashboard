@@ -5,7 +5,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { parseArgs, buildConfig } from "../cli.js";
+import { parseArgs, buildConfig, guardTempHomePort, PRODUCTION_DEFAULT_PORT } from "../cli.js";
 
 describe("parseArgs", () => {
   it("returns null subcommand with no args", () => {
@@ -70,6 +70,19 @@ describe("parseArgs", () => {
     expect(result.flags.tunnel).toBe(false);
   });
 
+  // fix-autostart-discovery-precedence (5.1, D5): ephemeral is a FLAG-only
+  // opt-in — no env var, no inference — so it parses like --dev.
+  it("parses --ephemeral flag", () => {
+    const result = parseArgs(["start", "--ephemeral"]);
+    expect(result.subcommand).toBe("start");
+    expect(result.flags.ephemeral).toBe(true);
+  });
+
+  it("defaults ephemeral to unset when the flag is absent", () => {
+    const result = parseArgs(["start"]);
+    expect(result.flags.ephemeral).toBeUndefined();
+  });
+
   it("ignores unknown args", () => {
     const result = parseArgs(["start", "--unknown", "value"]);
     expect(result.subcommand).toBe("start");
@@ -80,6 +93,44 @@ describe("parseArgs", () => {
     const result = parseArgs(["--port", "3000"]);
     expect(result.subcommand).toBeNull();
     expect(result.flags.port).toBe(3000);
+  });
+});
+
+describe("guardTempHomePort", () => {
+  const tmp = "/tmp";
+  const noop = () => {};
+
+  it("remaps the production port to an ephemeral 0 under a temp/faux HOME", () => {
+    expect(guardTempHomePort(PRODUCTION_DEFAULT_PORT, "/tmp/faux-home-abc", tmp, noop)).toBe(0);
+  });
+
+  it("leaves the production port alone under a real HOME", () => {
+    expect(guardTempHomePort(PRODUCTION_DEFAULT_PORT, "/Users/robson", tmp, noop)).toBe(
+      PRODUCTION_DEFAULT_PORT,
+    );
+  });
+
+  it("leaves a non-production port alone even under a temp HOME (test servers use random ports)", () => {
+    expect(guardTempHomePort(8300, "/tmp/faux", tmp, noop)).toBe(8300);
+  });
+
+  it("does not treat a sibling dir (/tmpfoo) as living under /tmp", () => {
+    expect(guardTempHomePort(PRODUCTION_DEFAULT_PORT, "/tmpfoo/home", tmp, noop)).toBe(
+      PRODUCTION_DEFAULT_PORT,
+    );
+  });
+
+  it("passes a null (already-ephemeral) port through unchanged", () => {
+    expect(guardTempHomePort(null, "/tmp/faux", tmp, noop)).toBeNull();
+  });
+
+  it("warns when it remaps", () => {
+    let msg = "";
+    guardTempHomePort(PRODUCTION_DEFAULT_PORT, "/tmp/faux", tmp, (m) => {
+      msg = m;
+    });
+    expect(msg).toContain("ephemeral");
+    expect(msg).toContain(String(PRODUCTION_DEFAULT_PORT));
   });
 });
 
@@ -125,6 +176,18 @@ describe("buildConfig host resolution", () => {
     fs.writeFileSync(configFile, JSON.stringify({ bindHost: "10.0.0.5" }));
     process.env.PI_DASHBOARD_HOST = "0.0.0.0";
     expect(buildConfig({ host: "127.0.0.1" }).host).toBe("127.0.0.1");
+  });
+
+  // Integration: HOME here (testDir) is under os.tmpdir(), so the temp-home port
+  // guard is wired through buildConfig — an explicit --port 8000 must be remapped
+  // to an ephemeral port so a test/isolated server can never shadow a real
+  // dashboard on localhost:8000. See change: guard-temp-home-production-port.
+  it("remaps an explicit production port 8000 to ephemeral under a temp HOME", () => {
+    expect(buildConfig({ port: PRODUCTION_DEFAULT_PORT }).port).toBe(0);
+  });
+
+  it("passes a non-production port through untouched under a temp HOME", () => {
+    expect(buildConfig({ port: 8300 }).port).toBe(8300);
   });
 });
 

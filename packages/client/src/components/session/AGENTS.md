@@ -6,7 +6,7 @@ Files in this directory. One row per source file. See change: fold-oversized-age
 |------|---------|
 | `agent-card-utils.ts` | Re-export shim. Forwards to `@blackbelt-technology/pi-dashboard-client-utils/agent-card-utils`. Symbol moved in change `complete-flows-plugin-migration` (Layer 0). |
 | `AgentCardShell.tsx` | Re-export shim. Forwards to `@blackbelt-technology/pi-dashboard-client-utils/AgentCardShell`. Symbol moved in change `complete-flows-plugin-migration` (Layer 0). |
-| `ComposerSessionActions.tsx` | Composer-side session-action strip. Hosts OpenSpec artifact chips + action buttons + Git groups. → see `ComposerSessionActions.tsx.AGENTS.md` |
+| `ComposerSessionActions.tsx` | Composer-side session-action strip. Hosts OpenSpec artifact chips + action buttons + Git groups. → see `ComposerSessionActions.tsx.AGENTS.md` `showOpenSpec` consumes `openspecReadiness` (legacy fallback preserved). See change: add-openspec-init-affordances. |
 | `ContextUsageBar.tsx` | Progress bar showing context-window usage. Exports `ContextUsageBar`. → see `ContextUsageBar.tsx.AGENTS.md` |
 | `CountBadges.tsx` | Shared `+adds −dels` count badges. See change: add-change-summary-table. |
 | `DashboardSpawnButtons.tsx` | Sidebar spawn-button stack. Exports `DashboardSpawnButtons`. → see `DashboardSpawnButtons.tsx.AGENTS.md` |
@@ -18,13 +18,13 @@ Files in this directory. One row per source file. See change: fold-oversized-age
 | `RetriedErrorBadge.tsx` | Compact badge collapsing a tool error→retry pair into one line. Click expands to full `ToolCallStep`. → see `RetriedErrorBadge.tsx.AGENTS.md` |
 | `SessionActivityBar.tsx` | Pure component. Renders one row per unresolved `bash` toolCall: `⏵ <command> <elapsed> [⏹]`. → see `SessionActivityBar.tsx.AGENTS.md` |
 | `SessionBanner.tsx` | Composed session-status banner. Error anchor (red) + retry sub-line (amber) in one surface, driven by… → see `SessionBanner.tsx.AGENTS.md` |
-| `SessionCard.tsx` | Gates both `<ContextUsageBar>` mounts on `useDisplayPrefs(session.id).contextUsageBar` → see `SessionCard.tsx.AGENTS.md` |
+| `SessionCard.tsx` | Gates both `<ContextUsageBar>` mounts on `useDisplayPrefs(session.id).contextUsageBar` → see `SessionCard.tsx.AGENTS.md` OPENSPEC subcard gates on `openspecReadiness` (legacy fallback preserved); BROKEN/STALE render the inert `OpenSpecDisabledPanel` — controls out of the DOM, per-reason text, one control routed folder↔settings. See change: add-openspec-init-affordances. |
 | `SessionHeader.tsx` | Session chat header (desktop + mobile). Renders name/rename (`InlineRenameInput`), model, thinking level, pi… → see `SessionHeader.tsx.AGENTS.md` |
-| `SessionList.tsx` | Main sidebar session list. DnD-ordered (`@dnd-kit`) pinned/unpinned + workspace tiers, folder grouping,…… → see `SessionList.tsx.AGENTS.md` |
+| `SessionList.tsx` | Main sidebar session list. DnD-ordered (`@dnd-kit`) pinned/unpinned + workspace tiers, folder grouping,…… → see `SessionList.tsx.AGENTS.md` Folder section render gate readiness-driven; `openspecOfferInitialization`/`openspecEnabled` props; conditional “Enable OpenSpec for this folder” DIRECTORY menu item; `seekToFolderOpenSpec` (expand+scroll+focus, no dialog). See change: add-openspec-init-affordances. |
 | `SessionSidebar.tsx` | Legacy compact session sidebar. Active + ended (`<details>`) lists with status dots, source icons, model,… → see `SessionSidebar.tsx.AGENTS.md` |
 | `SessionSubcard.tsx` | Inset titled panel wrapper grouping session-card sections (OPENSPEC, WORKSPACE, PROCESS, MEMORY, FLOWS). → see `SessionSubcard.tsx.AGENTS.md` |
 | `SortablePinnedGroup.tsx` | dnd-kit sortable wrapper for a pinned folder group (`data.type: "pinned-group"`), drop indicator via… → see `SortablePinnedGroup.tsx.AGENTS.md` |
-| `SortableSessionCard.tsx` | dnd-kit sortable wrapper for a session card (`data.type: "session"`). Drag handle props fed to descendant `SessionCard` via `DragHandleCtx`. Exports `SortableSessionCard`, `useSessionCardDragHandle`. |
+| `SortableSessionCard.tsx` | dnd-kit sortable wrapper for a session card (`data.type: "session"`). Drag handle props fed to descendant `SessionCard` via `DragHandleCtx` — they now land on the card’s hover-revealed grip bead in the directory-rail band, not the deleted left gutter (see change: session-card-directory-rail). Exports `SortableSessionCard`, `useSessionCardDragHandle`. |
 | `SpawnErrorBanner.tsx` | Renders structured spawn error: code→hint, preflight reasons, stderr details, timeout banner. → see `SpawnErrorBanner.tsx.AGENTS.md` |
 | `SpawnErrorToastHost.tsx` | App-level toast container for off-screen `spawn_error` events. Raw red → `--severity-error-*`. → see `SpawnErrorToastHost.tsx.AGENTS.md` |
 | `StatePill.tsx` | Color-coded OpenSpec ChangeState pill (`PLANNING`=zinc, `READY`=blue, `IMPLEMENTING`=amber, `COMPLETE`=green)… → see `StatePill.tsx.AGENTS.md` |

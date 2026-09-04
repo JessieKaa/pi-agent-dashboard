@@ -30,6 +30,7 @@ import { t as i18nT } from "../../lib/i18n/i18n.js";
 import { fetchTool } from "../../lib/api/tools-api.js";
 import { CloseWorktreeDialog } from "./CloseWorktreeDialog.js";
 import { MergeConfirmDialog } from "./MergeConfirmDialog.js";
+import { logRejection } from "../../lib/report-error.js";
 
 /**
  * Module-level cache of `gh` availability — one fetch per page load,
@@ -43,9 +44,13 @@ export function __resetGhAvailableCache(): void {
   ghAvailableCache = undefined;
   ghAvailablePromise = undefined;
 }
-function probeGhAvailable(): Promise<boolean> {
+/** Exported for the guard-precedence tests. See change: cleanup-client-plugin-promises. */
+export function probeGhAvailable(): Promise<boolean> {
   if (ghAvailableCache !== undefined) return Promise.resolve(ghAvailableCache);
-  if (ghAvailablePromise) return ghAvailablePromise;
+  // Explicit nullish check — a `Promise` is always truthy, so the bare guard was
+  // correct only by accident. Declared type is `| undefined`, so `!== undefined`
+  // (not `!== null`) is the narrowing. See change: cleanup-client-plugin-promises (D6).
+  if (ghAvailablePromise !== undefined) return ghAvailablePromise;
   ghAvailablePromise = fetchTool("gh")
     .then((r) => {
       ghAvailableCache = r.ok === true;
@@ -114,6 +119,7 @@ export function WorktreeActionsMenu({ session, allSessions, onShutdownSession, d
   const {
     flipUp: sheetFlipUp,
     maxHeight: sheetMaxHeight,
+    minHeight: sheetMinHeight,
     anchorRight: sheetAnchorRight,
     maxWidth: sheetMaxWidth,
   } = usePopoverFlip(sheetTriggerRef, { open: sheetOpen, estimatedWidth: 140, boundaryRef });
@@ -121,7 +127,9 @@ export function WorktreeActionsMenu({ session, allSessions, onShutdownSession, d
   useEffect(() => {
     if (ghAvailable !== undefined) return;
     let cancelled = false;
-    probeGhAvailable().then((v) => { if (!cancelled) setGhAvailable(v); });
+    void probeGhAvailable()
+      .then((v) => { if (!cancelled) setGhAvailable(v); })
+      .catch(logRejection("WorktreeActionsMenu.probeGhAvailable"));
     return () => { cancelled = true; };
   }, [ghAvailable]);
 
@@ -248,7 +256,7 @@ export function WorktreeActionsMenu({ session, allSessions, onShutdownSession, d
           {sheetOpen && (
             <div
               data-testid="worktree-actions-mobile-sheet"
-              style={{ maxHeight: sheetMaxHeight, maxWidth: sheetMaxWidth }}
+              style={{ maxHeight: sheetMaxHeight, minHeight: sheetMinHeight, maxWidth: sheetMaxWidth }}
               className={`absolute z-50 flex flex-col gap-1 overflow-y-auto bg-[var(--bg-secondary)] border border-[var(--border-secondary)] rounded p-1 min-w-[140px] ${
                 sheetAnchorRight ? "right-0" : "left-0"
               } ${sheetFlipUp ? "bottom-full mb-1" : "top-full mt-1"}`}

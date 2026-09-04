@@ -16,10 +16,14 @@ import path from "node:path";
 import type { Workspace } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
 import { CONFIG_DIR } from "@blackbelt-technology/pi-dashboard-shared/config.js";
 import type { DisplayPrefs, PartialDisplayPrefs } from "@blackbelt-technology/pi-dashboard-shared/display-prefs.js";
+import {
+  mergeCustomEventGroupPrefs,
+  migrateLegacyCustomEntryFallback,
+} from "@blackbelt-technology/pi-dashboard-shared/display-prefs.js";
 import type { LiveServerTarget } from "@blackbelt-technology/pi-dashboard-shared/live-server.js";
 import { normalizePath } from "@blackbelt-technology/pi-dashboard-shared/platform/paths.js";
-import { readJsonFile, writeJsonFile } from "./json-store.js";
 import { safeRealpathSync } from "../resolve-path.js";
+import { readJsonFile, writeJsonFile } from "./json-store.js";
 
 export const PREFERENCES_FILE = path.join(CONFIG_DIR, "preferences.json");
 
@@ -109,6 +113,24 @@ export interface PreferencesStore {
   /** Returns true on mutation, false on unknown id or not-member. */
   removeFolderFromWorkspace(id: string, dirPath: string): boolean;
   /**
+   * Moves `dirPath` into workspace `toWorkspaceId`, or — when
+   * `toWorkspaceId` is `null` — ejects it from every workspace.
+   *
+   * Validate-before-mutate: the target is resolved BEFORE any detach, so an
+   * unknown id leaves the folder where it was (returns false, no mutation).
+   * Same-workspace moves are rejected (`reorder_workspace_folders` owns
+   * repositioning). `index` is clamped to `[0, folders.length]`; omitted =
+   * append. Ignored when `toWorkspaceId` is null. Path is canonicalized
+   * internally. Returns true only on a real mutation.
+   *
+   * See change: drag-folders-across-workspaces.
+   */
+  moveFolderToWorkspace(
+    dirPath: string,
+    toWorkspaceId: string | null,
+    index?: number,
+  ): boolean;
+  /**
    * Replaces a workspace's folder order. Rejected if `paths` does not
    * equal the current member set (after canonicalization). Returns true
    * on mutation, false otherwise.
@@ -184,7 +206,10 @@ function sanitizeName(input: unknown): string | null {
  * (default false). See changes: reasoning-auto-collapse-timer,
  * keep-reasoning-open-until-turn-ends.
  */
-function backfillDisplayPrefs(prefs: DisplayPrefs | undefined): DisplayPrefs | undefined {
+function backfillDisplayPrefs(
+  prefs: DisplayPrefs | undefined,
+  customEventGroupDefaults: Record<string, boolean> = {},
+): DisplayPrefs | undefined {
   if (!prefs) return prefs;
   let out = prefs;
   if (typeof out.reasoningAutoCollapseMs !== "number") {
@@ -211,6 +236,31 @@ function backfillDisplayPrefs(prefs: DisplayPrefs | undefined): DisplayPrefs | u
   if (typeof out.showOutOfCwdSessionDiffs !== "boolean") {
     out = { ...out, showOutOfCwdSessionDiffs: false };
   }
+  // Legacy prefs predating the notify gate default it to "all" — today's
+  // behavior, so an upgrade hides nothing the user had not asked to hide.
+  // See change: gate-notify-rows-by-level.
+  if (typeof out.notifyMinLevel !== "string") {
+    out = { ...out, notifyMinLevel: "all" };
+  }
+  // Legacy prefs predating the two render-inline-reasoning-and-custom-entries
+  // fields resolve to the preset defaults: inline flow OFF (today's capped
+  // reasoning body), custom-entry fallback ON (the bug being fixed is
+  // invisibility). See change: render-inline-reasoning-and-custom-entries.
+  if (typeof out.reasoningInlineFlow !== "boolean") {
+    out = { ...out, reasoningInlineFlow: false };
+  }
+  // Custom event groups (add-custom-event-group-filters): migrate the removed
+  // single `customEntryFallback` switch onto the `other` group (idempotent,
+  // design D7), then seed every configured group so a gate is never
+  // `undefined` — a legacy file without the field resolves each group to its
+  // configured default, and a group added to the file after seeding gets its
+  // default on the next (restart-to-apply) load.
+  out = migrateLegacyCustomEntryFallback(out);
+  const existingGroups =
+    typeof out.customEventGroups === "object" && out.customEventGroups !== null
+      ? out.customEventGroups
+      : {};
+  out = { ...out, customEventGroups: { ...customEventGroupDefaults, ...existingGroups } };
   return out;
 }
 
@@ -224,7 +274,22 @@ function normalizeWorkspaceOnLoad(ws: Workspace): Workspace {
   };
 }
 
-export function createPreferencesStore(filePath: string = PREFERENCES_FILE): PreferencesStore {
+export function createPreferencesStore(
+  filePath: string = PREFERENCES_FILE,
+  deps: {
+    /**
+     * Configured custom-event-group defaults (group id → default visibility),
+     * read from the groups file at composition time. Seeds `backfillDisplayPrefs`
+     * and the `setDisplayPrefs` base literal so no group gate is ever `undefined`.
+     * See change: add-custom-event-group-filters.
+     */
+    customEventGroupDefaults?: Record<string, boolean>;
+  } = {},
+): PreferencesStore {
+  // Resolved once per process — the groups file is restart-to-apply (design D6).
+  const seededCustomEventGroupDefaults: Record<string, boolean> = {
+    ...(deps.customEventGroupDefaults ?? {}),
+  };
   const data: PreferencesData = readJsonFile<PreferencesData>(filePath, {
     sessionOrder: {},
     pinnedDirectories: [],
@@ -264,7 +329,20 @@ export function createPreferencesStore(filePath: string = PREFERENCES_FILE): Pre
 
   const rawWorkspaces = Array.isArray(data.workspaces) ? data.workspaces : [];
   let workspaces: Workspace[] = rawWorkspaces.map(normalizeWorkspaceOnLoad);
-  let displayPrefs: DisplayPrefs | undefined = backfillDisplayPrefs(data.displayPrefs);
+  let displayPrefs: DisplayPrefs | undefined = backfillDisplayPrefs(
+    data.displayPrefs
+      ? migrateLegacyCustomEntryFallback(data.displayPrefs, deps.customEventGroupDefaults)
+      : data.displayPrefs,
+    deps.customEventGroupDefaults,
+  );
+  // The load-time migration + seeding must be DURABLE on the load that
+  // performs it — "the legacy field does not survive" and "second boot is a
+  // no-op" are only true if the migrated prefs reach disk. The debounced
+  // dirty flag below deliberately excludes displayPrefs (a modern file
+  // round-trips identically → no write), so persist only when the JSON
+  // content actually changed.
+  const prefsChangedOnLoad =
+    JSON.stringify(data.displayPrefs ?? null) !== JSON.stringify(displayPrefs ?? null);
   let openspecUpdateSignatures: Record<string, string> = data.openspecUpdateSignatures ?? {};
   // Opt-in auto-init flag. Absent/non-boolean → false (today's behavior).
   let autoInitWorktreeOnSpawn: boolean = data.autoInitWorktreeOnSpawn === true;
@@ -276,7 +354,10 @@ export function createPreferencesStore(filePath: string = PREFERENCES_FILE): Pre
     Array.isArray(data.favoriteModels) ? data.favoriteModels.filter((l) => typeof l === "string") : [],
   );
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-  let dirty =
+let dirty =
+    // Load-time displayPrefs migration/seeding (custom-entry-fallback) must
+    // reach disk on THIS load — see the prefsChangedOnLoad comment above.
+    prefsChangedOnLoad ||
     data.pinSeeded !== true ||
     pinnedDirectories.length !== rawPinned.length ||
     pinnedDirectories.some((p, i) => p !== rawPinned[i]) ||
@@ -464,6 +545,35 @@ export function createPreferencesStore(filePath: string = PREFERENCES_FILE): Pre
       return true;
     },
 
+    moveFolderToWorkspace(
+      dirPath: string,
+      toWorkspaceId: string | null,
+      index?: number,
+    ): boolean {
+      const canon = canonicalize(dirPath);
+      const detach = () => {
+        for (const other of workspaces) {
+          const i = other.folders.indexOf(canon);
+          if (i !== -1) other.folders.splice(i, 1);
+        }
+      };
+      if (toWorkspaceId !== null) {
+        // Resolve the target FIRST — a stale id must not leave the folder
+        // detached from every workspace.
+        const ws = findWs(toWorkspaceId);
+        if (!ws) return false;
+        if (ws.folders.includes(canon)) return false;
+        detach();
+        const at = Math.min(Math.max(index ?? ws.folders.length, 0), ws.folders.length);
+        ws.folders.splice(at, 0, canon);
+      } else {
+        if (!workspaces.some((w) => w.folders.includes(canon))) return false;
+        detach();
+      }
+      scheduleSave();
+      return true;
+    },
+
     reorderWorkspaceFolders(id: string, paths: string[]): boolean {
       const ws = findWs(id);
       if (!ws) return false;
@@ -528,6 +638,9 @@ export function createPreferencesStore(filePath: string = PREFERENCES_FILE): Pre
         changeSummaryTable: false,
         reserveProcessLineAtIdle: false,
         showOutOfCwdSessionDiffs: false,
+        notifyMinLevel: "all",
+        reasoningInlineFlow: false,
+        customEventGroups: { ...seededCustomEventGroupDefaults },
       };
       const merged: DisplayPrefs = {
         tokenStatsBar: partial.tokenStatsBar ?? base.tokenStatsBar,
@@ -547,10 +660,17 @@ export function createPreferencesStore(filePath: string = PREFERENCES_FILE): Pre
           partial.reserveProcessLineAtIdle ?? base.reserveProcessLineAtIdle,
         showOutOfCwdSessionDiffs:
           partial.showOutOfCwdSessionDiffs ?? base.showOutOfCwdSessionDiffs,
+        notifyMinLevel: partial.notifyMinLevel ?? base.notifyMinLevel,
+        reasoningInlineFlow: partial.reasoningInlineFlow ?? base.reasoningInlineFlow,
+        customEventGroups: mergeCustomEventGroupPrefs(base.customEventGroups, partial.customEventGroups),
       };
       displayPrefs = merged;
       scheduleSave();
-      return { ...merged, toolCalls: { ...merged.toolCalls } };
+      return {
+        ...merged,
+        toolCalls: { ...merged.toolCalls },
+        customEventGroups: { ...merged.customEventGroups },
+      };
     },
 
     reorderWorkspaces(ids: string[]): boolean {

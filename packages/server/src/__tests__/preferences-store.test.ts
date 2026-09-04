@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { isNotifyRowVisible } from "@blackbelt-technology/pi-dashboard-shared/display-prefs.js";
 import { createPreferencesStore } from "../persistence/preferences-store.js";
 
 // Mock resolve-path to be a no-op (no symlink resolution in tests)
@@ -619,6 +620,191 @@ describe("preferences-store", () => {
       }));
       const store = createPreferencesStore(filePath);
       expect(store.getDisplayPrefs()?.showOutOfCwdSessionDiffs).toBe(false);
+      store.dispose();
+    });
+
+    // ── gate-notify-rows-by-level ────────────────────────────────────────
+    const LEGACY_DISPLAY_PREFS = {
+      tokenStatsBar: true,
+      contextUsageBar: true,
+      reasoning: false,
+      toolResults: true,
+      turnMetadata: true,
+      debugTools: false,
+      toolCalls: { read: true, bash: true, edit: true, agent: true, generic: true },
+    };
+
+    // 2.11 / test-plan #E7
+    it("backfills notifyMinLevel to 'all' for a legacy displayPrefs file", () => {
+      fs.writeFileSync(filePath, JSON.stringify({ displayPrefs: LEGACY_DISPLAY_PREFS }));
+      const store = createPreferencesStore(filePath);
+      expect(store.getDisplayPrefs()?.notifyMinLevel).toBe("all");
+      store.dispose();
+    });
+
+    // 2.12 / test-plan #E8 — a PATCH of an unrelated field must not drop it.
+    it("preserves a stored notifyMinLevel across a partial PATCH", () => {
+      fs.writeFileSync(filePath, JSON.stringify({
+        displayPrefs: { ...LEGACY_DISPLAY_PREFS, notifyMinLevel: "warnings" },
+      }));
+      const store = createPreferencesStore(filePath);
+      const returned = store.setDisplayPrefs({ reasoning: true });
+      // Returned (broadcast) value AND the stored value both survive.
+      expect(returned.notifyMinLevel).toBe("warnings");
+      expect(store.getDisplayPrefs()?.notifyMinLevel).toBe("warnings");
+      expect(returned.reasoning).toBe(true);
+      store.dispose();
+    });
+
+    // 2.12 / test-plan #E8 — the seedless `base` literal path.
+    it("carries notifyMinLevel through setDisplayPrefs with no prior prefs", () => {
+      const store = createPreferencesStore(filePath);
+      const returned = store.setDisplayPrefs({ notifyMinLevel: "errors" });
+      expect(returned.notifyMinLevel).toBe("errors");
+      expect(store.getDisplayPrefs()?.notifyMinLevel).toBe("errors");
+      // …and a later unrelated PATCH still preserves it.
+      expect(store.setDisplayPrefs({ debugTools: true }).notifyMinLevel).toBe("errors");
+      store.dispose();
+    });
+
+    // 2.13 / test-plan #X1 — a hand-edited garbage floor must not suppress.
+    it("does not let a corrupt persisted notifyMinLevel suppress an error notify", () => {
+      fs.writeFileSync(filePath, JSON.stringify({
+        displayPrefs: { ...LEGACY_DISPLAY_PREFS, notifyMinLevel: "oops" },
+      }));
+      const store = createPreferencesStore(filePath);
+      const stored = store.getDisplayPrefs()?.notifyMinLevel;
+      // The store round-trips whatever is on disk; the predicate is what must
+      // fail open. Assert the end-to-end guarantee, not the storage shape.
+      for (const level of ["info", "success", "warning", "error"]) {
+        expect(
+          isNotifyRowVisible({ content: "notify", method: "notify", level }, stored),
+          `level=${level}`,
+        ).toBe(true);
+      }
+      store.dispose();
+    });
+
+    // 2.15 / test-plan #X3 — absent parent key, and absent file entirely.
+    // Names what it actually asserts: an ABSENT floor (no displayPrefs key, or
+    // no file at all) still fails open at the predicate. It does not claim the
+    // store never yields `undefined` — that guarantee is not tested here.
+    it("fails open when the store yields no notifyMinLevel at all", () => {
+      fs.writeFileSync(filePath, JSON.stringify({ someOtherKey: 1 }));
+      const store1 = createPreferencesStore(filePath);
+      // No displayPrefs at all → nothing to backfill; the predicate still must
+      // not suppress anything when handed the resulting undefined floor.
+      const floor1 = store1.getDisplayPrefs()?.notifyMinLevel;
+      expect(isNotifyRowVisible({ content: "notify", method: "notify", level: "error" }, floor1))
+        .toBe(true);
+      expect(isNotifyRowVisible({ content: "notify", method: "notify", level: "info" }, floor1))
+        .toBe(true);
+      store1.dispose();
+
+      fs.rmSync(filePath, { force: true });
+      const store2 = createPreferencesStore(filePath);
+      const floor2 = store2.getDisplayPrefs()?.notifyMinLevel;
+      expect(isNotifyRowVisible({ content: "notify", method: "notify", level: "info" }, floor2))
+        .toBe(true);
+      store2.dispose();
+    });
+
+    // ── render-inline-reasoning-and-custom-entries (E4) ──────────────────
+    // Legacy persisted displayPrefs predating the two new fields must load
+    // with the fields RESOLVED to defaults, never undefined: the backfill is
+    // what injects defaults into already-persisted legacy files (not
+    // mergeDisplayPrefs, which only sees live requests).
+    const NEW_FIELDS_LEGACY_DISPLAY_PREFS = {
+      tokenStatsBar: true,
+      contextUsageBar: true,
+      reasoning: false,
+      toolResults: true,
+      turnMetadata: true,
+      debugTools: false,
+      toolCalls: { read: true, bash: true, edit: true, agent: true, generic: true },
+      reasoningAutoCollapseMs: 30000,
+      keepReasoningOpenUntilTurnEnds: false,
+      toolGroupDefaultCollapsed: false,
+      changeSummaryTable: true,
+      reserveProcessLineAtIdle: false,
+      showOutOfCwdSessionDiffs: false,
+      notifyMinLevel: "all",
+    };
+
+    it("backfills a legacy displayPrefs file: each configured group resolves to its default, never undefined (task 5.3)", () => {
+      fs.writeFileSync(filePath, JSON.stringify({
+        displayPrefs: NEW_FIELDS_LEGACY_DISPLAY_PREFS,
+      }));
+      const store = createPreferencesStore(filePath, {
+        customEventGroupDefaults: { memory: false, search: true, other: true },
+      });
+      const prefs = store.getDisplayPrefs();
+      expect(prefs?.customEventGroups).toEqual({ memory: false, search: true, other: true });
+      expect(prefs?.reasoningInlineFlow).toBe(false);
+      store.dispose();
+    });
+
+    it("migrates a legacy customEntryFallback=false onto customEventGroups.other at load (task 6.1)", () => {
+      fs.writeFileSync(filePath, JSON.stringify({
+        displayPrefs: { ...NEW_FIELDS_LEGACY_DISPLAY_PREFS, customEntryFallback: false },
+      }));
+      const store = createPreferencesStore(filePath, {
+        customEventGroupDefaults: { memory: false, other: true },
+      });
+      const prefs = store.getDisplayPrefs() as any;
+      // persisted false lands as other:false, not overwritten by the default
+      expect(prefs.customEventGroups.other).toBe(false);
+      // ...and as hidden for EVERY shipped group the old switch gated —
+      // a hide-everything user keeps everything hidden (doubt-review fix)
+      for (const g of ["memory", "search", "subagents", "flows", "goals"]) {
+        expect(prefs.customEventGroups[g]).toBe(false);
+      }
+      // ...and for USER-CONFIGURED groups (CodeRabbit Xw): a configured id
+      // absent from the prefs also seeds hidden, not its visible default.
+      const storeXw = createPreferencesStore(filePath, {
+        customEventGroupDefaults: { memory: false, other: true, myplugin: true },
+      });
+      const legacyFile = filePath.replace(".json", "-xw.json");
+      fs.writeFileSync(legacyFile, JSON.stringify({
+        displayPrefs: { ...NEW_FIELDS_LEGACY_DISPLAY_PREFS, customEntryFallback: false },
+      }));
+      const storeXw2 = createPreferencesStore(legacyFile, {
+        customEventGroupDefaults: { memory: false, other: true, myplugin: true },
+      });
+      expect((storeXw2.getDisplayPrefs() as any).customEventGroups.myplugin).toBe(false);
+      storeXw.dispose();
+      storeXw2.dispose();
+      expect(prefs.customEntryFallback).toBeUndefined();
+      // the migration is DURABLE on the load that performs it: flush and
+      // assert the on-disk file no longer carries the legacy field
+      store.flush();
+      const onDisk = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+      expect(onDisk.displayPrefs.customEntryFallback).toBeUndefined();
+      // second load performs no further migration and keeps the user choice
+      const store2 = createPreferencesStore(filePath, {
+        customEventGroupDefaults: { memory: false, other: true },
+      });
+      const again = store2.getDisplayPrefs() as any;
+      expect(again.customEventGroups.other).toBe(false);
+      store.dispose();
+      store2.dispose();
+    });
+
+    it("setDisplayPrefs base/merged literals carry the new defaults (E4)", () => {
+      const store = createPreferencesStore(filePath, {
+        customEventGroupDefaults: { memory: false, search: true, other: true },
+      });
+      const merged = store.setDisplayPrefs({ debugTools: true });
+      expect(merged.customEventGroups).toEqual({ memory: false, search: true, other: true });
+      expect(merged.reasoningInlineFlow).toBe(false);
+      // An unrelated PATCH must not reset a stored value of either field.
+      store.setDisplayPrefs({ reasoningInlineFlow: true, customEventGroups: { memory: true } });
+      const again = store.setDisplayPrefs({ debugTools: false });
+      expect(again.reasoningInlineFlow).toBe(true);
+      // PATCH of one group id preserves every other key (task 5.4 arm)
+      expect(again.customEventGroups.memory).toBe(true);
+      expect(again.customEventGroups.search).toBe(true);
+      expect(again.customEventGroups.other).toBe(true);
       store.dispose();
     });
   });

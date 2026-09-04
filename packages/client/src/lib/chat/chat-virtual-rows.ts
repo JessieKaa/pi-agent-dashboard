@@ -74,6 +74,7 @@ const TEXT_RESERVE_CLAMP = 8000;
  * Per-renderer-kind image reserve. Tool-result images use their existing
  * `max-h-[512px]` reserve; user attachment notices are small badges.
  */
+const IMAGE_RESERVE_USER = 300;
 const IMAGE_RESERVE_TOOL_RESULT = 512;
 
 /** Base (chrome) height per row type, before the text/image reserve. */
@@ -91,6 +92,11 @@ function baseRowSize(role: ChatMessage["role"]): number {
       return 120;
     case "rawEvent":
       return 120;
+    case "custom":
+      // Bounded generic custom-entry card: chrome + a visible (240px-capped)
+      // body region — the 120 default arm is badly wrong for a 200-line JSON
+      // body. See change: render-inline-reasoning-and-custom-entries (P2).
+      return 160;
     case "assistant":
       return 140;
     case "bashOutput":
@@ -110,10 +116,11 @@ export function estimateVirtualRowSize(item: BurstItem, textChars = 0): number {
   if (isBurst(item)) return 220;
   if (isGroup(item)) return 64;
   const msg = item as ChatMessage;
-  const textReserve = Math.min(Math.ceil(textChars / CHARS_PER_LINE) * LINE_PX, TEXT_RESERVE_CLAMP);
-  let size = baseRowSize(msg.role) + textReserve;
-  if (msg.role === "toolResult" && msg.images && msg.images.length > 0) {
-    size += IMAGE_RESERVE_TOOL_RESULT;
+  let textReserve = Math.min(Math.ceil(textChars / CHARS_PER_LINE) * LINE_PX, TEXT_RESERVE_CLAMP);
+  if (msg.role === "custom") textReserve = Math.min(textReserve, 240);
+  const size = baseRowSize(msg.role) + textReserve;
+  if (msg.images && msg.images.length > 0) {
+    return size + (msg.role === "toolResult" ? IMAGE_RESERVE_TOOL_RESULT : IMAGE_RESERVE_USER);
   }
   return size;
 }

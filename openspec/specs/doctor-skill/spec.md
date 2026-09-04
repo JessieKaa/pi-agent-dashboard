@@ -186,3 +186,65 @@ to the doctor module that must regenerate.
 - **THEN** the AGENTS.md Documentation Update Protocol row directs them to run
   `doctor --regenerate <module>` for the single affected module
 
+### Requirement: Apple-tools provisioning probe
+
+The doctor skill SHALL include an Apple-tools provisioning probe that reports the terminal state of the write-suppressed provisioning traversal, so a half-provisioned host is diagnosable from the standard diagnostic entry point rather than requiring the operator to know the package-specific command.
+
+#### Scenario: Probe reports an unprovisioned macOS host
+
+- **WHEN** the doctor runs on a macOS host with no iMCP application present
+- **THEN** it reports the Apple-tools provisioning state
+- **AND** names the installer command as the remediation
+
+#### Scenario: Probe reports a provisioned host
+
+- **WHEN** the doctor runs on a fully provisioned host
+- **THEN** it reports the state pending permission grants
+- **AND** names the menu-bar activation step as the remaining manual action
+
+#### Scenario: Probe is silent-clean on a non-macOS host
+
+- **WHEN** the doctor runs on a non-macOS host
+- **THEN** the Apple-tools probe reports the unsupported-platform state
+- **AND** does not report it as a fault requiring remediation
+
+### Requirement: Probe derives state live and never writes
+
+The probe SHALL derive its verdict from the same write-suppressed check used by the command-line and settings surfaces, and SHALL NOT mutate any configuration as a side effect of diagnosis.
+
+#### Scenario: Diagnosis performs no writes
+
+- **WHEN** the doctor's Apple-tools probe runs in any environment
+- **THEN** no configuration file is created or modified
+- **AND** no application installation is attempted
+
+#### Scenario: Verdict matches the other surfaces
+
+- **WHEN** the doctor probe and the command-line check run against the same host state
+- **THEN** both report the same terminal state
+
+#### Scenario: Probe degrades gracefully when the package is absent
+
+- **WHEN** the doctor runs on a host where the Apple-tools package is not installed
+- **THEN** the probe reports the package as absent
+- **AND** the remaining doctor probes complete normally
+
+### Requirement: Resolved OAuth redirect base module
+The doctor skill SHALL carry an `oauth-redirect-base` capability module reporting the redirect base that actually WON the precedence chain and the tier that produced it (`auth.redirectBaseUrl` | `tunnel` | `localhost`), following the uniform module contract (SCOPE · KNOWLEDGE · CHECKS · FIX ROUTING · DERIVES-FROM) with a knowledge-hash sidecar.
+
+The module SHALL read `GET /api/auth/diagnostics` over **loopback**, where the network guard admits it with no JWT, and SHALL fall back to the resolved-base line written to `~/.pi/dashboard/server.log` at every register and reload. It SHALL NOT depend on a remote authenticated request, because an operator whose OAuth is broken cannot obtain a JWT.
+
+The module SHALL route a `source` that disagrees with the deployment shape to the fix, and SHALL state both traps: the provider-side registration requirement, and the zero-provider boot state in which the endpoint reports `authActive: false` and only a restart applies an auth config change.
+
+#### Scenario: Reports the winning tier
+- **WHEN** the module runs against a dashboard with `auth.redirectBaseUrl` set
+- **THEN** it SHALL report that value as the resolved base with source `auth.redirectBaseUrl`
+
+#### Scenario: Works with no HTTP access
+- **WHEN** the diagnostics endpoint cannot be reached
+- **THEN** the module SHALL derive the resolved base from the `server.log` line instead of reporting nothing
+
+#### Scenario: Zero-provider boot is not reported as live
+- **WHEN** the server booted with an empty resolvable provider registry
+- **THEN** the module SHALL report `authActive: false` rather than a value that looks live
+

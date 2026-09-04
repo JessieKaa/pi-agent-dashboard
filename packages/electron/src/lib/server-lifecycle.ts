@@ -451,7 +451,11 @@ export async function readServerLogTail(lines: number = 20): Promise<string> {
  * Never throws — failures are returned as `{ kind: "failed", reason, logTail }`.
  */
 export async function requestServerLaunch(opts: { force?: boolean } = {}): Promise<LaunchOutcome> {
-  if (inflightLaunch) return inflightLaunch;
+  // Explicit nullish check: a `Promise` is always truthy, so the bare guard was
+  // correct only by accident. Narrowing preserves the inflight memoization
+  // exactly — do not `await` here, the caller awaits the shared promise.
+  // See change: cleanup-async-semantics-server-extension (design D4).
+  if (inflightLaunch !== null) return inflightLaunch;
   inflightLaunch = (async (): Promise<LaunchOutcome> => {
     try {
       emitLaunchStatus({ phase: "starting" });
@@ -496,6 +500,21 @@ export async function requestServerLaunch(opts: { force?: boolean } = {}): Promi
   return inflightLaunch;
 }
 
+/**
+ * Body for the quit-path `/api/shutdown`. Declares that a USER closed the app,
+ * as opposed to a dev-reload / force-relaunch shutdown (which leaves the pi
+ * sessions running and expects them to reattach). The server records it as the
+ * `user-quit` exit intent, which does NOT suppress cold-start recovery: if the
+ * quit took the sessions down with it they can never reattach and deserve an
+ * offer; if they survived, the next boot's liveness gate retracts them.
+ * See change: fix-recovery-exit-intent (task 3.6).
+ */
+const USER_QUIT_SHUTDOWN_INIT: RequestInit = {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ userQuit: true }),
+};
+
 /** Stop the server if we started it and own it. */
 export async function stopServerIfNeeded(): Promise<void> {
   const config = loadMinimalConfig();
@@ -516,7 +535,7 @@ export async function stopServerIfNeeded(): Promise<void> {
         });
         if (shouldStop) {
           try {
-            await fetch(`http://localhost:${port}/api/shutdown`, { method: "POST" });
+            await fetch(`http://localhost:${port}/api/shutdown`, USER_QUIT_SHUTDOWN_INIT);
           } catch { /* already stopped */ }
         }
       }
@@ -527,6 +546,6 @@ export async function stopServerIfNeeded(): Promise<void> {
   // Legacy path: use serverStartedByUs flag.
   if (!serverStartedByUs) return;
   try {
-    await fetch(`http://localhost:${port}/api/shutdown`, { method: "POST" });
+    await fetch(`http://localhost:${port}/api/shutdown`, USER_QUIT_SHUTDOWN_INIT);
   } catch { /* already stopped */ }
 }

@@ -8,7 +8,12 @@
 
 import type {
   DisplayPrefs,
+  NotifyMinLevel,
   PartialDisplayPrefs,
+} from "@blackbelt-technology/pi-dashboard-shared/display-prefs.js";
+import {
+  NOTIFY_MIN_LEVELS,
+  normalizeNotifyMinLevel,
 } from "@blackbelt-technology/pi-dashboard-shared/display-prefs.js";
 import { mdiCircleSmall, mdiCog } from "@mdi/js";
 import { Icon } from "@mdi/react";
@@ -17,12 +22,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useDisplayPrefs } from "../../hooks/useDisplayPrefs.js";
 import { usePopoverFlip } from "../../hooks/usePopoverFlip.js";
 import { useDisplayPrefsContext } from "../../lib/state/DisplayPrefsContext.js";
+import { useCustomEventGroups } from "../../lib/state/custom-event-groups.js";
 import { usePopoverBoundary } from "../../lib/state/PopoverBoundaryContext.js";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
 
 type ToolCallPatch = Partial<DisplayPrefs["toolCalls"]>;
+type CustomEventGroupsPatch = Partial<DisplayPrefs["customEventGroups"]>;
 type DisplayPrefsPatch =
-  Partial<Omit<DisplayPrefs, "toolCalls">> & { toolCalls?: ToolCallPatch };
+  Partial<Omit<DisplayPrefs, "toolCalls" | "customEventGroups">> & {
+    toolCalls?: ToolCallPatch;
+    customEventGroups?: CustomEventGroupsPatch;
+  };
 
 interface Props {
   sessionId: string;
@@ -43,6 +53,7 @@ interface Props {
 export function ChatViewMenu({ sessionId, send, currentOverride }: Props): React.ReactElement {
   const { global } = useDisplayPrefsContext();
   const prefs = useDisplayPrefs(sessionId);
+  const customGroups = useCustomEventGroups();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -50,7 +61,7 @@ export function ChatViewMenu({ sessionId, send, currentOverride }: Props): React
   // layouts), not the viewport, so the `right-0` popover flips before its label
   // column is guillotined by the pane edge. See change: fix-popover-container-clip.
   const boundaryRef = usePopoverBoundary();
-  const { flipUp, maxHeight, anchorRight, maxWidth } = usePopoverFlip(triggerRef, {
+  const { flipUp, maxHeight, minHeight, anchorRight, maxWidth } = usePopoverFlip(triggerRef, {
     open,
     estimatedWidth: 256, // w-64 natural width
     boundaryRef,
@@ -78,6 +89,12 @@ export function ChatViewMenu({ sessionId, send, currentOverride }: Props): React
     if (delta.toolCalls) {
       next.toolCalls = { ...(currentOverride?.toolCalls ?? {}), ...delta.toolCalls };
     }
+    if (delta.customEventGroups) {
+      next.customEventGroups = {
+        ...(currentOverride?.customEventGroups ?? {}),
+        ...delta.customEventGroups,
+      };
+    }
     send({ type: "setSessionDisplayPrefs", sessionId, override: next });
   }, [currentOverride, send, sessionId]);
 
@@ -96,6 +113,13 @@ export function ChatViewMenu({ sessionId, send, currentOverride }: Props): React
       currentOverride?.toolCalls?.[key] !== undefined &&
       global !== undefined &&
       currentOverride!.toolCalls![key] !== global.toolCalls[key],
+    [currentOverride, global],
+  );
+  const isCustomGroupOverridden = useCallback(
+    (gid: string) =>
+      currentOverride?.customEventGroups?.[gid] !== undefined &&
+      global !== undefined &&
+      currentOverride!.customEventGroups![gid] !== global.customEventGroups[gid],
     [currentOverride, global],
   );
 
@@ -128,7 +152,7 @@ export function ChatViewMenu({ sessionId, send, currentOverride }: Props): React
       {open && (
         <div
           data-testid="chat-view-popover"
-          style={{ maxHeight, maxWidth }}
+          style={{ maxHeight, minHeight, maxWidth }}
           className={`absolute z-30 w-64 overflow-y-auto bg-[var(--bg-secondary)] border border-[var(--border-secondary)] rounded-lg shadow-lg p-2 text-xs ${
             anchorRight ? "right-0" : "left-0"
           } ${flipUp ? "bottom-full mb-1" : "top-full mt-1"}`}
@@ -137,6 +161,7 @@ export function ChatViewMenu({ sessionId, send, currentOverride }: Props): React
           <Row label={i18nT("common.contextUsageBar", undefined, "Context usage bar")} value={prefs.contextUsageBar} marked={isOverridden("contextUsageBar")} onChange={(v) => patch({ contextUsageBar: v })} />
           <Row label={i18nT("session.reasoningBlocks", undefined, "Reasoning blocks")} value={prefs.reasoning} marked={isOverridden("reasoning")} onChange={(v) => patch({ reasoning: v })} />
           <Row label={i18nT("session.keepReasoningOpenUntilTurnEnds", undefined, "Keep reasoning open until turn ends")} value={prefs.keepReasoningOpenUntilTurnEnds} marked={isOverridden("keepReasoningOpenUntilTurnEnds")} onChange={(v) => patch({ keepReasoningOpenUntilTurnEnds: v })} />
+          <Row label={i18nT("settings.reasoningInlineFlow", undefined, "Inline reasoning flow")} value={prefs.reasoningInlineFlow} marked={isOverridden("reasoningInlineFlow")} onChange={(v) => patch({ reasoningInlineFlow: v })} />
           <Row label={i18nT("common.keepToolGroupsCollapsed", undefined, "Keep tool groups collapsed")} value={prefs.toolGroupDefaultCollapsed} marked={isOverridden("toolGroupDefaultCollapsed")} onChange={(v) => patch({ toolGroupDefaultCollapsed: v })} />
           <Row label={i18nT("common.toolResultBodies", undefined, "Tool result bodies")} value={prefs.toolResults} marked={isOverridden("toolResults")} onChange={(v) => patch({ toolResults: v })} />
           <Row label={i18nT("session.turnMetadata", undefined, "Turn metadata")} value={prefs.turnMetadata} marked={isOverridden("turnMetadata")} onChange={(v) => patch({ turnMetadata: v })} />
@@ -144,6 +169,27 @@ export function ChatViewMenu({ sessionId, send, currentOverride }: Props): React
           <Row label={i18nT("common.showOutOfCwdSessionDiffs", undefined, "Show out-of-workspace diffs")} value={prefs.showOutOfCwdSessionDiffs} marked={isOverridden("showOutOfCwdSessionDiffs")} onChange={(v) => patch({ showOutOfCwdSessionDiffs: v })} />
           <Row label={i18nT("common.reserveProcessLineAtIdle", undefined, "Reserve process line at idle")} value={prefs.reserveProcessLineAtIdle} marked={isOverridden("reserveProcessLineAtIdle")} onChange={(v) => patch({ reserveProcessLineAtIdle: v })} />
           <Row label={i18nT("common.debugEvents", undefined, "Debug events")} value={prefs.debugTools} marked={isOverridden("debugTools")} onChange={(v) => patch({ debugTools: v })} />
+          <SelectRow
+            label={i18nT("common.notifications", undefined, "Notifications")}
+            value={normalizeNotifyMinLevel(prefs.notifyMinLevel)}
+            marked={isOverridden("notifyMinLevel")}
+            onChange={(v) => patch({ notifyMinLevel: v })}
+          />
+          {/* Extension-row visibility — one toggle per configured custom
+              event group, in configured order, including the catch-all
+              `other`. An id absent from prefs resolves to the group's
+              configured default. See change:
+              add-custom-event-group-filters. */}
+          <div className="text-[var(--text-tertiary)] mb-1">{i18nT("settings.customEventGroups", undefined, "Custom event groups")}</div>
+          {(customGroups ?? []).map((g) => (
+            <Row
+              key={g.id}
+              label={g.label}
+              value={prefs.customEventGroups[g.id] ?? g.default}
+              marked={isCustomGroupOverridden(g.id)}
+              onChange={(v) => patch({ customEventGroups: { [g.id]: v } })}
+            />
+          ))}
           <div className="my-2 border-t border-[var(--border-subtle)]" />
           <div className="text-[var(--text-tertiary)] mb-1">{i18nT("common.toolCalls", undefined, "Tool calls")}</div>
           <Row label={i18nT("common.read", undefined, "Read")} value={prefs.toolCalls.read} marked={isToolCallOverridden("read")} onChange={(v) => patch({ toolCalls: { read: v } })} />
@@ -163,6 +209,70 @@ export function ChatViewMenu({ sessionId, send, currentOverride }: Props): React
         </div>
       )}
     </div>
+  );
+}
+
+/** i18n label for one `notifyMinLevel` stop. */
+function notifyMinLevelLabel(value: NotifyMinLevel): string {
+  switch (value) {
+    case "all":
+      return i18nT("common.notifyMinLevel.all", undefined, "All");
+    case "success":
+      return i18nT("common.notifyMinLevel.success", undefined, "Outcomes and problems");
+    case "warnings":
+      return i18nT("common.notifyMinLevel.warnings", undefined, "Problems only");
+    case "errors":
+      return i18nT("common.notifyMinLevel.errors", undefined, "Failures only");
+  }
+}
+
+/**
+ * Value-selecting popover row — the first non-boolean control here.
+ *
+ * Keeps the label-left / control-right rhythm of its boolean siblings and
+ * yields the platform picker on mobile. Lands at `min-h-[44px]` (matching
+ * `ThinkingLevelSelector`) rather than copying the ~26px `py-1` sibling rows;
+ * restyling those siblings is deliberately out of scope (design D8).
+ * See change: gate-notify-rows-by-level.
+ */
+function SelectRow({
+  label,
+  value,
+  marked,
+  onChange,
+}: {
+  label: string;
+  value: NotifyMinLevel;
+  marked: boolean;
+  onChange: (v: NotifyMinLevel) => void;
+}) {
+  return (
+    <label
+      data-testid="notify-min-level-row"
+      data-overridden={marked ? "true" : "false"}
+      className="flex items-center justify-between gap-2 px-2 py-1 min-h-[44px] rounded hover:bg-[var(--bg-hover)] cursor-pointer"
+    >
+      <span className="flex items-center gap-1 text-[var(--text-secondary)]">
+        {marked && (
+          <span title={i18nT("common.overridesGlobal", undefined, "Overrides global")} className="text-amber-400 inline-flex">
+            <Icon path={mdiCircleSmall} size={0.7} />
+          </span>
+        )}
+        {label}
+      </span>
+      <select
+        data-testid="notify-min-level"
+        value={value}
+        onChange={(e) => onChange(e.target.value as NotifyMinLevel)}
+        className="bg-[var(--bg-tertiary)] border border-[var(--border-subtle)] rounded px-1.5 py-1 text-xs text-[var(--text-primary)]"
+      >
+        {NOTIFY_MIN_LEVELS.map((stop) => (
+          <option key={stop} value={stop}>
+            {notifyMinLevelLabel(stop)}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 

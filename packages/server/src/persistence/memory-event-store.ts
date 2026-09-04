@@ -2,6 +2,11 @@
  * In-memory event store with LRU eviction.
  * Replaces SQLite-backed event-store.ts.
  */
+
+import {
+  isBase64DataCarrier,
+  isInlineImageBlock,
+} from "@blackbelt-technology/pi-dashboard-shared/image-block.js";
 import type { DashboardEvent } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 
 export interface StoredEvent {
@@ -14,6 +19,40 @@ export interface EventStore {
   insertEvent(sessionId: string, event: DashboardEvent): number;
   /** Get events for a session starting from minSeq (inclusive) */
   getEvents(sessionId: string, minSeq: number): StoredEvent[];
+  /**
+   * Get events in the INCLUSIVE seq range `[minSeq, maxSeq]`. Resolved by
+   * binary search for both bounds over the seq-sorted, append-only buffer plus
+   * one slice — O(log n + k), deliberately NOT a linear filter: a linear
+   * implementation would cost O(n) per backfill regardless of span, which is
+   * the exact per-scroll cost this API exists to remove.
+   * See change: lazy-load-session-history (D8).
+   */
+  getEventsRange(sessionId: string, minSeq: number, maxSeq: number): StoredEvent[];
+  /**
+   * COUNT of stored events in `[minSeq, maxSeq]`, without materializing them.
+   *
+   * `handleHistoryBackfill` recomputes `remainingGapCount` after every backfill
+   * step and reads only `.length`, so `getEventsRange(...).length` allocates a
+   * slice of the whole remaining gap purely to discard it. `tail-only` makes
+   * that the worst case on EVERY step: `headMaxSeq` stays `0` by design, so the
+   * counted range never shrinks from below.
+   * See change: add-tail-only-replay-window.
+   */
+  countEventsRange(sessionId: string, minSeq: number, maxSeq: number): number;
+  /**
+   * At most `limit` of the HIGHEST-seq stored events in `[minSeq, maxSeq]`,
+   * ascending — the newest end of the range without materializing the rest.
+   *
+   * Backfill's cap is an event COUNT, so the tail-anchored read must cost the
+   * cap, not the gap's seq distance: reusing
+   * `getEventsRange(...).slice(-limit)` would materialize the entire range
+   * only to discard all but the last N — thousands of events on a dense gap.
+   * Implementation mirrors `getEventsRange` — binary search `end` at
+   * `maxSeq + 1` and a floor at `minSeq`, then slice the last `limit` before
+   * `end` — O(log n + limit). Touches `buf.lastAccess` like every read.
+   * See change: fix-history-backfill-holey-store (D3).
+   */
+  getEventsEndingAt(sessionId: string, minSeq: number, maxSeq: number, limit: number): StoredEvent[];
   /** Get a single event by sessionId and seq */
   getEvent(sessionId: string, seq: number): DashboardEvent | undefined;
   /**
@@ -33,9 +72,37 @@ export interface EventStore {
   /**
    * Cumulative store-shed telemetry (process lifetime, never reset on read).
    * `trimmedEvents` counts per-session-cap drops; `evictedSessions` counts
-   * whole-session LRU evictions. See change: instrument-event-store-trim.
+   * whole-session LRU evictions; `collapsedUpdates` counts superseded
+   * `tool_execution_update` events dropped at retention.
+   * See change: instrument-event-store-trim, collapse-superseded-tool-execution-updates.
    */
   getTrimStats(): TrimStats;
+  /**
+   * TEST-ONLY instrumentation for the collapse find-cost bound (D6). Distinct
+   * from the `collapsedUpdates` telemetry counter: this answers "how many
+   * buffer entries did the predecessor lookup examine", not "how many events
+   * were shed". See change: collapse-superseded-tool-execution-updates (P1).
+   */
+  getCollapseProbe(): CollapseProbe;
+  /**
+   * TEST-ONLY instrumentation for the `getEventsRange` sub-linearity bound
+   * (D8): buffer entries examined by the most recent range read. A binary
+   * search over 20000 entries probes ~O(log n); a linear filter probes 20000.
+   * See change: lazy-load-session-history (test-plan #E33).
+   */
+  getRangeProbe(): RangeProbe;
+  /**
+   * TEST-ONLY instrumentation for the `getEventsEndingAt` sub-linearity bound
+   * (D3) — the sibling of `getRangeProbe`, kept separate so the two read
+   * paths cannot clobber each other's probe.
+   * See change: fix-history-backfill-holey-store (test-plan #P1).
+   */
+  getEndingProbe(): RangeProbe;
+}
+
+interface RangeProbe {
+  /** Buffer entries examined by the most recent `getEventsRange` bound search. */
+  lastEntriesExamined: number;
 }
 
 export interface TrimStats {
@@ -45,12 +112,90 @@ export interface TrimStats {
     bySession: Record<string, number>;
   };
   evictedSessions: number;
+  /**
+   * Cumulative count of superseded `tool_execution_update` events removed by
+   * the retention collapse. ADDITIVE `/api/health` field.
+   * See change: collapse-superseded-tool-execution-updates (D9).
+   */
+  collapsedUpdates: number;
+  /**
+   * Cumulative subagent-tick telemetry. ADDITIVE `/api/health` fields, never
+   * reset on read, mirroring `collapsedUpdates`. `subagentTickBytes` is the
+   * size of every INGESTED subagent-carrying event; `subagentTickFatBytes` is
+   * the part that arrived WITH a timeline. The ratio is the live read on
+   * whether the bridge strip is in force — the spec's ≤ 2x bound is a growth
+   * curve a cumulative counter cannot assert, so this is a health signal, not
+   * the gate.
+   *
+   * Three deliberate imprecisions, so the number is not over-read:
+   *  - counted at INGEST, before the retention collapse, so a later-subsumed
+   *    tick is still counted;
+   *  - sizes come from `measureBytes`, which short-circuits at the ceiling —
+   *    a bounded estimate, not an exact serialized length;
+   *  - a terminal tick is counted once PER CARRIER (`subagent_completed` and
+   *    `tool_execution_end` are both fat), so these are per-carrier counts,
+   *    not per-logical-tick.
+   * See change: reduce-subagent-details-payload (D6).
+   */
+  subagentTicks: number;
+  subagentTickBytes: number;
+  subagentFatTicks: number;
+  subagentTickFatBytes: number;
+}
+
+/**
+ * All-zero `TrimStats`, used as `/api/health`'s fallback when no event store is
+ * wired. Exported (rather than written as a literal at the call site) because
+ * TypeScript types `a ?? b` as `NonNullable<A> | B` and does NOT check `b`
+ * against `A` — an inline literal would silently omit a newly-required field
+ * while still typechecking. Naming the type here makes the omission a compile
+ * error and gives the shape test something to assert against.
+ * See change: collapse-superseded-tool-execution-updates (D9).
+ */
+export const EMPTY_TRIM_STATS: TrimStats = {
+  trimmedEvents: { total: 0, toolExecutionEnd: 0, bySession: {} },
+  evictedSessions: 0,
+  collapsedUpdates: 0,
+  subagentTicks: 0,
+  subagentTickBytes: 0,
+  subagentFatTicks: 0,
+  subagentTickFatBytes: 0,
+};
+
+export interface CollapseProbe {
+  /** Buffer entries examined by the most recent insert's predecessor lookup. */
+  lastEntriesExamined: number;
+  /** High-water mark of `lastEntriesExamined` over the store's lifetime. */
+  maxEntriesExamined: number;
+  /** Live total of indexed `toolCallId`s across every resident buffer. */
+  indexedToolCalls: number;
+}
+
+/**
+ * Two INDEPENDENT seq pointers per `toolCallId` (D7). `creatingSeq` pins the
+ * first update carrying `details.agentId` (first-wins `type`/`description`);
+ * `newestSeq` tracks the current retained tail update. A single-seq index
+ * would collapse the creating tick whenever it happened to be the indexed
+ * predecessor, silently voiding the pin.
+ */
+interface CollapseIndexEntry {
+  creatingSeq: number | undefined;
+  newestSeq: number | undefined;
 }
 
 interface SessionBuffer {
   events: StoredEvent[];
   nextSeq: number;
   lastAccess: number;
+  /**
+   * Per-buffer collapse index, keyed by `toolCallId` and holding SEQ values —
+   * never array positions (`trimBufferToLimit` rebuilds the array wholesale,
+   * invalidating any position). Lives on the buffer so it is released with it
+   * on LRU evict / `deleteEventsForSession`; a process-wide map would
+   * accumulate an entry per `toolCallId` of every evicted session — an
+   * unbounded leak inside a memory-bounding change (D6.4).
+   */
+  collapseIndex: Map<string, CollapseIndexEntry>;
 }
 
 export const DEFAULT_MAX_CACHED_SESSIONS = 100;
@@ -73,6 +218,12 @@ export const DEFAULT_MAX_EVENTS_PER_SESSION = 20000;
 const ESSENTIAL_CHAT_EVENT_TYPES: ReadonlySet<string> = new Set([
   "message_start",
   "message_end",
+  // Inline terminal lifecycle: the reducer's card position depends on the
+  // paired open/close surviving trim together. Trimming one of a structurally
+  // paired set relocates the card to the stream tail on replay.
+  // See change: preserve-inline-terminal-transcript (D3b).
+  "inline_terminal_open",
+  "inline_terminal_close",
 ]);
 
 /**
@@ -112,8 +263,116 @@ function trimBufferToLimit(
   return { dropped, toolEndDropped };
 }
 
-/** Default max size for any string field within event data */
-const DEFAULT_MAX_STRING_SIZE = 4_000;
+// ---- Superseded `tool_execution_update` collapse (D5/D6/D7) ----
+// See change: collapse-superseded-tool-execution-updates.
+
+/**
+ * Resolve an update's subagent `details` as `data.partialResult.details` ONLY.
+ * Mirrors the client reducer exactly: its `tool_execution_update` branch gates
+ * on `if (partialResult)` and reads `structured.details`; it NEVER falls back
+ * to a top-level `data.details` for an update (that path belongs to
+ * `tool_execution_end`). A gate resolving `data.details` would compare keys the
+ * consumer never reads, and could drop a predecessor on the strength of a field
+ * that has no effect (D7.1).
+ */
+function resolveUpdateDetails(event: DashboardEvent): Record<string, unknown> | undefined {
+  const data = event.data as Record<string, unknown> | undefined;
+  const pr = data?.partialResult as Record<string, unknown> | undefined;
+  if (!pr || typeof pr !== "object") return undefined;
+  const details = pr.details;
+  if (!details || typeof details !== "object") return undefined;
+  return details as Record<string, unknown>;
+}
+
+/**
+ * Does this update set the consumer's rendered `result`? `result` has TWO
+ * sources, not one: the plain-string `partialResult` branch, and the structured
+ * branch's text extracted from `partialResult.content` (a SIBLING of `details`,
+ * assigned only `if (text != null)`). Expressed over the OUTCOME using the
+ * reducer's own predicate rather than over the presence of a `content` key,
+ * so the mixed plain-string → structured-without-`content` case is caught (D7).
+ */
+function setsRenderedResult(event: DashboardEvent): boolean {
+  const data = event.data as Record<string, unknown> | undefined;
+  const pr = data?.partialResult;
+  if (pr == null) return false;
+  if (typeof pr !== "object") return true; // plain-string overwrite branch
+  const content = (pr as Record<string, unknown>).content;
+  // Reducer: array-with-text → that text; else `content != null` → String(content).
+  return content != null;
+}
+
+/** Coarse JS value type, distinguishing null and array from plain objects. */
+function valueType(v: unknown): string {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return "array";
+  return typeof v;
+}
+
+/**
+ * D7 superset gate: may predecessor `p` be dropped in favour of successor `s`?
+ *
+ * The reducer's `subagents` merge is ACCUMULATIVE — every field is extracted
+ * conditionally, so a field present in `p` and absent from `s` survives the
+ * full fold and would be lost by a naive keep-newest. Require ALL of:
+ *   - every key of `p`'s details is present in `s`'s details AND holds the same
+ *     JS type (`readSubagentDetails` extracts type-conditionally, so a key that
+ *     is present-but-type-downgraded is "absent" to the consumer);
+ *   - a non-empty `entries` is not replaced by an empty/absent one (the
+ *     reducer's empty-array overwrite guard exists because initial and
+ *     late/reordered frames legitimately arrive empty);
+ *   - if `p` sets the rendered `result`, `s` sets it too.
+ *
+ * The rendered-result rule applies even when NEITHER event resolves details —
+ * they can reach that state for different reasons: a plain-string
+ * `partialResult` (the reducer's unconditional overwrite branch, which SETS
+ * `result`) resolves no details, and so does a structured `partialResult`
+ * carrying neither `details` nor `content` (which sets nothing). An earlier
+ * `if (!dp && !ds) return true` short-circuit skipped the rule on that path and
+ * dropped a result-setting predecessor in favour of a successor that set
+ * nothing. See test X9.
+ *
+ * On failure BOTH are retained; the index advances to `s`, so the non-subsumed
+ * `p` is shed only by the ordinary trim/evict policies.
+ */
+/** Is every key of `pd` present in `sd` holding a value of the SAME JS type? */
+function keysSurvive(pd: Record<string, unknown>, sd: Record<string, unknown>): boolean {
+  for (const k of Object.keys(pd)) {
+    if (!(k in sd)) return false;
+    if (valueType(pd[k]) !== valueType(sd[k])) return false;
+  }
+  return true;
+}
+
+/** Is a non-empty `entries` array preserved (never replaced by an empty one)? */
+function entriesSurvive(pd: Record<string, unknown>, sd: Record<string, unknown>): boolean {
+  if (!Array.isArray(pd.entries) || pd.entries.length === 0) return true;
+  return Array.isArray(sd.entries) && sd.entries.length > 0;
+}
+
+function subsumes(p: DashboardEvent, s: DashboardEvent): boolean {
+  const dp = resolveUpdateDetails(p);
+  const ds = resolveUpdateDetails(s);
+  const pd = dp ?? {};
+  const sd = ds ?? {};
+  if (!keysSurvive(pd, sd)) return false;
+  if (!entriesSurvive(pd, sd)) return false;
+  return !setsRenderedResult(p) || setsRenderedResult(s);
+}
+
+/** `data.toolCallId` when it is a string — else undefined (D5 fail-open). */
+function readToolCallId(event: DashboardEvent): string | undefined {
+  const id = (event.data as Record<string, unknown> | undefined)?.toolCallId;
+  return typeof id === "string" ? id : undefined;
+}
+
+/**
+ * Default max size for any string field within event data. Exported so the
+ * boot-time transcript-cap assert can validate the value the store ACTUALLY
+ * uses when the config leaves it unset, rather than skipping the check.
+ * See change: fit-attachments-for-display (task 5.5).
+ */
+export const DEFAULT_MAX_STRING_SIZE = 4_000;
 /**
  * Default cap on the TOTAL serialized size of an individual event's `data`
  * (bytes). A single subagent turn embeds its full timeline (tool calls,
@@ -121,48 +380,62 @@ const DEFAULT_MAX_STRING_SIZE = 4_000;
  * deeply-nested payload can escape per-field truncation and blow the server
  * heap when `JSON.stringify`d on the broadcast path (whole-server OOM).
  * See change: bound-subagent-event-serialization.
+ *
+ * Raised 20_000 -> 262_144 (256 KiB). Image content blocks are now fitted for
+ * display BEFORE they reach the store (768 px long edge, q75), whose measured
+ * worst case is 212 KB (n=40) - so 256 KiB covers 100 % of fitted output and
+ * the ceiling becomes deterministic. At the RAW payload sizes that reach the
+ * store today (p99 2.2 MB, max 10.5 MB) a 256 KiB ceiling would still only
+ * cover 74.9 %, which is why the raise is only sound TOGETHER with the fit.
+ * The raise is global: `DEFAULT_TRANSCRIPT_CAP_BYTES` is derived from it at
+ * 0.75 x and therefore moves 15 KB -> 192 KiB (D9, accepted).
+ * See change: fit-attachments-for-display (task 5.4, D2/D9).
  */
-export const DEFAULT_MAX_EVENT_DATA_SIZE = 20_000;
+export const DEFAULT_MAX_EVENT_DATA_SIZE = 262_144;
 
-/** True for a base64 image content block (`data` string + sibling `mimeType`). */
-function isImageBlock(obj: object): boolean {
-  return (
-    typeof (obj as Record<string, unknown>).data === "string" &&
-    "mimeType" in obj
-  );
-}
 
 /**
- * Remove user image payloads from browser-bound events while preserving the
- * attachment count. Pi JSONL and the original bridge event remain unchanged.
+ * Inline image-block detection (flat pi shape + nested Anthropic `source`
+ * shape) is the canonical `isInlineImageBlock` from
+ * `@blackbelt-technology/pi-dashboard-shared/image-block.js`, shared with the
+ * client reducer so the two sites can never drift.
+ * See change: fix-pasted-image-message-vanishes.
  */
-export function projectUserImageAttachments(event: DashboardEvent): DashboardEvent {
-  if (event.eventType !== "message_start") return event;
-  const data = event.data;
+
+/**
+ * Chat-message image-bytes rescue: strip the base64 bytes out of every inline
+ * image block in a `data.message` while PRESERVING the message envelope (role,
+ * text blocks, block positions, mime). Runs (only for an over-ceiling event)
+ * BEFORE the generic string pass and the `{__truncated}` fallback. The
+ * whole-event `{__truncated}` placeholder erases `data.message` entirely — for
+ * a user chat message with a pasted screenshot that means the client's
+ * `message_start` handler sees no `message.role` and the row VANISHES from
+ * history (text and all). Reducing the image bytes in place keeps the text +
+ * a positioned image placeholder so the message survives; a downstream
+ * fit/attachment resolution (when available) still back-fills the rendered
+ * thumbnail.
+ *
+ * Returns a NEW event when it changed anything, else the original reference.
+ * See change: fix-pasted-image-message-vanishes.
+ */
+function stripInlineImageBytesFromMessage(event: DashboardEvent): DashboardEvent {
+  const data = event.data as Record<string, unknown> | undefined;
   if (!data || typeof data !== "object") return event;
-  const message = (data as Record<string, unknown>).message;
-  if (!message || typeof message !== "object") return event;
-  const msg = message as Record<string, unknown>;
-  if (msg.role !== "user" || !Array.isArray(msg.content)) return event;
-
-  const imageCount = msg.content.filter(
-    (part) => part && typeof part === "object" && (part as Record<string, unknown>).type === "image",
-  ).length;
-  if (imageCount === 0) return event;
-
-  return {
-    ...event,
-    data: {
-      ...(data as Record<string, unknown>),
-      imageCount,
-      message: {
-        ...msg,
-        content: msg.content.filter(
-          (part) => !(part && typeof part === "object" && (part as Record<string, unknown>).type === "image"),
-        ),
-      },
-    },
-  };
+  const message = data.message as Record<string, unknown> | undefined;
+  const content = message?.content;
+  if (!Array.isArray(content) || !content.some(isInlineImageBlock)) return event;
+  const nextContent = content.map((block) => {
+    if (!isInlineImageBlock(block)) return block;
+    const r = block as Record<string, unknown>;
+    // Flat shape: blank the top-level `data`.
+    if (typeof r.data === "string" && r.data.length > 0) {
+      return { ...r, data: "", imageTruncated: true };
+    }
+    // Nested shape: blank `source.data` but keep the wrapper + media_type.
+    const src = r.source as Record<string, unknown>;
+    return { ...r, source: { ...src, data: "" }, imageTruncated: true };
+  });
+  return { ...event, data: { ...data, message: { ...message, content: nextContent } } };
 }
 
 /**
@@ -219,7 +492,7 @@ export function capString(s: string, maxSize: number): string {
 function summarizeAtDepthLimit(obj: unknown, maxSize: number): unknown {
   if (typeof obj === "string") return capString(obj, maxSize);
   if (obj && typeof obj === "object") {
-    if (!Array.isArray(obj) && isImageBlock(obj)) return obj;
+    if (!Array.isArray(obj) && isBase64DataCarrier(obj)) return obj;
     return "[truncated: deep]";
   }
   return obj;
@@ -247,8 +520,12 @@ function truncateStrings(obj: unknown, maxSize: number, depth = 0): unknown {
     let changed = false;
     const result: Record<string, unknown> = {};
     for (const [key, val] of Object.entries(obj)) {
-      // Preserve base64 image data — skip truncation when sibling mimeType exists
-      if (key === "data" && typeof val === "string" && "mimeType" in obj) {
+      // Preserve base64 image data — skip truncation when a sibling mime key
+      // exists, in EITHER shape (flat `mimeType`, nested `source.media_type`).
+      // Detection is the shared `isBase64DataCarrier`, so this pass and the
+      // client cannot drift on what an image block looks like.
+      // See change: fix-pasted-image-message-vanishes.
+      if (key === "data" && typeof val === "string" && isBase64DataCarrier(obj)) {
         result[key] = val;
         continue;
       }
@@ -445,9 +722,16 @@ interface SubagentTimeline {
  * TYPE-scoped detector (D1). Returns the resolved `details` + its `entries[]`
  * ONLY when the event is a subagent-carrying tool event — `data.toolName ===
  * "Agent"`, OR eventType `tool_execution_update`/`tool_execution_end` with a
- * `details.agentId` — AND an array sits at `data.partialResult.details.entries`
- * (live) or `data.details.entries` (started/end). Shape alone (a bare array)
- * MUST NOT match.
+ * `details.agentId`, OR a `subagent_*` eventType (the resync-reply carrier) —
+ * AND an array sits at `data.partialResult.details.entries` (live) or
+ * `data.details.entries` (started/end). Shape alone (a bare array) MUST NOT
+ * match.
+ *
+ * The `subagent_*` arm is D5a of reduce-subagent-details-payload: a resync
+ * reply arrives as `subagent_started` with `{id, details}`, matching neither
+ * of the tool arms, so it took the generic pass where an array > 20 items was
+ * clobbered to the string "[array truncated]" and the reducer rendered no
+ * timeline at all. See change: reduce-subagent-details-payload.
  */
 function locateSubagentTimeline(event: DashboardEvent): SubagentTimeline | undefined {
   const data = event.data as Record<string, unknown> | undefined;
@@ -466,7 +750,8 @@ function locateSubagentTimeline(event: DashboardEvent): SubagentTimeline | undef
   const isUpdateOrEnd =
     event.eventType === "tool_execution_update" || event.eventType === "tool_execution_end";
   const hasAgentId = typeof details.agentId === "string";
-  if (!isAgentTool && !(isUpdateOrEnd && hasAgentId)) return undefined;
+  const isSubagentCarrier = event.eventType.startsWith("subagent_");
+  if (!isAgentTool && !isSubagentCarrier && !(isUpdateOrEnd && hasAgentId)) return undefined;
   return { details, entries: details.entries as unknown[], underPartialResult };
 }
 
@@ -616,7 +901,7 @@ export function reduceSubagentEvent(event: DashboardEvent, ceiling: number): Das
   const ENTRY_FINAL = clamp(Math.round(E * 0.45), 1_500, 6_000);
 
   const n = origEntries.length;
-  let kHead = Math.min(K_HEAD, n);
+  const kHead = Math.min(K_HEAD, n);
   let kTail = Math.min(K_TAIL, n - kHead);
 
   // Decrement K_TAIL while the intermediate per-entry budget underflows MID_FLOOR.
@@ -753,18 +1038,35 @@ function createTruncator(maxStringSize: number, maxEventDataSize: number) {
         ? reduceSubagentEvent(event, maxEventDataSize)
         : event;
     }
+    // Rescue a chat message that only busts the per-event ceiling because of
+    // inline image bytes: strip the base64 out of its image blocks (both the
+    // flat pi shape `{data,mimeType}` and the nested Anthropic shape
+    // `{source:{media_type,data}}`) BEFORE the generic string pass, but keep
+    // the text + role + block positions. Without this rescue a pasted
+    // screenshot collapses the whole event to `{__truncated}`, which erases
+    // `data.message` and makes the user's row VANISH from chat history (text
+    // and all). Small (under-ceiling) images are left untouched so normal
+    // inline rendering is unaffected.
+    // See change: fix-pasted-image-message-vanishes.
+    const rescued =
+      sizePass && exceedsSerializedSize(data, maxEventDataSize)
+        ? stripInlineImageBytesFromMessage(event)
+        : event;
+    const rescuedData = rescued.data as Record<string, unknown>;
     const truncated = stringPass
-      ? (truncateStrings(data, maxStringSize) as Record<string, unknown>)
-      : (data as Record<string, unknown>);
+      ? (truncateStrings(rescuedData, maxStringSize) as Record<string, unknown>)
+      : rescuedData;
     if (sizePass && exceedsSerializedSize(truncated, maxEventDataSize)) {
       const messageEvent = reduceAssistantMessageEvent(
         truncated !== data ? { ...event, data: truncated } : event,
         maxEventDataSize,
       );
       if (messageEvent) return messageEvent;
+      // Non-image content alone still busts the ceiling (e.g. a huge text
+      // block) — fall through to the whole-event placeholder.
       return truncatedPlaceholder(event, maxEventDataSize);
     }
-    return truncated !== data ? { ...event, data: truncated } : event;
+    return truncated !== data ? { ...rescued, data: truncated } : rescued;
   };
 }
 
@@ -795,11 +1097,55 @@ export function createMemoryEventStore(
   // counters above are the lifetime record. See change: instrument-event-store-trim.
   const trimmedEventsBySession = new Map<string, number>();
   let evictedSessionsTotal = 0;
+  let collapsedUpdatesTotal = 0;
+  // Subagent-tick byte telemetry (D6). Additive, never reset on read.
+  // See change: reduce-subagent-details-payload.
+  let subagentTicksTotal = 0;
+  let subagentTickBytesTotal = 0;
+  let subagentFatTicksTotal = 0;
+  let subagentTickFatBytesTotal = 0;
+
+  /**
+   * Count one ingested subagent-carrying event, splitting fat (carries a
+   * timeline) from thin. Measured on the STORED event, which is what the live
+   * broadcast sends — so broadcast bytes == counted bytes.
+   * See change: reduce-subagent-details-payload (D6).
+   */
+  function countSubagentTick(event: DashboardEvent): void {
+    const isSubagentCarrier =
+      event.eventType.startsWith("subagent_") ||
+      event.eventType === "tool_execution_update" ||
+      event.eventType === "tool_execution_end";
+    if (!isSubagentCarrier) return;
+    const data = event.data as Record<string, unknown> | undefined;
+    if (!data || typeof data !== "object") return;
+    const pr = data.partialResult as Record<string, unknown> | undefined;
+    const details = (pr && typeof pr === "object" ? pr.details : data.details) as
+      | Record<string, unknown>
+      | undefined;
+    if (!details || typeof details !== "object") return;
+    if (typeof details.agentId !== "string" && !event.eventType.startsWith("subagent_")) return;
+    const bytes = measureBytes(data, maxEventDataSize);
+    subagentTicksTotal += 1;
+    subagentTickBytesTotal += bytes;
+    if (Array.isArray(details.entries) && details.entries.length > 0) {
+      subagentFatTicksTotal += 1;
+      subagentTickFatBytesTotal += bytes;
+    }
+  }
+  // P1 find-cost probe. Reset per insert; distinct from collapsedUpdatesTotal.
+  let lastEntriesExamined = 0;
+  let maxEntriesExamined = 0;
+  // D8 sub-linearity probe. Reset per `getEventsRange` call.
+  let lastRangeEntriesExamined = 0;
+  // Sibling probe for `getEventsEndingAt` (D3) — kept separate from the
+  // `getEventsRange` probe so the two read paths cannot clobber each other.
+  let lastEndingEntriesExamined = 0;
 
   function getOrCreate(sessionId: string): SessionBuffer {
     let buf = buffers.get(sessionId);
     if (!buf) {
-      buf = { events: [], nextSeq: 1, lastAccess: Date.now() };
+      buf = { events: [], nextSeq: 1, lastAccess: Date.now(), collapseIndex: new Map() };
       buffers.set(sessionId, buf);
     }
     buf.lastAccess = Date.now();
@@ -831,12 +1177,138 @@ export function createMemoryEventStore(
     return evicted;
   }
 
+  /**
+   * Locate `seq` in the seq-sorted `buf.events` by scanning BACKWARD from the
+   * tail (D6.1). The superseded predecessor sits near the tail, so the scan is
+   * bounded by the number of concurrently-streaming tool calls, not by buffer
+   * length. A FORWARD scan (the shape `getEvent` uses) would make collapse
+   * O(buffer length) per insert — precisely what D6 forbids. Returns -1 on a
+   * miss (e.g. trim already dropped the entry); the caller must never let a
+   * negative index reach `splice`.
+   */
+  function findIndexBySeq(buf: SessionBuffer, seq: number): number {
+    let examined = 0;
+    for (let i = buf.events.length - 1; i >= 0; i--) {
+      examined++;
+      const s = buf.events[i].seq;
+      if (s === seq) {
+        lastEntriesExamined = examined;
+        if (examined > maxEntriesExamined) maxEntriesExamined = examined;
+        return i;
+      }
+      // Array is seq-ascending: once we are below the target it is absent.
+      if (s < seq) break;
+    }
+    lastEntriesExamined = examined;
+    if (examined > maxEntriesExamined) maxEntriesExamined = examined;
+    return -1;
+  }
+
+  /**
+   * D6.2 VERIFIED removal: resolve `prevSeq`, confirm the located entry is
+   * still a `tool_execution_update` carrying `toolCallId`, and only then test
+   * subsumption and splice. An unresolved lookup (trim already dropped it) is a
+   * no-op — a negative index must NEVER reach `splice`, which would delete the
+   * buffer's LAST element (the max-seq event).
+   */
+  function dropIfSuperseded(
+    buf: SessionBuffer,
+    prevSeq: number,
+    toolCallId: string,
+    successor: DashboardEvent,
+  ): void {
+    const i = findIndexBySeq(buf, prevSeq);
+    if (i === -1) return;
+    const candidate = buf.events[i];
+    if (candidate.event.eventType !== "tool_execution_update") return;
+    if (readToolCallId(candidate.event) !== toolCallId) return;
+    if (!subsumes(candidate.event, successor)) return;
+    buf.events.splice(i, 1);
+    collapsedUpdatesTotal++;
+  }
+
+  /**
+   * Drop index entries whose events the trim has already discarded.
+   *
+   * The buffer's EVENTS are capped, but the index is keyed by `toolCallId`, so
+   * without this a long-lived session gains one PERMANENT entry per distinct
+   * tool call — an uncapped map inside a change whose purpose is to bound
+   * memory. This is the D6.4 leak argument applied WITHIN a session rather than
+   * across them: buffer-scoping alone only bounds it at eviction, which a
+   * long-lived session never reaches.
+   *
+   * Called only after a trim actually dropped events, so the O(index) scan is
+   * amortized against the trim's own hysteresis, not paid per insert.
+   * See change: collapse-superseded-tool-execution-updates.
+   */
+  function pruneCollapseIndex(buf: SessionBuffer): void {
+    const minSeq = buf.events[0]?.seq;
+    if (minSeq === undefined) {
+      buf.collapseIndex.clear();
+      return;
+    }
+    for (const [toolCallId, entry] of buf.collapseIndex) {
+      // `newestSeq` below the surviving floor ⇒ every event for this call is
+      // gone ⇒ the entry can never resolve again.
+      if (entry.newestSeq === undefined || entry.newestSeq < minSeq) {
+        buf.collapseIndex.delete(toolCallId);
+        continue;
+      }
+      // The pinned creating tick was trimmed away: the first-wins fields it
+      // carried are already out of the buffer, so the pin protects nothing and
+      // would only block a legitimate collapse. Release it.
+      if (entry.creatingSeq !== undefined && entry.creatingSeq < minSeq) {
+        entry.creatingSeq = undefined;
+      }
+    }
+  }
+
+  /**
+   * Drop the previously-retained `tool_execution_update` for this call when the
+   * just-inserted `stored` subsumes it (D7), then advance the index. Fail-open
+   * on a missing `toolCallId` (D5) and on any unverified lookup (D6.2).
+   */
+  function collapseSuperseded(buf: SessionBuffer, stored: StoredEvent): void {
+    if (stored.event.eventType !== "tool_execution_update") return;
+    const toolCallId = readToolCallId(stored.event);
+    // D5: an update we cannot key (including a `{__truncated}` placeholder,
+    // whose data carries no toolCallId) is retained and collapses nothing.
+    if (toolCallId === undefined) return;
+
+    let entry = buf.collapseIndex.get(toolCallId);
+    if (!entry) {
+      entry = { creatingSeq: undefined, newestSeq: undefined };
+      buf.collapseIndex.set(toolCallId, entry);
+    }
+
+    const prevSeq = entry.newestSeq;
+    // D7: skip removal when the predecessor IS the pinned creating tick.
+    if (prevSeq !== undefined && prevSeq !== entry.creatingSeq) {
+      dropIfSuperseded(buf, prevSeq, toolCallId, stored.event);
+    }
+
+    entry.newestSeq = stored.seq;
+    if (entry.creatingSeq === undefined) {
+      const details = resolveUpdateDetails(stored.event);
+      // Structural pin: the FIRST update carrying `details.agentId` supplies the
+      // reducer's first-wins `type`/`description` and is never collapsed away.
+      if (details && typeof details.agentId === "string") entry.creatingSeq = stored.seq;
+    }
+  }
+
   return {
     insertEvent(sessionId: string, event: DashboardEvent): number {
       const buf = getOrCreate(sessionId);
       const seq = buf.nextSeq++;
-      const projectedEvent = projectUserImageAttachments(event);
-      buf.events.push({ seq, event: truncateEventData(projectedEvent) });
+      lastEntriesExamined = 0;
+      const stored: StoredEvent = { seq, event: truncateEventData(event) };
+      countSubagentTick(stored.event);
+      buf.events.push(stored);
+      // Collapse superseded updates AFTER truncation (so the `{__truncated}`
+      // placeholder is already resolved) and BEFORE trim/evict, so the shed
+      // policies see the already-collapsed buffer.
+      // See change: collapse-superseded-tool-execution-updates (D1, task 2.3).
+      collapseSuperseded(buf, stored);
       // Trim over the per-session limit (0 = unlimited). Hysteresis: only
       // reclaim once the buffer overshoots the cap by TRIM_SLACK, then trim
       // back to the cap in one O(n) pass. This amortizes the trim cost to O(1)
@@ -858,6 +1330,10 @@ export function createMemoryEventStore(
             sessionId,
             (trimmedEventsBySession.get(sessionId) ?? 0) + dropped,
           );
+          // The trim just raised the buffer's seq floor; release index entries
+          // it orphaned so the map tracks RESIDENT calls, not every call ever
+          // seen. See change: collapse-superseded-tool-execution-updates.
+          pruneCollapseIndex(buf);
         }
       }
       evictedSessionsTotal += evictIfNeeded();
@@ -870,6 +1346,83 @@ export function createMemoryEventStore(
       buf.lastAccess = Date.now();
       const effectiveMin = minSeq > 0 ? minSeq : 1;
       return buf.events.filter((e) => e.seq >= effectiveMin);
+    },
+
+    getEventsRange(sessionId: string, minSeq: number, maxSeq: number): StoredEvent[] {
+      lastRangeEntriesExamined = 0;
+      const buf = buffers.get(sessionId);
+      if (!buf) return [];
+      buf.lastAccess = Date.now();
+      if (maxSeq < minSeq) return [];
+      const events = buf.events;
+      // Binary search both bounds over the seq-sorted buffer, then ONE slice.
+      // `lo` = first index with seq >= minSeq; `hi` = first index with
+      // seq > maxSeq. Gaps from the middle trim are fine — sortedness, not
+      // contiguity, is what the search needs.
+      const lowerBound = (target: number): number => {
+        let lo = 0;
+        let hi = events.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >>> 1;
+          lastRangeEntriesExamined++;
+          if (events[mid].seq < target) lo = mid + 1;
+          else hi = mid;
+        }
+        return lo;
+      };
+      const start = lowerBound(minSeq > 0 ? minSeq : 1);
+      const end = lowerBound(maxSeq + 1);
+      if (end <= start) return [];
+      return events.slice(start, end);
+    },
+
+    countEventsRange(sessionId: string, minSeq: number, maxSeq: number): number {
+      // Same two binary searches as `getEventsRange`, minus the slice. Shares
+      // the D8 probe so the sub-linearity bound is asserted on this path too.
+      lastRangeEntriesExamined = 0;
+      const buf = buffers.get(sessionId);
+      if (!buf) return 0;
+      buf.lastAccess = Date.now();
+      if (maxSeq < minSeq) return 0;
+      const events = buf.events;
+      const lowerBound = (target: number): number => {
+        let lo = 0;
+        let hi = events.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >>> 1;
+          lastRangeEntriesExamined++;
+          if (events[mid].seq < target) lo = mid + 1;
+          else hi = mid;
+        }
+        return lo;
+      };
+      const start = lowerBound(minSeq > 0 ? minSeq : 1);
+      const end = lowerBound(maxSeq + 1);
+      return end <= start ? 0 : end - start;
+    },
+
+    getEventsEndingAt(sessionId: string, minSeq: number, maxSeq: number, limit: number): StoredEvent[] {
+      lastEndingEntriesExamined = 0;
+      const buf = buffers.get(sessionId);
+      if (!buf) return [];
+      buf.lastAccess = Date.now();
+      if (maxSeq < minSeq) return [];
+      const events = buf.events;
+      const lowerBound = (target: number): number => {
+        let lo = 0;
+        let hi = events.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >>> 1;
+          lastEndingEntriesExamined++;
+          if (events[mid].seq < target) lo = mid + 1;
+          else hi = mid;
+        }
+        return lo;
+      };
+      const end = lowerBound(maxSeq + 1);
+      const startFloor = lowerBound(minSeq > 0 ? minSeq : 1);
+      if (end <= startFloor) return [];
+      return events.slice(Math.max(startFloor, end - limit), end);
     },
 
     getEvent(sessionId: string, seq: number): DashboardEvent | undefined {
@@ -900,6 +1453,7 @@ export function createMemoryEventStore(
       const buf = buffers.get(sessionId);
       if (!buf) return 0;
       const count = buf.events.length;
+      // The collapse index rides on `buf`, so dropping the buffer releases it.
       buffers.delete(sessionId);
       trimmedEventsBySession.delete(sessionId);
       return count;
@@ -928,7 +1482,26 @@ export function createMemoryEventStore(
           bySession: Object.fromEntries(trimmedEventsBySession),
         },
         evictedSessions: evictedSessionsTotal,
+        collapsedUpdates: collapsedUpdatesTotal,
+        subagentTicks: subagentTicksTotal,
+        subagentTickBytes: subagentTickBytesTotal,
+        subagentFatTicks: subagentFatTicksTotal,
+        subagentTickFatBytes: subagentTickFatBytesTotal,
       };
+    },
+
+    getRangeProbe(): RangeProbe {
+      return { lastEntriesExamined: lastRangeEntriesExamined };
+    },
+
+    getEndingProbe(): RangeProbe {
+      return { lastEntriesExamined: lastEndingEntriesExamined };
+    },
+
+    getCollapseProbe(): CollapseProbe {
+      let indexedToolCalls = 0;
+      for (const buf of buffers.values()) indexedToolCalls += buf.collapseIndex.size;
+      return { lastEntriesExamined, maxEntriesExamined, indexedToolCalls };
     },
   };
 }

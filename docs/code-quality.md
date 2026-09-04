@@ -35,6 +35,14 @@ Static-analysis code quality via Biome. Ratchet model: rules graduate `off → w
 
 Rule lifecycle one-way pawl: `off → warn → error`. Cannot regress.
 
+### `warn` not free
+
+- `quality:changed` = `biome check --changed --error-on-warnings --write`. Flag escalates `warn` → hard failure on changed files.
+- CI `biome lint . --reporter=github` omits the flag. `warn` annotates, does not fail.
+- Consequence: `off → warn` promotion hard-blocks the local oracle for anyone touching a flagged file. Costs the toucher, not the author.
+- Candidate rule with material false-positive rate goes to `off`, not `warn`. Parking a rule at `warn` not a neutral hedge.
+- Decisive for `useExhaustiveSwitchCases`: only 4 findings, all 4 deliberate partial switches. At `warn` they block `quality:changed` for every future edit of `directory-handler.ts` and `git-link-builder.ts`, permanently, no fix available.
+
 ## Tier ladder
 
 Rule → group, as configured in `biome.json`.
@@ -54,8 +62,14 @@ Rule → group, as configured in `biome.json`.
 | useValidForDirection | correctness |
 | useValidTypeof | correctness |
 | noDangerouslySetInnerHtmlWithChildren | security |
+| noImportCycles | suspicious |
+| noFloatingPromises | nursery |
+| noMisusedPromises | nursery |
+| noUndeclaredDependencies | correctness |
 
 NOTE: `useValidTypeof` lives in `correctness` group in Biome 2.5.1. design.md originally mislabeled it `suspicious`.
+
+NOTE: type-aware + structural rules graduated with 0 findings repo-wide. Cost ~2s over 2916 files.
 
 ### Tier B — `warn`, ratchet per-area
 
@@ -80,17 +94,121 @@ NOTE: `useValidTypeof` lives in `correctness` group in Biome 2.5.1. design.md or
 
 useAltText, useValidAriaProps, useValidAriaValues, useAriaPropsForRole, useButtonType, useValidAnchor.
 
+## Type-aware + structural rules
+
+Biome 2.5.1 ships type-aware inference. `noFloatingPromises`/`noMisusedPromises` reason about promise semantics. `noImportCycles`/`noUndeclaredDependencies` reason across files.
+
+`tsc --noEmit` proves types, not usage. Vitest proves only what it was told. Neither catches a floating promise.
+
+Rules named individually in `biome.json`. NO `linter.domains` block. Domains grant future Biome rules automatically on upgrade — conflicts with one-way ratchet where every graduation is deliberate.
+
+Type-aware finding counts DEPEND on installed deps. Measured before `pnpm install` vs after: useAwaitThenable 3 → 285, noUnnecessaryConditions 601 → 487, noBaseToString 47 → 21, useExhaustiveSwitchCases 2 → 4. Always run `pnpm install` before probing.
+
+## Probe must be non-vacuous
+
+Zero finding = evidence only if rule CAN fire. Misnamed rule reports silent zero. Rule resolved `off` by override reports silent zero.
+
+Before trusting a zero, plant a deliberate violation, confirm probe reports it, delete planted file.
+
+Verified this way at graduation: planted `async f(){}` + bare `f()` → noFloatingPromises fired. Planted async callback into sync-callback param → noMisusedPromises fired. Planted 2-module import loop → noImportCycles fired (2 errors).
+
+Rule group not assumable. `noUnnecessaryConditions` lives in `suspicious`, not `nursery`. Verify identifier against installed Biome version.
+
+## Site-count extraction must reconcile
+
+Site counts come from Biome's reported diagnostic total. Extracted site lists MUST reconcile against it.
+
+Extraction regex anchored `^[a-z]` drops dot-paths. Cost 2 sites: `.pi/skills/implement/scripts/restart-server.ts:35,38`. Reported 487, extracted 485.
+
+Same trap class as dropping `.cjs`/`.mjs`/`.cts` extensions.
+
+Discrepancy resolved by FINDING the missing site. Never explained away as duplicate diagnostic.
+
+Reconcile with: `comm -23 <(full-extract | sort) <(your-extract | sort)`.
+
+## Candidate type-aware rules — triaged, all `off`
+
+| Rule | Group | Findings | Sampled | Verdict |
+|---|---|---|---|---|
+| useAwaitThenable | nursery | 285 | 13 | off |
+| noUnnecessaryConditions | suspicious | 487 | 15 | off |
+| noBaseToString | nursery | 21 | 6 | off |
+| useExhaustiveSwitchCases | nursery | 4 | 4 | off |
+
+- useAwaitThenable: 284/285 sites are `await fastify.inject(...)` in `__tests__`. Fastify `inject` returns `LightMyRequest.Chain` — thenable, not Promise. 1 non-test site = `await fastify.register(cookie)`, same class. ~100% false positive.
+- noUnnecessaryConditions: emits "This case is unreachable" on live code. Example `packages/server/src/model-proxy/convert/anthropic-out.ts:35` `case "start"` and `:51` `case "text_delta"` — both on the working model-proxy SSE conversion path. Acting on findings deletes working code. 63/487 in test files. Rest split between defensive `?.`/`??` on JSON-parsed data and false unreachable-case claims.
+- noBaseToString: dominated by `String(err)` and `err instanceof Error ? err.message : String(err)` on `unknown`. That is the CORRECT idiom. 5 of 21 sites in `packages/server/src/package/package-manager-wrapper.ts` alone.
+- useExhaustiveSwitchCases: all 4 are deliberate partial switches over wide unions — `packages/server/src/browser-handlers/directory-handler.ts:290` forwards a subset of `BrowserToServerMessage`; `packages/extension/src/git-link-builder.ts:72,91` omits platforms by design. Rule cannot distinguish deliberately-partial from accidentally-incomplete.
+
+Evidence: Biome type inference approximate relative to `tsc`. No candidate enters at `error`. None enters at `warn`.
+
+## ast-grep — evaluated, rejected
+
+Recorded so it is not re-litigated.
+
+Measured against this repo:
+
+- `client → server` imports: **0** real. 4 matches are comments.
+- Raw hex literals in client: **678** total. **451 (66%)** live in
+  `lib/theme/themes.ts` (378), `index.css` (47), `lib/theme/monaco-theme.ts`
+  (26) — token-definition files, where hex belongs.
+
+Every code-shaped convention already obeyed, or violated by design. Rules that
+ARE violated are markdown- and filesystem-shaped. AST engine cannot read those.
+New dependency buying zero true positives → not bought. Enforcement lives in
+`scripts/check-conventions.mjs` instead.
+
+Caution, generalizable: original figures were 604/447 at `lib/themes.ts` and
+`lib/monaco-theme.ts`. Both paths deleted by a client reorg. Ratio survived
+re-derivation; paths did not. Same reorg silently broke `i18n-parity.mjs`.
+Re-derive counts against the tree before citing them.
+
+## False positive escape hatch
+
+`error`-tier type-aware rule can false-positive on new code. Hard-stops unattended `ship-it`.
+
+Escape = `// biome-ignore lint/<group>/<rule>: <reason>`. Reason mandatory, must state why finding is incorrect.
+
+Suppression in shipped code needs a linked follow-up.
+
+NEVER downgrade rule severity to clear one site. Downgrade removes gate for all code.
+
+Biome reports `suppressions/unused`. Stale suppression surfaces on its own.
+
 ## Overrides
 
 - `__tests__/**` + `*.test.ts` + `*.test.tsx` → noExplicitAny off.
 - noConsole never enabled. No server/scripts override needed.
+- `noUndeclaredDependencies` off for test files: `**/__tests__/**`, `**/*.test.ts`, `**/*.test.tsx`.
+- `noUndeclaredDependencies` off for build/config globs: `**/vitest.config.ts`, `**/vite.config.ts`, `**/vite.*.config.ts`, `**/forge.config.ts`, `packages/*/scripts/**`.
+- `noUndeclaredDependencies` off for non-published trees: `examples/**`, `openspec/changes/**/spike/**`, `.pi/flows/**`, `tests/e2e/**`, `qa/scripts/**`, `.pi/skills/**/scripts/**`.
+
+## Blind spot — undeclared deps in test files
+
+`__tests__` override silences 911 `noUndeclaredDependencies` sites. 891 `from "vitest"`.
+
+Whole-repo `--only` probe reports 965 sites total. 911 in test files.
+
+Next most common silenced imports: `@testing-library/react` 72, `react` 65, `vitest/config` 32.
+
+Test files accumulate undeclared imports with NO signal while rule sits at `error`.
+
+Rule reports zero under real config. Zero does NOT mean clean tree. Names the exclusion.
+
+Figures re-derived at graduation. Planning-time figures (1288 / 1030) wrong.
 
 ## Graduation criterion
 
-Rule moves `warn → error` only after `biome lint . --only=<group>/<rule> --reporter=json` reports 0 violations outside grandfathered overrides.
+Rule moves `warn → error` only after plain lint reports 0 errors.
+
+- `--only=<rule>` force-enables the rule. BYPASSES `overrides` severity entirely. Only `files.includes` exclusions survive it. Rule resolved by override can never report zero under `--only`.
+- Correct oracle: set rule to `"error"` in a copy of `biome.json`, run plain `npx biome lint . --max-diagnostics=20000`. Count errors. No `--only`.
+- `--only` still OK for COUNTING an `off` candidate rule during triage — no override interaction exists yet.
 
 - Cleanup lands first. Severity flip second.
 - After flip, rule = `error`. New violation fails CI. Cannot regress.
+- Each rule verified + flipped independently. Non-zero probe blocks that one rule only, not the set.
+- Graduation flips switches, does not fix violations. Non-zero probe → route sites to a cleanup change.
 
 ## Oracle — `quality:changed`
 
@@ -104,6 +222,113 @@ biome check --changed --error-on-warnings --write && tsc --noEmit && npm test
 - Exit 0 → achieved.
 - Non-zero → continue.
 - Goal-plugin (`@ricoyudog/pi-goal-hermes`) judge reads it.
+
+`quality:changed` = DEV-LOOP oracle. No automated caller. Absent from
+`.github/` workflows, `ship-it`, `ship-change`. Human or `code-quality` skill
+invokes it.
+
+## Dead-code oracle — Knip
+
+Whole-graph dead-code detection. Tool = Knip 6.32.2. Config `knip.json` +
+`knip-baseline.json` at repo root. Generator `scripts/knip-config.mjs`.
+Ratchet `scripts/knip-ratchet.mjs`.
+
+npm scripts:
+
+| Script | Command |
+|---|---|
+| `knip` | run Knip against generated config |
+| `knip:config` | regenerate config from manifests |
+| `knip:ratchet` | per-class baseline ratchet |
+
+### Scope split
+
+Per-change checks live in `quality:changed` (Biome, tsc, tests). Whole-graph
+checks do NOT. Reachability not decidable from changed-file scope. Dead code
+is a property of the whole graph. Split deliberate.
+
+### Baseline
+
+Measured 2026-08-13. Files 10, exports 227, types 189, duplicates 11,
+enumMembers 0. Total 437. Runtime ~8s whole-workspace.
+
+### Entry points derived, not declared
+
+`scripts/knip-config.mjs` derives entries from manifests:
+`pi-dashboard-plugin.{client,server,bridge}`, `pi.extensions`. Knip reads
+`bin`/`main`/`exports` natively. Deliberately not re-declared.
+
+### WHY rooting matters
+
+Unrooted graph does not under-report, it INVERTS. No config → 723 findings /
+90 unused files. False-positives: `packages/extension/src/canvas-tool.ts`, which
+`bridge.ts` imports directly. Rooted: 437 / 10, all ten exact-verified true
+positives.
+
+### Known blind spot — `scripts/**`
+
+`scripts/**` = entry glob. Scripts invoked by shell/CI, edge Knip cannot see
+(`node x.mjs` from `.sh` files, `docker cp` + node). Consequence: genuinely dead
+script undetectable. Accepted trade-off.
+
+### Gate — per-class ratchet, never a scalar total
+
+`scripts/knip-ratchet.mjs` enforces per-class baseline. Deleting one dead file
+must not pay for two new dead exports. Baseline = debt ceiling.
+`--check-baseline-diff <ref>` rejects raised class. Lowering always allowed.
+Missing baseline = hard error. Never implicit adoption of current counts.
+
+### Where it runs
+
+- `ship-it` step 4.4 enforcer = PREVENTION. Blocks before landing.
+- `.github/workflows/nightly.yml` knip job = DETECTION. Runs after merge.
+- Docker harness `docker/scripts/knip-harness-check.sh` = reproducibility.
+
+### Rule ownership
+
+Dependency classes `off` in `knip.json`: `unlisted`, `binaries`, `dependencies`,
+`devDependencies`, `optionalPeerDependencies`, `unresolved`. Owned by
+`noUndeclaredDependencies` in `biome.json` at repo-root scope. Currently 0
+findings. Its overrides deliberately exempt `**/__tests__/**`,
+`**/vitest.config.ts`, `tests/e2e/**`, `qa/scripts/**`,
+`.pi/skills/**/scripts/**`. One rule, one owning engine.
+
+### Harness caveat
+
+Harness image carries `knip.json`, `knip-baseline.json`, `playwright.config.ts`,
+`.github/`, `tests/`, `qa/`, `public/`, `.pi/skills`. NEVER `.pi/settings.json`
+(pins a host absolute path). Host + container agree on unused-FILES set. `types`
+count may differ by one (Node 24.15 vs 24.19), not tree. Exact cross-environment
+scalar equality not asserted.
+
+## Ship gate — `ship-it` step 4.4
+
+Separate from `quality:changed`. Runs in order. First non-zero exit stops ship,
+routes to step-4 fix loop.
+
+| # | Command | Owns |
+|---|---|---|
+| 1 | `node scripts/check-conventions.mjs --base origin/develop` | 4 repo conventions; touched-file scoped (committed diff ∪ working tree) |
+| 2 | `node scripts/dox-byte-gate.mjs` | `AGENTS.md` byte cap |
+| 3 | `node scripts/i18n-lint.mjs --strict` | hardcoded user-facing strings |
+| 4 | `node scripts/i18n-parity.mjs` | catalog key parity |
+
+Gotchas, each load-bearing:
+
+- `i18n-lint.mjs` exits 0 regardless of findings without `--strict`. Pass
+  `--strict` or it advises instead of gates.
+- `i18n-parity.mjs` compares `union(zhCN, hu)` against each catalog. Read two
+  paths deleted by a client reorg → crashed on every run. Repaired.
+- `dox-byte-gate.mjs` filters `kb dox lint --json` to `kind="over-threshold"` +
+  `arm="bytes"`. Raw `kb dox lint` exits 1 on any of 7 issue kinds; tree carries
+  57 non-gating issues. Direct wiring never lands green.
+- `check-conventions.mjs` enforces exactly 4 rules. Four is a deliberate ceiling.
+  Growth pressure → write a different script.
+
+## Semantic layer — `ship-it` step 4.5
+
+Model review on the `@review` role. Deliberately NOT in `quality:changed`.
+`quality:changed` stays deterministic + offline-runnable.
 
 ## Safe vs unsafe fixes
 
@@ -149,6 +374,10 @@ Biome lints whole files, not diff lines. Touch one line in 400-line legacy file 
 
 - Default policy: grandfather. Fix only diff, `// biome-ignore` unavoidable legacy lines, leave rest.
 - Boy-scout alternative (clean whole touched file) tension with surgical-changes rule.
+
+## Known quirk — quality:changed empty diff
+
+`npm run quality:changed` exits 1 when diff contains no Biome-lintable file (e.g. only `.md` + `biome.json`): "No files were processed in the specified paths." Not a violation. Run three legs directly to verify: `npx biome lint .`, `npx tsc --noEmit`, `npm test`.
 
 ## Skill
 

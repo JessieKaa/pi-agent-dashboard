@@ -101,6 +101,7 @@ describe("useMessageHandler — replay coalescing", () => {
         selectedSessionIdRef: useRef(undefined),
         pendingSpawnsRef: useRef(new Map()),
         loadingHistoryTimersRef: useRef(new Map()),
+        replayInFlightTimersRef: useRef(new Map()),
         replayPersister,
       };
       return useMessageHandler(setters, deps);
@@ -185,6 +186,22 @@ describe("useMessageHandler — replay coalescing", () => {
     expect(historyWindowsRef.current.get("s1")).toEqual(historyWindow);
   });
 
+  it("clears history-window metadata when an unwindowed full replay starts", () => {
+    const { dispatch } = setup();
+    historyWindowsRef.current.set("s1", {
+      requestedMessages: 200,
+      effectiveMessages: 207,
+      startSeq: 41,
+      endSeq: 900,
+      hasOlder: true,
+    });
+
+    dispatch(replay("s1", 1, [toolStart("full", 1)], true));
+    flushFrame();
+
+    expect(historyWindowsRef.current.get("s1")).toBeUndefined();
+  });
+
   it("publishes once per frame when replay spans multiple frames", () => {
     const { dispatch } = setup();
 
@@ -200,7 +217,7 @@ describe("useMessageHandler — replay coalescing", () => {
 
   it("applies reset and continuation batches in arrival order while preserving pendingPrompt", () => {
     const initial = createInitialState();
-    initial.pendingPrompt = { text: "keep me", imageCount: 1, status: "sending" };
+    initial.pendingPrompt = { text: "keep me", imageCount: 1, status: "sent" };
     initial.messages.push({ id: "stale", role: "user", content: "stale", timestamp: 1 });
     const { dispatch } = setup(new Map([["s1", initial]]));
 

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { DisplayPrefs, PartialDisplayPrefs } from "./display-prefs.js";
+import type { AutoNamerPersistedState, NotifyLogEntry } from "./types.js";
 
 /**
  * Session metadata stored as a sidecar `.meta.json` file
@@ -21,6 +22,15 @@ export interface SessionMeta {
    * again for that session. See change: add-auto-session-naming.
    */
   nameSource?: "auto" | "user";
+  /**
+   * The auto-namer's durable stop state. Persisted — a narrowly-scoped
+   * exception to "no new persisted field" — because a process restart would
+   * otherwise re-spend a full attempt budget and re-emit the error, so a
+   * "permanent" stop would not in fact be permanent. Same lifecycle as
+   * `nameSource`, already dashboard-owned.
+   * See change: fix-auto-naming-reasoning-model (design D7).
+   */
+  autoNamerState?: AutoNamerPersistedState;
   attachedProposal?: string | null;
   hidden?: boolean;
 
@@ -125,6 +135,14 @@ export interface SessionMeta {
    * See change: add-embed-session-lifecycle.
    */
   lifecyclePolicy?: "ephemeral" | "durable";
+
+  /**
+   * Retained notification history mirror of `DashboardSession.notifyLog`
+   * (bounded, oldest evicted). Persisted so notifications are not the one
+   * transcript row type that disappears on `/api/restart`.
+   * See change: split-notify-from-prompt-request.
+   */
+  notifyLog?: NotifyLogEntry[];
 
   /**
    * Automation-run identity mirror of `DashboardSession.automationRun`.

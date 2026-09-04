@@ -17,6 +17,14 @@
  * automations ~1 s after boot is operationally negligible.
  */
 const ENGINE_INIT_DELAY_MS = 1000;
+/**
+ * Debounce for the activity-driven "folder set may have changed" rescan +
+ * watcher reconcile. Longer than the old 2s tick: the reconcile is now
+ * incremental (near-zero cost in steady state), so the only real work here is
+ * the scope re-scan — a new folder's automations arming within this window is
+ * fine, and it keeps CPU churn off the hot event path.
+ */
+const RESCAN_DEBOUNCE_MS = 15_000;
 
 import os from "node:os";
 import path from "node:path";
@@ -28,7 +36,9 @@ import {
   collectActionRegistry,
   coreActionContributions,
 } from "./action-registry.js";
+import { FOLDER_SCOPE_CONTRIBUTION_PREFIX, collectFolderScopeBases } from "./folder-scope-contributions.js";
 import type { Engine } from "./engine.js";
+import { settingsDefaultBound } from "./resolve-children.js";
 import { mountAutomationRoutes, unknownActionKind } from "./routes.js";
 
 const PLUGIN_ID = "automation";
@@ -48,6 +58,20 @@ interface AutomationPluginConfig {
    * See change: finalize-automation-run-on-session-death.
    */
   maxRunAgeMs?: number;
+  /**
+   * Settings-default cap on concurrent child spawns per fire when an
+   * automation declares no `maxConcurrentSpawns`. Precedence: this value →
+   * `PI_AUTOMATION_MAX_CONCURRENT_SPAWNS` env → hard default 4.
+   * See change: add-automation-concurrent-spawn, automation-work-source-fanout.
+   */
+  maxConcurrentSpawns?: number;
+  /**
+   * Folder-backed reference work-sources for `schedule.batch` fan-out, keyed
+   * by the `on.source` id an automation names. Each drains files under `dir`.
+   * Reference-only; production sources register through the same registry.
+   * See change: automation-work-source-fanout.
+   */
+  workSources?: Array<{ id: string; dir: string; visibilityTimeoutMs?: number }>;
 }
 
 /** Shared holder so the synchronously-mounted run route can reach the engine
@@ -160,7 +184,7 @@ export async function registerPlugin(ctx: ServerPluginContext): Promise<void> {
 
 async function initEngine(ctx: ServerPluginContext): Promise<void> {
   const { createEngine } = await import("./engine.js");
-  const { createAutomationWatcher } = await import("./automation-watcher.js");
+  const { createAutomationWatcher, reconcileWatchers } = await import("./automation-watcher.js");
   const { logger } = ctx;
   const homeDir = os.homedir();
 
@@ -173,10 +197,73 @@ async function initEngine(ctx: ServerPluginContext): Promise<void> {
       scanFolder: cfg.scanFolderScope !== false,
       scanGlobal: cfg.scanGlobalScope !== false,
       maxRunAgeMs: cfg.maxRunAgeMs ?? 30 * 60 * 1000,
+      maxConcurrentSpawns: settingsDefaultBound(
+        cfg.maxConcurrentSpawns,
+        process.env.PI_AUTOMATION_MAX_CONCURRENT_SPAWNS,
+      ),
     };
   }
 
-  /** Distinct repo roots derived from known session cwds (per-folder scope). */
+  // Build the stable work-source registry from plugin config (reference
+  // folder-backed sources). A source carries lease state, so it is created
+  // ONCE here and reused for the engine's life. See change:
+  // automation-work-source-fanout.
+  const { WorkSourceRegistry } = await import("./work-source-registry.js");
+  const { createFolderWorkSource } = await import("./folder-work-source.js");
+  const workSources = new WorkSourceRegistry();
+  // Validate untrusted runtime config at the boundary: workSources must be an
+  // array; each entry needs a non-empty id + dir; a non-positive/non-finite
+  // visibility timeout would mint immediately-expired leases; a dir may back
+  // only ONE live source (leases are in-memory — see createFolderWorkSource).
+  const rawSources = ctx.getPluginConfig<AutomationPluginConfig>()?.workSources;
+  const seenDirs = new Set<string>();
+  for (const ws of Array.isArray(rawSources) ? rawSources : []) {
+    const label = typeof ws?.id === "string" && ws.id.trim() ? ws.id : "<unnamed>";
+    if (typeof ws?.id !== "string" || !ws.id.trim()) {
+      ctx.logger.warn(`automation work-source: entry ignored — missing/empty id`);
+      continue;
+    }
+    if (typeof ws?.dir !== "string" || !ws.dir.trim()) {
+      ctx.logger.warn(`automation work-source "${label}": ignored — missing/empty dir`);
+      continue;
+    }
+    if (ws.visibilityTimeoutMs !== undefined && (!Number.isFinite(ws.visibilityTimeoutMs) || ws.visibilityTimeoutMs <= 0)) {
+      ctx.logger.warn(`automation work-source "${label}": ignored — visibilityTimeoutMs must be a positive finite number`);
+      continue;
+    }
+    const resolvedDir = path.resolve(ws.dir);
+    if (seenDirs.has(resolvedDir)) {
+      ctx.logger.warn(`automation work-source "${label}": ignored — duplicate dir "${resolvedDir}" (one live source per dir)`);
+      continue;
+    }
+    seenDirs.add(resolvedDir);
+    // Construction touches the filesystem (ensureDirs/reclaim) — an unwritable
+    // dir must not abort engine init; isolate the failure to this one entry.
+    try {
+      workSources.register(
+        ws.id,
+        createFolderWorkSource({
+          dir: ws.dir,
+          ...(typeof ws.visibilityTimeoutMs === "number" ? { visibilityTimeoutMs: ws.visibilityTimeoutMs } : {}),
+        }),
+      );
+    } catch (e) {
+      ctx.logger.warn(
+        `automation work-source "${label}": failed to initialize dir "${resolvedDir}": ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  // Warned folder-scope contribution keys, deduped across reads. `folderScopeBases()`
+  // runs on every `listScopes()` call (refresh, watcher reconcile, stale-run reaper),
+  // so a malformed contribution must warn once per key, never once per read.
+  const folderScopeWarnedKeys = new Set<string>();
+
+  // Distinct repo roots the automation engine scans/arms/reaps/watches. Derived
+  // from live session cwds AND unioned with published `automation.folderscope.`
+  // contributions (collected each read → load-order independent). The boot arm is
+  // one-shot, anchored to `engine.start()` → `refresh()` + the initial
+  // `attachWatchers()`; contributions are process-lifetime (host has no `unprovide`).
   function folderScopeBases(): string[] {
     const bases = new Set<string>();
     try {
@@ -186,6 +273,13 @@ async function initEngine(ctx: ServerPluginContext): Promise<void> {
       }
     } catch {
       /* ignore */
+    }
+    for (const base of collectFolderScopeBases(ctx.consumeAll(FOLDER_SCOPE_CONTRIBUTION_PREFIX), {
+      warn: (m) => ctx.logger.warn(m),
+      homeDir,
+      warnedKeys: folderScopeWarnedKeys,
+    })) {
+      bases.add(base);
     }
     return [...bases];
   }
@@ -205,6 +299,7 @@ async function initEngine(ctx: ServerPluginContext): Promise<void> {
     abortSpawnedRun: (args) => ctx.abortSpawnedRun(args),
     resolveRegistry: () => collectActionRegistry(ctx.consumeAll(ACTION_CONTRIBUTION_PREFIX), { warn: (m) => ctx.logger.warn(m) }),
     listScopes,
+    workSources,
     config: pluginConfig,
     homeDir,
     log: (m) => logger.info(m),
@@ -217,8 +312,7 @@ async function initEngine(ctx: ServerPluginContext): Promise<void> {
     logger: (m) => logger.warn(m),
   });
   function attachWatchers(): void {
-    watcher.detachAll();
-    for (const s of listScopes()) watcher.attach(s.base);
+    reconcileWatchers(watcher, listScopes().map((s) => s.base));
   }
 
   engine.start();
@@ -306,8 +400,13 @@ async function initEngine(ctx: ServerPluginContext): Promise<void> {
         const buffered = (runText.get(sessionId) ?? []).join("\n\n").trim();
         runText.delete(sessionId);
         runCompletion.delete(sessionId);
+        // Name the finalize path taken. A systematic delivery outage otherwise
+        // looks like many independent max-age timeouts (it hid a 101-run,
+        // 0-success failure). See change: fix-automation-run-lifecycle.
+        logger.info(`[finalize] path=completion-event (${completion.eventType}) session=${sessionId}`);
         engine.onSessionEnded(sessionId, buffered || (completion.summarize?.(event?.data) ?? ""));
       } else if (event?.eventType === "agent_end") {
+        logger.info(`[finalize] path=agent_end session=${sessionId}`);
         const result = (runText.get(sessionId) ?? []).join("\n\n").trim();
         runText.delete(sessionId);
         runPrompt.delete(sessionId);
@@ -322,7 +421,7 @@ async function initEngine(ctx: ServerPluginContext): Promise<void> {
         rescanTimer = null;
         engine.refresh();
         attachWatchers();
-      }, 2000);
+      }, RESCAN_DEBOUNCE_MS);
       if (typeof rescanTimer.unref === "function") rescanTimer.unref();
     }
   });
@@ -336,6 +435,7 @@ async function initEngine(ctx: ServerPluginContext): Promise<void> {
   // (idempotent vs a late flow_complete/agent_end/Stop).
   // See change: finalize-automation-run-on-session-death.
   ctx.onSessionEnded((sessionId) => {
+    if (runText.has(sessionId)) logger.info(`[finalize] path=session-death session=${sessionId}`);
     const buffered = (runText.get(sessionId) ?? []).join("\n\n").trim();
     runText.delete(sessionId);
     runPrompt.delete(sessionId);
@@ -413,6 +513,7 @@ async function runNowViaEngine(
       : { repoRoot: base, scanFolder: true, scanGlobal: false },
     eng.registry.kinds(),
     eng.actionRegistry.ids(),
+    eng.workSources.ids(),
   ).find((a) => a.name === name && a.scope === scope && a.valid);
   if (!found) return { ok: false, error: `automation "${name}" not found or invalid in ${scope} scope` };
   const r = eng.startRunFor(found);

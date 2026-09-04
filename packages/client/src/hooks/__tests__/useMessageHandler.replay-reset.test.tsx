@@ -59,6 +59,7 @@ function setup() {
     setSpawnErrors: vi.fn(),
     setResumeErrors: vi.fn(),
     setLoadingHistory: vi.fn(),
+    setReplayInFlight: vi.fn(),
   };
 
   const deps: any = {
@@ -72,6 +73,7 @@ function setup() {
     maxSeqMapRef: { current: maxSeqMap },
     selectedSessionIdRef: { current: undefined },
     loadingHistoryTimersRef: { current: new Map() },
+    replayInFlightTimersRef: { current: new Map() },
   };
 
   const { result } = renderHook(() => useMessageHandler(setters, deps));

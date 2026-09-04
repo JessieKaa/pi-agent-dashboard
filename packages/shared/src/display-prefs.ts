@@ -7,6 +7,112 @@
  *
  * See change: configurable-chat-display.
  */
+import { normalizeNotifyLevel } from "./notify.js";
+import type { NotifyLevel } from "./protocol.js";
+import {
+  defaultCustomEventGroupPrefs,
+  SHIPPED_CUSTOM_EVENT_GROUPS,
+} from "./custom-event-groups.js";
+
+/**
+ * Minimum `ctx.ui.notify` level that renders as a chat row.
+ *
+ * The ladder is `info < success < warning < error`. `success` deliberately
+ * ranks ABOVE `info`: a success notify reports an outcome, whereas info is
+ * chatter — so `"success"` reads as "outcomes and problems, no chatter". That
+ * ordering is a product decision, NOT a property of the level; do not "fix" it
+ * into alphabetical or emission order.
+ *
+ * There is deliberately no `"off"` value. `"errors"` is the floor of the axis,
+ * so a failing extension can always say so.
+ *
+ * See change: gate-notify-rows-by-level.
+ */
+export type NotifyMinLevel = "all" | "success" | "warnings" | "errors";
+
+/** The four stops, in ladder order — for rendering the settings controls. */
+export const NOTIFY_MIN_LEVELS: readonly NotifyMinLevel[] = [
+  "all",
+  "success",
+  "warnings",
+  "errors",
+];
+
+// Two SEPARATE rank maps, keyed by two different vocabularies. The row's level
+// is singular (`warning`/`error`); the floor is plural (`warnings`/`errors`)
+// and adds `all`. Only `success` is spelled the same in both. A single shared
+// map keyed by a union of both would typo-pass. See design D2.
+const LEVEL_RANK: Record<NotifyLevel, number> = {
+  info: 0,
+  success: 1,
+  warning: 2,
+  error: 3,
+};
+const FLOOR_RANK: Record<NotifyMinLevel, number> = {
+  all: 0,
+  success: 1,
+  warnings: 2,
+  errors: 3,
+};
+
+/**
+ * The minimum shape both chat-view gate sites can supply.
+ *
+ * `shared` cannot import the client's `ChatMessage`, and the two sites do not
+ * hold the same object — `isRowVisible` reads `msg.args.method` while the
+ * render branch reads the built `request.method`. Each site adapts its local
+ * object to this descriptor so the two can never drift.
+ */
+export interface NotifyRowDescriptor {
+  /** `ChatMessage.content` — `"notify"` for a notify row. */
+  content: unknown;
+  /** `args.method` / `request.method` — `"notify"` for a notify row. */
+  method: unknown;
+  /** `params.level`; may legitimately be absent. */
+  level: unknown;
+}
+
+/**
+ * Unrecognized floor → `"all"`. Neither write path validates the value.
+ *
+ * OWN-property check, deliberately. The earlier `value in FLOOR_RANK` also
+ * matched every inherited `Object.prototype` name, so a floor of `"toString"`
+ * resolved its rank to a FUNCTION and made every `>=` comparison false —
+ * silently hiding even `error`, the one thing this axis promises never to hide.
+ * `Object.hasOwn` consults own properties only, so those names now fall through
+ * to the `"all"` fallback.
+ *
+ * Exported so the two SELECT controls render the EFFECTIVE floor. Persistence
+ * deliberately round-trips arbitrary strings (validation lives here, not in the
+ * store), so a controlled `<select>` could otherwise hold a value matching no
+ * `<option>` — which renders as no selection at all.
+ */
+export function normalizeNotifyMinLevel(value: unknown): NotifyMinLevel {
+  return typeof value === "string" && Object.hasOwn(FLOOR_RANK, value)
+    ? (value as NotifyMinLevel)
+    : "all";
+}
+
+/**
+ * Decide whether ONE row renders under ONE `notifyMinLevel`.
+ *
+ * Fail-open on BOTH inputs:
+ * - A row not positively identified as a notify renders. An ask misclassified
+ *   as a notify would deadlock the session with no visible cause; a notify
+ *   misclassified as an ask is a cosmetic miss. The discriminator therefore
+ *   requires BOTH markers `addNotify` stamps, never `role === "interactiveUi"`
+ *   and never the mere presence of a level.
+ * - An unrecognized floor is treated as `"all"`. Without that clause a garbage
+ *   persisted value would make every comparison `NaN` and hide even `error`,
+ *   breaking the one guarantee this axis makes.
+ *
+ * See change: gate-notify-rows-by-level.
+ */
+export function isNotifyRowVisible(row: NotifyRowDescriptor, minLevel: unknown): boolean {
+  const isNotify = row.content === "notify" && row.method === "notify";
+  if (!isNotify) return true;
+  return LEVEL_RANK[normalizeNotifyLevel(row.level)] >= FLOOR_RANK[normalizeNotifyMinLevel(minLevel)];
+}
 
 export interface ToolCallPrefs {
   read: boolean;
@@ -85,6 +191,38 @@ export interface DisplayPrefs {
    * See change: opt-in-out-of-cwd-session-diffs.
    */
   showOutOfCwdSessionDiffs: boolean;
+  /**
+   * Minimum `ctx.ui.notify` level that renders as a chat row. `"all"` (default)
+   * preserves today's behavior. `error` is never suppressed at any value.
+   * Blocking asks are unaffected at every value — the gate keys on the notify
+   * discriminator, never on the row's role.
+   * See change: gate-notify-rows-by-level.
+   */
+  notifyMinLevel: NotifyMinLevel;
+  /**
+   * When true, a reasoning block's body renders with NO vertical height cap
+   * and NO inner vertical scrollbar, flowing down the chat transcript like
+   * any other row. When false (default), the body is capped at 400px with an
+   * inner vertical scrollbar (today's behavior). HEIGHT ONLY — open/closed
+   * state stays owned by the collapse machinery (auto-collapse timer,
+   * turn-scoped hold, manual toggle).
+   * See change: render-inline-reasoning-and-custom-entries.
+   */
+  reasoningInlineFlow: boolean;
+  /**
+   * Per-group visibility for custom chat rows, keyed by custom event group id
+   * (see `custom-event-groups.ts`). Shallow-merged field-by-field exactly like
+   * `toolCalls`: a group id present in a per-session override wins for that
+   * group only; every absent id falls through to the global value, and a
+   * group id absent from BOTH resolves to the group's configured `default`
+   * (the server backfill seeds every configured group so the lookup is total).
+   * Replaces the removed single-switch `customEntryFallback`; the catch-all
+   * `other` group's toggle carries its behavior. `flow-event` keeps its
+   * dedicated rendering at every value. Render-time gate only: rows still
+   * exist in state, so toggling never replays anything.
+   * See change: add-custom-event-group-filters.
+   */
+  customEventGroups: Record<string, boolean>;
 }
 
 /**
@@ -94,7 +232,9 @@ export interface DisplayPrefs {
  * to be a full `ToolCallPrefs` whenever present.
  */
 export type PartialDisplayPrefs = {
-  [K in keyof DisplayPrefs]?: K extends "toolCalls" ? Partial<ToolCallPrefs> : DisplayPrefs[K];
+  [K in keyof DisplayPrefs]?: K extends "toolCalls" | "customEventGroups"
+    ? Partial<DisplayPrefs[K]>
+    : DisplayPrefs[K];
 };
 
 export const DISPLAY_PRESETS: Record<"simple" | "standard" | "everything", DisplayPrefs> = {
@@ -112,6 +252,9 @@ export const DISPLAY_PRESETS: Record<"simple" | "standard" | "everything", Displ
     changeSummaryTable: false,
     reserveProcessLineAtIdle: false,
     showOutOfCwdSessionDiffs: false,
+    notifyMinLevel: "all",
+    reasoningInlineFlow: false,
+    customEventGroups: defaultCustomEventGroupPrefs(),
   },
   standard: {
     tokenStatsBar: true,
@@ -127,6 +270,9 @@ export const DISPLAY_PRESETS: Record<"simple" | "standard" | "everything", Displ
     changeSummaryTable: true,
     reserveProcessLineAtIdle: false,
     showOutOfCwdSessionDiffs: false,
+    notifyMinLevel: "all",
+    reasoningInlineFlow: false,
+    customEventGroups: defaultCustomEventGroupPrefs(),
   },
   everything: {
     tokenStatsBar: true,
@@ -142,14 +288,38 @@ export const DISPLAY_PRESETS: Record<"simple" | "standard" | "everything", Displ
     changeSummaryTable: true,
     reserveProcessLineAtIdle: true,
     showOutOfCwdSessionDiffs: false,
+    notifyMinLevel: "all",
+    reasoningInlineFlow: false,
+    customEventGroups: defaultCustomEventGroupPrefs(),
   },
 };
+
+/**
+ * Shallow field-by-field merge of two group-id → boolean records — the
+ * `customEventGroups` arm shared by `mergeDisplayPrefs` (per-session merge)
+ * and the server's PATCH arm. An override key present wins for that group id
+ * only; undefined-valued keys are ignored (they mean "not specified").
+ * See change: add-custom-event-group-filters.
+ */
+export function mergeCustomEventGroupPrefs(
+  global: Record<string, boolean>,
+  override?: Partial<Record<string, boolean>>,
+): Record<string, boolean> {
+  const out: Record<string, boolean> = { ...global };
+  if (override) {
+    for (const [k, v] of Object.entries(override)) {
+      if (typeof v === "boolean") out[k] = v;
+    }
+  }
+  return out;
+}
 
 /**
  * Merge a sparse per-session override over global prefs.
  *
  * - Top-level boolean fields: override.value ?? global.value.
- * - `toolCalls`: shallow merge of override.toolCalls onto global.toolCalls.
+ * - `toolCalls` and `customEventGroups`: shallow merge of the override's
+ *   object onto the global's, field by field.
  * - `undefined` override returns `{ ...global }` (defensive copy).
  */
 export function mergeDisplayPrefs(
@@ -157,7 +327,7 @@ export function mergeDisplayPrefs(
   override?: PartialDisplayPrefs,
 ): DisplayPrefs {
   if (!override) {
-    return { ...global, toolCalls: { ...global.toolCalls } };
+    return { ...global, toolCalls: { ...global.toolCalls }, customEventGroups: { ...global.customEventGroups } };
   }
   return {
     tokenStatsBar: override.tokenStatsBar ?? global.tokenStatsBar,
@@ -178,7 +348,72 @@ export function mergeDisplayPrefs(
       override.reserveProcessLineAtIdle ?? global.reserveProcessLineAtIdle,
     showOutOfCwdSessionDiffs:
       override.showOutOfCwdSessionDiffs ?? global.showOutOfCwdSessionDiffs,
+    notifyMinLevel: override.notifyMinLevel ?? global.notifyMinLevel,
+    reasoningInlineFlow: override.reasoningInlineFlow ?? global.reasoningInlineFlow,
+    customEventGroups: mergeCustomEventGroupPrefs(global.customEventGroups, override.customEventGroups),
   };
+}
+
+/**
+ * One-shot migration (design D7): map a persisted `customEntryFallback` onto
+ * `customEventGroups`, then drop the legacy field. Idempotent — once the
+ * field is absent, no further action. Non-destructive: explicit
+ * `customEventGroups` keys are never overwritten.
+ *
+ * The old switch gated EVERY non-`flow-event` custom row. A legacy `false`
+ * therefore hides the WHOLE gated population, not just the catch-all: every
+ * shipped group seeds `false` (plus `other`), so the user's exact prior
+ * visible-set survives the upgrade — "custom entries that were hidden do not
+ * reappear" (spec requirement). A legacy `true` (the old default) forces no
+ * keys at all: absent keys resolve to configured defaults, and the one
+ * intended behavior change (memory/om.* ships hidden) is the CHANGELOG'd
+ * default flip, not a migration artifact.
+ *
+ * Typed loosely over the prefs shape so it runs over the global prefs, a
+ * per-session override, or a raw legacy file object alike.
+ * See change: add-custom-event-group-filters.
+ */
+export function migrateLegacyCustomEntryFallback<
+  T extends { customEntryFallback?: unknown; customEventGroups?: unknown },
+>(
+  prefs: T,
+  /**
+   * Configured group defaults (id → default visibility) from the groups file,
+   * when the caller has them (server paths do). A legacy `false` hides the
+   * WHOLE gated population — shipped groups AND user-configured groups — so
+   * every configured id absent from the prefs also seeds `false`.
+   */
+  configuredGroupDefaults?: Record<string, boolean>,
+): T {
+  if (!prefs || typeof prefs !== "object") return prefs;
+  const legacy = prefs.customEntryFallback;
+  if (typeof legacy !== "boolean") {
+    // Corrupt value: the field is unused either way, and the contract is
+    // "the field does not survive" — drop it rather than migrate it.
+    const next = { ...prefs } as T;
+    delete (next as { customEntryFallback?: unknown }).customEntryFallback;
+    return next;
+  }
+  const next = { ...prefs } as T & { customEventGroups?: Record<string, boolean> };
+  if (legacy === false) {
+    const groups = {
+      ...(typeof next.customEventGroups === "object" && next.customEventGroups !== null
+        ? next.customEventGroups
+        : {}),
+    };
+    if (groups.other === undefined) groups.other = false;
+    for (const g of SHIPPED_CUSTOM_EVENT_GROUPS) {
+      if (groups[g.id] === undefined) groups[g.id] = false;
+    }
+    if (configuredGroupDefaults) {
+      for (const id of Object.keys(configuredGroupDefaults)) {
+        if (groups[id] === undefined) groups[id] = false;
+      }
+    }
+    next.customEventGroups = groups;
+  }
+  delete (next as { customEntryFallback?: unknown }).customEntryFallback;
+  return next;
 }
 
 /**

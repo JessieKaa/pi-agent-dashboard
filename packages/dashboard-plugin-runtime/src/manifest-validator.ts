@@ -12,7 +12,6 @@ import {
   type SettingsTab,
   SLOT_DEFINITIONS,
   type SlotId,
-  VALID_SETTINGS_TABS,
 } from "@blackbelt-technology/pi-dashboard-shared/dashboard-plugin/slot-types.js";
 
 export class ManifestValidationError extends Error {
@@ -104,16 +103,34 @@ function validateClaim(claim: unknown, pluginId: string, index: number): PluginC
         );
       }
     }
-  }
-
-  // settings-section: validate optional tab field
-  if (slotId === "settings-section" && c.tab !== undefined) {
-    if (!VALID_SETTINGS_TABS.includes(c.tab as SettingsTab)) {
+    // presentation: optional "page" | "dialog". Unlike `depth`, an unknown
+    // value is FATAL rather than a warn-and-default: a typo like "modal" would
+    // otherwise silently fall back to the dialog default, and the author would
+    // see the behaviour they asked to opt OUT of. See change:
+    // add-route-backed-overlay-dialogs.
+    if (
+      c.presentation !== undefined &&
+      c.presentation !== "page" &&
+      c.presentation !== "dialog"
+    ) {
       throw new ManifestValidationError(
         pluginId,
-        `claims[${index}].tab "${c.tab}" is not a valid settings tab. Valid tabs: ${VALID_SETTINGS_TABS.join(", ")}`,
+        `claims[${index}] slot "shell-overlay-route" presentation must be "page" or "dialog" if provided`,
       );
     }
+  }
+
+  // settings-section: `tab` is accepted but inert. Every `settings-section`
+  // claim renders on its owning plugin's page (`/settings/plugins/<id>`), so
+  // rejecting an unknown VALUE would fail a manifest over a field nothing
+  // reads. The TYPE is still enforced: `tab` is copied onto the normalized
+  // claim, so a non-string would violate the manifest type it is cast to.
+  // See change: plugin-settings-pages (design D3).
+  if (slotId === "settings-section" && c.tab !== undefined && typeof c.tab !== "string") {
+    throw new ManifestValidationError(
+      pluginId,
+      `claims[${index}].tab must be a string if provided`,
+    );
   }
 
   // optional string fields
@@ -145,6 +162,9 @@ function validateClaim(claim: unknown, pluginId: string, index: number): PluginC
     ...(typeof c.sessionParam === "string" ? { sessionParam: c.sessionParam } : {}),
     ...(c.depth === 1 || c.depth === 2 ? { depth: c.depth } : {}),
     ...(typeof c.parentPath === "string" ? { parentPath: c.parentPath } : {}),
+    ...(c.presentation === "page" || c.presentation === "dialog"
+      ? { presentation: c.presentation }
+      : {}),
     ...(typeof c.tab === "string" ? { tab: c.tab as SettingsTab } : {}),
     ...(typeof c.predicate === "string" ? { predicate: c.predicate } : {}),
     ...(typeof c.shouldRender === "string" ? { shouldRender: c.shouldRender } : {}),
@@ -200,7 +220,7 @@ export function validateManifest(raw: unknown, fallbackId = "unknown"): PluginMa
     }
     const r = m.requires as Record<string, unknown>;
     const out: PluginRequirements = {};
-    for (const field of ["piExtensions", "binaries", "services"] as const) {
+    for (const field of ["piExtensions", "binaries", "services", "paths"] as const) {
       const arr = r[field];
       if (arr === undefined) continue;
       if (!Array.isArray(arr)) {

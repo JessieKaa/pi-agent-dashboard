@@ -120,6 +120,23 @@ describe("selectReplayWindow", () => {
     expect(selected.metadata.hasOlder).toBe(false);
   });
 
+  it("clamps non-finite request counts instead of replaying the full store", () => {
+    const events = [
+      messageStart(1, "user"),
+      messageStart(2, "assistant"),
+      messageEnd(3, 2),
+      messageStart(4, "user"),
+      messageStart(5, "assistant"),
+      messageEnd(6, 5),
+    ];
+
+    const selected = selectReplayWindow(events, Number.NaN);
+
+    expect(selected.events.map((event) => event.seq)).toEqual([4, 5, 6]);
+    expect(selected.metadata.requestedMessages).toBe(1);
+    expect(selected.metadata.hasOlder).toBe(true);
+  });
+
   it("returns terminal metadata for an empty session", () => {
     expect(selectReplayWindow([], 200)).toEqual({
       events: [],

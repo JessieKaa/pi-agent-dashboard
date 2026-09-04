@@ -1,0 +1,3 @@
+# node-version.ts — index
+
+Single source of truth for Node-version predicates. `isAffectedNode(version)` flags nodejs/node#58515 Fastify-affected ranges (v22.0–v22.18, v24.1–v24.2). `isOutOfEnginesRange(version)` true when `<22.19.0` OR `>=26`, mirrors package.json#engines.node. `isUsableNodeVersion(version)` = `!isOutOfEnginesRange && !isAffectedNode`, rejects unparseable strings. Accept: 22.19+, 24.0, 24.3+, 25.x. Reject: 21.x, 22.0–22.18, 24.1–24.2, 26+. Consumed by server `node-guard.ts` (re-export) + electron `dependency-detector.ts` (`isUsableNodeVersion`). See change: unify-node-version-gate.

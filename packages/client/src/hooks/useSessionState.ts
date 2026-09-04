@@ -28,7 +28,9 @@ import { useCallback, useRef, useState } from "react";
 import { foldLiveEvents } from "../lib/chat/coalesce-live-events.js";
 import {
   addInteractiveRequest,
+  addNotify,
   applyPromptReceived,
+  carryPendingPrompt,
   createInitialState,
   dismissInteractiveRequest,
   reduceEvent,
@@ -67,7 +69,7 @@ function applyReplay(
   const firstSeq = events.length > 0 ? events[0].seq : null;
   const shouldReset = firstSeq != null && (firstSeq === 1 || firstSeq <= acc.maxSeq);
   let current = shouldReset ? createInitialState() : acc.state;
-  const carry = shouldReset ? acc.state.pendingPrompt : undefined;
+  const carry = shouldReset ? carryPendingPrompt(acc.state.pendingPrompt) : undefined;
   if (carry) current = { ...current, pendingPrompt: carry };
   for (const { event } of events) {
     current = reduceEvent(current, event);
@@ -99,7 +101,8 @@ export function applySessionMessage(
 
     case "session_state_reset": {
       const fresh = createInitialState();
-      if (acc.state.pendingPrompt) fresh.pendingPrompt = acc.state.pendingPrompt;
+      const carried = carryPendingPrompt(acc.state.pendingPrompt);
+      if (carried) fresh.pendingPrompt = carried;
       return { state: fresh, maxSeq: 0 };
     }
 
@@ -111,6 +114,11 @@ export function applySessionMessage(
 
     case "prompt_request":
       return settle(acc, addPromptBusRequest(acc.state, msg));
+
+    // Render-only chat row — never an interactiveRequests entry.
+    // See change: split-notify-from-prompt-request.
+    case "notify":
+      return settle(acc, addNotify(acc.state, msg.notifyId, msg.message, msg.level));
 
     case "ui_dismiss":
       return settle(acc, dismissInteractiveRequest(acc.state, msg.requestId));

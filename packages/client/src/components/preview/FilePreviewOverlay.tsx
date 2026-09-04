@@ -1,21 +1,22 @@
+import { useEscapeDismiss } from "@blackbelt-technology/pi-dashboard-client-utils/escape-stack";
 import { mdiClose, mdiLoading } from "@mdi/js";
 import { Icon } from "@mdi/react";
 import React, { type ComponentType, useEffect, useRef, useState } from "react";
-import { useEscapeDismiss } from "@blackbelt-technology/pi-dashboard-client-utils/escape-stack";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { getApiBase } from "../../lib/api/api-context.js";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
 import { getSyntaxTheme } from "../../lib/theme/syntax-theme.js";
 import { DialogPortal } from "../primitives/DialogPortal.js";
-import { MarkdownContent } from "./MarkdownContent.js";
-import { dirname } from "./resolve-local-image-src.js";
+import { useThemeContext } from "../settings/ThemeProvider.js";
+import { detectLanguage } from "../tool-renderers/lang-detect.js";
 import { AsciiDocPreview } from "./AsciiDocPreview.js";
 import { DocxPreview } from "./DocxPreview.js";
 import { EmlPreview } from "./EmlPreview.js";
+import { MarkdownContent } from "./MarkdownContent.js";
 import { PptxPreview } from "./PptxPreview.js";
+import { dirname } from "./resolve-local-image-src.js";
 import { SpreadsheetPreview } from "./SpreadsheetPreview.js";
-import { useThemeContext } from "../settings/ThemeProvider.js";
-import { detectLanguage } from "../tool-renderers/lang-detect.js";
+import { logRejection } from "../../lib/report-error.js";
 
 /** DOM id of the scroll target line inside the highlighted code view. */
 const TARGET_LINE_ID = "file-preview-target-line";
@@ -110,7 +111,8 @@ export function FilePreviewOverlay({ cwd, path, line, onClose }: Props) {
   useEffect(() => {
     if (isImage || isRich) return; // image / rich renderers fetch their own bytes
     let cancelled = false;
-    (async () => {
+    // Discarded with a stated handler. See change: cleanup-client-plugin-promises.
+    void (async () => {
       try {
         const url = `${getApiBase()}/api/file?cwd=${encodeURIComponent(cwd)}&path=${encodeURIComponent(path)}`;
         const res = await fetch(url);
@@ -128,7 +130,7 @@ export function FilePreviewOverlay({ cwd, path, line, onClose }: Props) {
       } catch (err: any) {
         if (!cancelled) setError(err?.message ?? "Network error");
       }
-    })();
+    })().catch(logRejection("FilePreviewOverlay.loadFile"));
     return () => {
       cancelled = true;
     };
@@ -196,7 +198,7 @@ export function FilePreviewOverlay({ cwd, path, line, onClose }: Props) {
     <DialogPortal>
       {/* Outer wrapper spans the viewport but is click-through, so the composer
           cutout at the bottom stays interactive. z-index sits ABOVE the Dialog
-          layer (`z-[60]`) so a preview opened from a dialog renders in front of
+          layer (`z-dialog (50)`) so a preview opened from a dialog renders in front of
           it, not behind. See change: fix-stacked-escape-closes-layers. */}
       <div className="fixed inset-0 z-[70] pointer-events-none">
         {/* Dim + dismiss layer: covers the message area only, stopping above the

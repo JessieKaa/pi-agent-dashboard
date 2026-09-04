@@ -12,7 +12,12 @@
  * BRANCH-COMPARISON.md §10 on origin/windows-integration.
  *
  * See change: unify-node-version-gate.
+ * See change: unify-pi-runtime-identity (task 6.3 — managed hint is emitted
+ * only when a managed Node runtime actually exists under `<managedDir>/node/`).
  */
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { getManagedDir } from "@blackbelt-technology/pi-dashboard-shared/managed-paths.js";
 import {
   isAffectedNode,
   isOutOfEnginesRange,
@@ -20,22 +25,46 @@ import {
 
 export { isAffectedNode, isOutOfEnginesRange };
 
-export function buildEnginesRangeMessage(version: string): string {
-  return [
+export interface EnginesRangeMessageOpts {
+  /** Managed install dir to probe; default `getManagedDir()`. */
+  managedDir?: string;
+  /** Hard override for tests; wins over the on-disk probe. */
+  managedNodeExists?: boolean;
+}
+
+/** True when a managed Node runtime is installed under `<managedDir>/node/`. */
+function managedNodeInstalled(opts: EnginesRangeMessageOpts): boolean {
+  if (opts.managedNodeExists !== undefined) return opts.managedNodeExists;
+  try {
+    return existsSync(path.join(opts.managedDir ?? getManagedDir(), "node"));
+  } catch {
+    return false;
+  }
+}
+
+export function buildEnginesRangeMessage(
+  version: string,
+  opts: EnginesRangeMessageOpts = {},
+): string {
+  const lines = [
     ``,
     `❌  pi-dashboard cannot start on Node ${version}.`,
     ``,
-    `    Required: >=22.19.0 <26 (see package.json#engines.node).`,
+    `    Required: >=22.19.0 <27 (see package.json#engines.node).`,
     ``,
     `    Below the floor: npm refuses with EBADENGINE and pi 0.75+ assumes`,
-    `    22.19 APIs. At/above the cap: untested; raise the cap when ready.`,
+    `    22.19 APIs. At/above the cap (Node 27+): untested; raise the cap when ready.`,
     ``,
     `    Fix:`,
     `      nvm:    nvm install 24 && nvm use 24`,
-    `      bundled: PATH="$HOME/.pi-dashboard/node/bin:$PATH" pi-dashboard start`,
-    `      brew:   brew install node@24`,
-    ``,
-  ].join("\n");
+  ];
+  // Managed hint only when the managed runtime actually exists — without
+  // one the prepend is dead advice. Existence probe only; never a write.
+  if (managedNodeInstalled(opts)) {
+    lines.push(`      bundled: PATH="$HOME/.pi-dashboard/node/bin:$PATH" pi-dashboard start`);
+  }
+  lines.push(`      brew:   brew install node@24`, ``, );
+  return lines.join("\n");
 }
 
 export function buildNodeUpgradeMessage(version: string): string {

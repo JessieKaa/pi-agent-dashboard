@@ -1,8 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { readConfigRedacted, writeConfigPartial } from "../config-api.js";
 import fs from "node:fs";
-import path from "node:path";
 import os from "node:os";
+import path from "node:path";
+import { loadConfig } from "@blackbelt-technology/pi-dashboard-shared/config.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  computeBindReachability,
+  formatBindReachabilityWarning,
+  initBindReachability,
+  resetBindReachability,
+  safeComputeBindReachability,
+  sameReachability,
+} from "../auth/bind-reachability-service.js";
+import { deleteAuthProvider, readConfigRedacted, writeConfigPartial } from "../config-api.js";
 
 describe("config-api", () => {
   let testDir: string;
@@ -184,5 +193,321 @@ describe("config-api", () => {
       expect(written.reattachPlacement).toBe("preserve");
       expect(written.port).toBe(8000); // existing fields preserved
     });
+  });
+  // ── Provider deletion (D9) ───────────────────────────────────────────────
+  // `writeConfigPartial`'s providers merge is spread-only and cannot express a
+  // removal, and `readConfigRedacted()` would persist "***" over every
+  // surviving secret. Deletion therefore gets its own raw read/write helper.
+  // See change: config-override-oauth-redirect-base.
+  describe("deleteAuthProvider", () => {
+    const twoProviders = {
+      port: 8000,
+      auth: {
+        secret: "real-secret",
+        providers: {
+          github: { clientId: "gh", clientSecret: "gh-real-secret" },
+          google: { clientId: "goo", clientSecret: "goo-real-secret" },
+        },
+      },
+    };
+
+    // #G8
+    it("removes exactly the named provider", () => {
+      fs.writeFileSync(configFile, JSON.stringify(twoProviders));
+      const result = deleteAuthProvider("github");
+      expect(result).toMatchObject({ success: true, deleted: true, remaining: 1 });
+      const written = JSON.parse(fs.readFileSync(configFile, "utf-8"));
+      expect(Object.keys(written.auth.providers)).toEqual(["google"]);
+    });
+
+    // #G9 — the whole reason this is not built on readConfigRedacted().
+    it("leaves the surviving provider's REAL clientSecret on disk", () => {
+      fs.writeFileSync(configFile, JSON.stringify(twoProviders));
+      deleteAuthProvider("github");
+      const written = JSON.parse(fs.readFileSync(configFile, "utf-8"));
+      expect(written.auth.providers.google.clientSecret).toBe("goo-real-secret");
+      expect(written.auth.secret).toBe("real-secret");
+    });
+
+    // #G10 — idempotent: absent provider is a success with no side effect.
+    it("is a no-op success for an absent provider", () => {
+      fs.writeFileSync(configFile, JSON.stringify(twoProviders));
+      const before = fs.readFileSync(configFile, "utf-8");
+      const result = deleteAuthProvider("keycloak");
+      expect(result).toMatchObject({ success: true, deleted: false, remaining: 2 });
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(before);
+    });
+
+    // #G11 — deleting the last provider is a LOCKOUT (auth stays enforced with
+    // no login path), not a disable. Refused without an explicit force.
+    it("refuses to delete the last provider without force", () => {
+      fs.writeFileSync(configFile, JSON.stringify({
+        auth: { providers: { github: { clientId: "gh", clientSecret: "s" } } },
+      }));
+      const result = deleteAuthProvider("github");
+      expect(result.success).toBe(false);
+      expect(result.reason).toBe("last-provider");
+      const written = JSON.parse(fs.readFileSync(configFile, "utf-8"));
+      expect(Object.keys(written.auth.providers)).toEqual(["github"]);
+    });
+
+    it("deletes the last provider when forced", () => {
+      fs.writeFileSync(configFile, JSON.stringify({
+        auth: { providers: { github: { clientId: "gh", clientSecret: "s" } } },
+      }));
+      const result = deleteAuthProvider("github", { force: true });
+      expect(result).toMatchObject({ success: true, deleted: true, remaining: 0 });
+      const written = JSON.parse(fs.readFileSync(configFile, "utf-8"));
+      expect(written.auth.providers).toEqual({});
+    });
+
+    it("preserves unrelated top-level config", () => {
+      fs.writeFileSync(configFile, JSON.stringify({ ...twoProviders, defaultModel: "gpt-4" }));
+      deleteAuthProvider("github");
+      const written = JSON.parse(fs.readFileSync(configFile, "utf-8"));
+      expect(written.defaultModel).toBe("gpt-4");
+      expect(written.port).toBe(8000);
+    });
+
+    it("is a success no-op when no auth block exists at all", () => {
+      fs.writeFileSync(configFile, JSON.stringify({ port: 8000 }));
+      expect(deleteAuthProvider("github")).toMatchObject({ success: true, deleted: false, remaining: 0 });
+    });
+  });
+
+  // ── Gateway action persistence (D12) ─────────────────────────────────────
+  // The action is ONE `PUT /api/config` carrying every key plus the provenance
+  // record, so a half-configured gateway is not representable. These pin the
+  // write side of that contract. Rows: G14, G15, S8.
+  // See change: config-override-oauth-redirect-base.
+  describe("gateway action writes", () => {
+    const GATEWAY = "https://pi.example.com";
+    const addPatch = {
+      publicBaseUrls: [GATEWAY],
+      cors: { allowedOrigins: [GATEWAY] },
+      auth: { redirectBaseUrl: GATEWAY },
+      trustedNetworks: ["10.4.0.9/32"],
+      gateways: [
+        {
+          url: GATEWAY,
+          authModes: ["oauth", "trusted-network"],
+          wrote: {
+            publicBaseUrls: [GATEWAY],
+            corsAllowedOrigins: [GATEWAY],
+            authRedirectBaseUrl: GATEWAY,
+            trustedNetworks: ["10.4.0.9/32"],
+          },
+        },
+      ],
+    };
+
+    // #G14
+    it("persists every recorded key in a single write", () => {
+      fs.writeFileSync(configFile, JSON.stringify({ port: 8000 }));
+      expect(writeConfigPartial({ ...addPatch }).success).toBe(true);
+      const written = JSON.parse(fs.readFileSync(configFile, "utf-8"));
+      expect(written.publicBaseUrls).toEqual([GATEWAY]);
+      expect(written.cors.allowedOrigins).toEqual([GATEWAY]);
+      expect(written.auth.redirectBaseUrl).toBe(GATEWAY);
+      expect(written.trustedNetworks).toEqual(["10.4.0.9/32"]);
+      expect(written.gateways).toHaveLength(1);
+      expect(written.gateways[0].wrote.authRedirectBaseUrl).toBe(GATEWAY);
+    });
+
+    // #G15 — the legacy nested key is left in place; the seeded top-level list
+    // is what every surface reads from now on.
+    it("keeps the legacy pairing entries reachable through the seeded list", () => {
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({ pairing: { publicBaseUrls: ["https://old.example"] } }),
+      );
+      writeConfigPartial({ publicBaseUrls: ["https://old.example", GATEWAY] });
+      const written = JSON.parse(fs.readFileSync(configFile, "utf-8"));
+      expect(written.publicBaseUrls).toEqual(["https://old.example", GATEWAY]);
+      expect(written.pairing.publicBaseUrls).toEqual(["https://old.example"]);
+    });
+
+    // #S8 — a failed write leaves NO provenance record. The record rides the
+    // same object as the values, so there is no ordering in which one lands
+    // without the other.
+    it("records no gateway when the write throws", () => {
+      fs.writeFileSync(configFile, JSON.stringify({ port: 8000 }));
+      const before = fs.readFileSync(configFile, "utf-8");
+      const spy = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+        throw new Error("disk full");
+      });
+      const result = writeConfigPartial({ ...addPatch });
+      spy.mockRestore();
+      expect(result.success).toBe(false);
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(before);
+      expect(JSON.parse(fs.readFileSync(configFile, "utf-8")).gateways).toBeUndefined();
+    });
+  });
+});
+
+// ── reachability: computed, never persisted, never unguarded ───────────
+// See change: warn-unreachable-trusted-networks.
+describe("reachability surface", () => {
+  let testDir: string;
+  let configFile: string;
+  let origHome: string;
+
+  beforeEach(() => {
+    testDir = path.join(os.tmpdir(), `test-reachability-${Date.now()}`);
+    fs.mkdirSync(path.join(testDir, ".pi", "dashboard"), { recursive: true });
+    configFile = path.join(testDir, ".pi", "dashboard", "config.json");
+    origHome = process.env.HOME!;
+    process.env.HOME = testDir;
+    resetBindReachability();
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    resetBindReachability();
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
+  });
+
+  it("#E30 strips an echoed `reachability` object from the written config", () => {
+    fs.writeFileSync(configFile, JSON.stringify({ port: 8000, bindHost: "127.0.0.1" }));
+    const result = writeConfigPartial({
+      bindHost: "0.0.0.0",
+      reachability: {
+        resolvedBindHost: "127.0.0.1",
+        pendingBindHost: "127.0.0.1",
+        unreachable: ["192.168.1.0/24"],
+      },
+    });
+    expect(result.success).toBe(true);
+    const written = JSON.parse(fs.readFileSync(configFile, "utf-8"));
+    expect(written.bindHost).toBe("0.0.0.0");
+    expect("reachability" in written).toBe(false);
+  });
+
+  it("#X1 degrades `reachability` to null instead of throwing", () => {
+    fs.writeFileSync(configFile, JSON.stringify({ port: 8123, bindHost: "127.0.0.1" }));
+    // `safeComputeBindReachability` is the PRODUCTION isolation the route calls;
+    // deleting its try/catch fails this test. (An earlier version of this test
+    // wrapped the call in its own try/catch and therefore proved nothing.)
+    expect(safeComputeBindReachability(() => { throw new Error("boom"); })).toBeNull();
+
+    // …and the rest of the config is unaffected by that degradation.
+    const payload = { ...readConfigRedacted(), reachability: null };
+    expect(payload.port).toBe(8123);
+    expect(payload.reachability).toBeNull();
+  });
+
+  it("#X2 computes the topology facts only for the guarded surface", () => {
+    fs.writeFileSync(configFile, JSON.stringify({
+      port: 8000,
+      bindHost: "127.0.0.1",
+      auth: { bypassHosts: ["192.168.1.0/24"] },
+    }));
+    initBindReachability({ resolvedBindHost: "127.0.0.1", hostFlag: null });
+    const r = computeBindReachability(loadConfig);
+    expect(r.unreachable).toEqual(["192.168.1.0/24"]);
+    expect(r.resolvedBindHost).toBe("127.0.0.1");
+    // The unguarded `/api/health` counterpart is pinned in health-endpoint.test.ts.
+  });
+});
+
+// ── The startup warning names the link that actually decides ───────────
+// See change: warn-unreachable-trusted-networks.
+describe("formatBindReachabilityWarning", () => {
+  const base = { resolvedBindHost: "127.0.0.1", pendingBindHost: "127.0.0.1", unreachable: ["192.168.1.0/24"] };
+
+  it("is silent when every trusted entry is reachable", () => {
+    expect(formatBindReachabilityWarning({ ...base, unreachable: [], bindHostSource: "config" })).toBeNull();
+  });
+
+  it("suggests config.bindHost when the config is the deciding link", () => {
+    const line = formatBindReachabilityWarning({ ...base, bindHostSource: "config" });
+    expect(line).toContain("[bind-reachability]");
+    expect(line).toContain("127.0.0.1");
+    expect(line).toContain("192.168.1.0/24");
+    expect(line).toContain("bindHost");
+  });
+
+  it("suggests the FLAG when --host shadows the config", () => {
+    const line = formatBindReachabilityWarning({ ...base, bindHostSource: "flag" });
+    expect(line).toContain("--host 0.0.0.0");
+    // Must not tell the user to edit a setting the flag overrides.
+    expect(line).not.toContain("Settings → Server");
+  });
+
+  it("suggests the ENV VAR when PI_DASHBOARD_HOST shadows the config", () => {
+    const line = formatBindReachabilityWarning({ ...base, bindHostSource: "env" });
+    expect(line).toContain("PI_DASHBOARD_HOST=0.0.0.0");
+    expect(line).not.toContain("Settings → Server");
+  });
+});
+
+// ── Regression: the broadcast gate must watch the WHOLE published fact ─
+// Gating the `reachability_updated` push on `pendingBindHost` alone meant a
+// write that edited only the trusted entries sent nothing, leaving every other
+// connected browser on a stale advisory until it reloaded — contradicting the
+// protocol docstring and the server-bind-host spec's no-polling requirement.
+// Found by CodeRabbit on PR #483. See change: warn-unreachable-trusted-networks.
+describe("sameReachability (broadcast gate)", () => {
+  const base = {
+    resolvedBindHost: "127.0.0.1",
+    pendingBindHost: "127.0.0.1",
+    unreachable: ["192.168.1.0/24"],
+    bindHostSource: "config" as const,
+  };
+
+  it("is true for an identical fact — no needless broadcast", () => {
+    expect(sameReachability(base, { ...base, unreachable: [...base.unreachable] })).toBe(true);
+  });
+
+  it("is FALSE when only the unreachable set changed (the bind host standing still)", () => {
+    expect(sameReachability(base, { ...base, unreachable: ["192.168.1.0/24", "10.0.0.0/8"] })).toBe(false);
+    expect(sameReachability(base, { ...base, unreachable: [] })).toBe(false);
+    expect(sameReachability(base, { ...base, unreachable: ["10.0.0.0/8"] })).toBe(false);
+  });
+
+  it("is false when the bind host, the resolved host, or the deciding link changed", () => {
+    expect(sameReachability(base, { ...base, pendingBindHost: "0.0.0.0" })).toBe(false);
+    expect(sameReachability(base, { ...base, resolvedBindHost: "0.0.0.0" })).toBe(false);
+    expect(sameReachability(base, { ...base, bindHostSource: "env" })).toBe(false);
+  });
+});
+
+describe("writeConfigPartial — openspec readiness keys (add-openspec-init-affordances)", () => {
+  let testDir: string;
+  let configFile: string;
+  let origHome: string;
+
+  beforeEach(() => {
+    testDir = path.join(os.tmpdir(), `test-config-api-osx-${Date.now()}`);
+    fs.mkdirSync(path.join(testDir, ".pi", "dashboard"), { recursive: true });
+    configFile = path.join(testDir, ".pi", "dashboard", "config.json");
+    origHome = process.env.HOME!;
+    process.env.HOME = testDir;
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
+  });
+
+  it("E23: a targeted optOutDirectories write preserves every other config key", () => {
+    fs.writeFileSync(configFile, JSON.stringify({
+      port: 8000,
+      autoShutdown: false,
+      openspec: { pollIntervalSeconds: 45, maxConcurrentSpawns: 4, changeDetection: "always" },
+    }));
+    const result = writeConfigPartial({ openspec: { optOutDirectories: ["/only/this"], offerInitialization: false } });
+    expect(result.success).toBe(true);
+    const cfg = loadConfig();
+    // Unrelated top-level keys preserved.
+    expect(cfg.port).toBe(8000);
+    expect(cfg.autoShutdown).toBe(false);
+    // Sibling openspec poll keys preserved (deep merge, not replace).
+    expect(cfg.openspec.pollIntervalSeconds).toBe(45);
+    expect(cfg.openspec.maxConcurrentSpawns).toBe(4);
+    expect(cfg.openspec.changeDetection).toBe("always");
+    // The written keys landed.
+    expect(cfg.openspec.optOutDirectories).toEqual(["/only/this"]);
+    expect(cfg.openspec.offerInitialization).toBe(false);
   });
 });

@@ -74,10 +74,20 @@ describe("E4 — pnpm-lock.yaml is the single committed lockfile", () => {
 // `npm install` (npm ships in Node). These MUST NOT be rewritten to pnpm.
 // `"pnpm".includes("npm")` is true, so npm-presence uses a word boundary.
 describe("X3 — runtime pi-core installs stay npm (never pnpm)", () => {
+  // `recovery-server.ts` is deliberately NOT in this list. It DOES reference
+  // pnpm, but only behind an explicit workspace probe: `detectPackageManager`
+  // returns "pnpm" solely when `pnpm-workspace.yaml` / `pnpm-lock.yaml` sits at
+  // the resolved repo root, and `suggestedReinstallCommand` consults it ONLY
+  // for the `monorepo` layout. The end-user layouts never reach it: `npm-global`
+  // and the default fallback return an npm command, and `electron` returns an
+  // installer message with no package manager at all. So the Column C premise —
+  // "runs on an end-user machine, where pnpm is not present" — does not hold for
+  // that reference. Blanket-guarding it would force `npm install` onto a pnpm
+  // hoisted workspace, which is exactly the tree-corrupting bug
+  // `recovery-server-respect-package-manager` fixed.
   const columnC = [
     "packages/server/src/pi/pi-core-updater.ts",
     "packages/server/src/pi/pi-core-checker.ts",
-    "packages/server/src/lifecycle/recovery-server.ts",
     "packages/electron/src/lib/update-checker.ts",
   ];
   for (const file of columnC) {
@@ -124,16 +134,27 @@ describe("X5 — root/workspace workflows install with pnpm", () => {
   });
 });
 
-// ── X6: deploy-site is dual-install — site/ stays npm, root uses pnpm ──────
-describe("X6 — deploy-site.yml dual-install regression", () => {
+// ── X6: deploy-site install shape ──────────────────────────────
+// Updated for c52745af0/e305c361b (static landing page): site/ has NO
+// dependencies — no npm ci, no cache-dependency-path, no astro build
+// (`npm run build` is a copy + reference check). The old dual-install contract
+// (site/ stays npm) described the Astro site and is retired. Root stays pnpm.
+describe("X6 — deploy-site.yml install shape", () => {
   const y = readWf("deploy-site.yml");
-  it("site/ job keeps its own npm lockfile + npm ci (unmigrated)", () => {
-    expect(y).toContain("cache-dependency-path: site/package-lock.json");
-    expect(y, "site/ install must stay `npm ci`").toMatch(/\bnpm ci\b/);
-  });
+  // Positives AND negatives are asserted against comment-free content: a stale
+  // comment must never satisfy (or mask) a required workflow step.
+  const code = y.split("\n").filter((l) => !l.trim().startsWith("#")).join("\n");
   it("root shell install uses pnpm", () => {
-    expect(y).toContain("pnpm/action-setup");
-    expect(y).toMatch(/pnpm install --frozen-lockfile/);
+    expect(code).toContain("pnpm/action-setup");
+    expect(code).toMatch(/pnpm install --frozen-lockfile/);
+  });
+  it("site/ job runs no npm install machinery (dependency-free static page)", () => {
+    expect(code, "no npm ci may return").not.toMatch(/\bnpm ci\b/);
+    expect(code, "no site lockfile cache may return").not.toContain("cache-dependency-path");
+  });
+  it("site/ stays dependency-free — no npm ci sneaks back in", () => {
+    expect(y, "site/ has no dependencies; npm ci must not return as a step").not.toMatch(/run:\s*npm ci/);
+    expect(y, "no site lockfile cache path without a site lockfile").not.toContain("cache-dependency-path");
   });
 });
 

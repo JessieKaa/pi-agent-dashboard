@@ -2,10 +2,10 @@
  * Directory and preference handlers: pin, unpin, reorder, openspec, pi-gateway forwards.
  */
 import type { BrowserToServerMessage } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
-import type { BrowserHandlerContext } from "./handler-context.js";
-import { safeRealpathSync } from "../resolve-path.js";
 import { archiveCompleted as openspecArchiveCompleted } from "@blackbelt-technology/pi-dashboard-shared/platform/openspec.js";
 import { normalizePath } from "@blackbelt-technology/pi-dashboard-shared/platform/paths.js";
+import { safeRealpathSync } from "../resolve-path.js";
+import type { BrowserHandlerContext } from "./handler-context.js";
 
 /**
  * Canonicalize a user-supplied path before storage: normalize separator /
@@ -22,10 +22,28 @@ export function handlePinDirectory(
   msg: Extract<BrowserToServerMessage, { type: "pin_directory" }>,
   ctx: BrowserHandlerContext,
 ): void {
-  const { preferencesStore, directoryService, sessionManager, broadcast } = ctx;
+  const { preferencesStore } = ctx;
   if (!preferencesStore) return;
   const resolved = canonicalizePath(msg.path);
   preferencesStore.pinDirectory(resolved);
+  pinDirectorySideEffects(resolved, ctx);
+}
+
+/**
+ * Everything `handlePinDirectory` does AFTER `preferencesStore.pinDirectory`:
+ * the `pinned_dirs_updated` broadcast plus historical on-disk session
+ * discovery. Shared with the eject branch of `handleMoveFolderToWorkspace`
+ * so an ejected folder gets the same treatment a hand-pinned one does.
+ * Callers must NOT broadcast `pinned_dirs_updated` themselves.
+ * `resolved` must already be canonical.
+ * See change: drag-folders-across-workspaces.
+ */
+export function pinDirectorySideEffects(
+  resolved: string,
+  ctx: BrowserHandlerContext,
+): void {
+  const { preferencesStore, directoryService, sessionManager, broadcast } = ctx;
+  if (!preferencesStore) return;
   broadcast({ type: "pinned_dirs_updated", paths: preferencesStore.getPinnedDirectories() });
   if (directoryService) {
     directoryService.onDirectoryAdded(resolved).then(({ sessions, openspecData }) => {
@@ -41,7 +59,11 @@ export function handlePinDirectory(
             firstMessage: hist.firstMessage,
             startedAt: hist.startedAt,
           });
-          sessionManager.unregister(hist.id);
+          // Historical sessions: registered only to seed the map, then ended
+          // immediately. The server never witnessed these endings, so they take
+          // the evidence-derived time rather than the moment the directory was
+          // added. See change: fix-ended-session-missing-endedat.
+          sessionManager.unregister(hist.id, { witnessed: false });
           sessionManager.update(hist.id, { hidden: true });
           const s = sessionManager.get(hist.id);
           if (s) broadcast({ type: "session_added", session: s });
@@ -155,6 +177,34 @@ export function handleReorderWorkspaceFolders(
   if (ctx.preferencesStore?.reorderWorkspaceFolders(msg.id, msg.paths)) broadcastWorkspaces(ctx);
 }
 
+/**
+ * Move a folder into a workspace (`toWorkspaceId`), or eject it from every
+ * workspace and pin it (`toWorkspaceId: null`).
+ *
+ * All effects gate on the store's return, so a rejected/stale request never
+ * pins a directory the user never pinned. On eject, `pinned_dirs_updated`
+ * goes out BEFORE `workspaces_updated` — the reverse order makes the folder
+ * belong to neither list for one render frame. See design D1/D2.
+ * See change: drag-folders-across-workspaces.
+ */
+export function handleMoveFolderToWorkspace(
+  msg: Extract<BrowserToServerMessage, { type: "move_folder_to_workspace" }>,
+  ctx: BrowserHandlerContext,
+): void {
+  const { preferencesStore } = ctx;
+  if (!preferencesStore) return;
+  // The type annotation is not a runtime guard: NaN would survive the clamp
+  // and `splice(NaN, 0, x)` coerces to a front insert.
+  if (msg.index !== undefined && !Number.isInteger(msg.index)) return;
+  const canon = canonicalizePath(msg.path);
+  if (!preferencesStore.moveFolderToWorkspace(canon, msg.toWorkspaceId, msg.index)) return;
+  if (msg.toWorkspaceId === null) {
+    preferencesStore.pinDirectory(canon);
+    pinDirectorySideEffects(canon, ctx);
+  }
+  broadcastWorkspaces(ctx);
+}
+
 export function handleReorderWorkspaces(
   msg: Extract<BrowserToServerMessage, { type: "reorder_workspaces" }>,
   ctx: BrowserHandlerContext,
@@ -177,9 +227,18 @@ export function handleOpenSpecRefresh(
   ctx: BrowserHandlerContext,
 ): void {
   if (ctx.directoryService) {
-    ctx.directoryService.refreshOpenSpec(msg.cwd).then((data) => {
-      ctx.broadcast({ type: "openspec_update", cwd: msg.cwd, data });
-    });
+    ctx.directoryService
+      .refreshOpenSpec(msg.cwd)
+      .then((data) => {
+        ctx.broadcast({ type: "openspec_update", cwd: msg.cwd, data });
+      })
+      // Fire-and-forget from a sync dispatch handler: a rejected refresh must
+      // not float. The gateway stays responsive; the client simply gets no
+      // openspec_update for this cwd.
+      // See change: cleanup-async-semantics-server-extension (design D1).
+      .catch((err: unknown) => {
+        console.warn(`[openspec] refresh failed for ${msg.cwd}:`, err);
+      });
   }
 }
 
@@ -202,6 +261,13 @@ export function handleOpenSpecBulkArchive(
       .then(() => ctx.directoryService!.pollDirectoryGated(msg.cwd))
       .then((data) => {
         if (data) ctx.broadcast({ type: "openspec_update", cwd: msg.cwd, data });
+      })
+      // The archive above already happened; a failed post-archive poll only
+      // costs the client its refresh, so log and stay responsive rather than
+      // floating the rejection.
+      // See change: cleanup-async-semantics-server-extension (design D1).
+      .catch((err: unknown) => {
+        console.warn(`[openspec] post-archive poll failed for ${msg.cwd}:`, err);
       });
   }
 }

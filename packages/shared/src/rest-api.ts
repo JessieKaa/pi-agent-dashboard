@@ -27,6 +27,48 @@ export type ListSessionsResponse = ApiResponse<DashboardSession[]>;
 
 export type FetchEventContentResponse = ApiResponse<DashboardEvent>;
 
+// pi retry policy (pi-retry-settings capability). pi's OWN native retry knobs,
+// read from / written to the GLOBAL `~/.pi/agent/settings.json` `retry` block.
+// The dashboard keeps no parallel policy and runs no retry loop; this is a thin
+// editor over pi's settings. GLOBAL only -- pi has no persisted per-session
+// retry policy (`setAutoRetryEnabled` delegates to the global setter), so there
+// is no project-scoped or per-session variant.
+// See change: retry-forever-with-stop-control.
+
+/** pi's `retry.provider.*` sub-block (provider/SDK-level request controls). */
+export interface PiRetryProviderPolicy {
+  /** Provider/SDK request timeout (ms). Absent = SDK default. */
+  timeoutMs?: number;
+  /** Provider/SDK retry attempts. pi default 0. */
+  maxRetries: number;
+  /** Max server-requested delay (ms) before failing. pi default 60000; 0 disables the limit. */
+  maxRetryDelayMs: number;
+}
+
+export interface PiRetryPolicy {
+  /** pi retries transient provider failures. */
+  enabled: boolean;
+  /** Max agent-level retry attempts. No clamp -- pi accepts any non-negative int. */
+  maxRetries: number;
+  /** Base backoff (ms); pi's delay is `baseDelayMs * 2^(attempt-1)`, uncapped. */
+  baseDelayMs: number;
+  /** Provider/SDK-level controls. A wait taken here emits NO event (invisible). */
+  provider: PiRetryProviderPolicy;
+}
+
+export type GetPiRetryPolicyResponse = ApiResponse<PiRetryPolicy>;
+
+/** PUT body -- all fields required (the client always sends the full policy). */
+export type PutPiRetryPolicyRequest = PiRetryPolicy;
+
+export interface PutPiRetryPolicyResult {
+  policy: PiRetryPolicy;
+  /** How many connected sessions were reloaded to apply the new policy. */
+  reloadedSessions: number;
+}
+
+export type PutPiRetryPolicyResponse = ApiResponse<PutPiRetryPolicyResult>;
+
 // ── Session Spawn ───────────────────────────────────────────────────
 
 export interface SpawnSessionRequest {
@@ -270,12 +312,73 @@ export interface TunnelWatchdogPublicStatus {
   recycleCount: number;
 }
 
+/**
+ * A tunnel that is active, but NOT at the reserved name the operator asked for.
+ *
+ * Deliberately a field on `active` rather than a fourth `degraded` status: the
+ * tunnel genuinely works, and `TunnelStatus` is the shared shape every provider
+ * and every existing consumer reads. It is a RECONCILIATION — derived by
+ * comparing the stored `tunnel.zrok.reservedName` against the name actually
+ * present in the live URL — which is what keeps a watchdog recycle from
+ * emitting a fresh notification every cycle: the same mismatch yields the same
+ * signal. See change: add-zrok-custom-reserved-name (D2).
+ */
+export interface TunnelDegraded {
+  /** The name configured but not served. */
+  configuredName: string;
+  /** The name the live URL actually carries, when one can be parsed from it. */
+  effectiveName?: string;
+}
+
 export type TunnelStatus =
-  | { status: "active"; url: string; serverOs: string; watchdog?: TunnelWatchdogPublicStatus }
+  | {
+      status: "active";
+      url: string;
+      serverOs: string;
+      watchdog?: TunnelWatchdogPublicStatus;
+      degraded?: TunnelDegraded;
+    }
   | { status: "inactive"; serverOs: string }
   | { status: "unavailable"; serverOs: string };
 
 export type TunnelStatusResponse = ApiResponse<TunnelStatus>;
+
+// ── Reserved-name configuration ──────────────────────────────────
+
+/**
+ * Why a zrok reserved-name request did or did not take effect.
+ *
+ * The point of the type is that `taken`, `invalid` and `write-failed` are
+ * DIFFERENT things a user can act on differently, where the previous bare
+ * `null` made all three arrive as a green tunnel at an unrequested URL.
+ */
+export type ReservedNameStatus = "ok" | "taken" | "invalid" | "write-failed";
+
+export interface ReservedNameResult {
+  status: ReservedNameStatus;
+  /** The name that was attempted (echoed so a stale client cannot mis-attribute a reason). */
+  name: string;
+  /** Human-readable reason. Present for every non-`ok` status. */
+  message?: string;
+  /**
+   * Set when a tunnel was already live and IS STILL SERVING its previous URL:
+   * the stored name now differs from what is served until a reconnect. Never
+   * omitted when that divergence exists — a silent divergence is the exact
+   * defect this endpoint removes.
+   */
+  liveUrlUnchanged?: string;
+  /**
+   * Set when the live tunnel was STOPPED to complete the request.
+   *
+   * Replacing a name must tear the share down before `delete name` (a release
+   * may never run against a running share), so after a replace-while-connected
+   * the tunnel is down — not "still serving the old URL". Reporting the latter
+   * would be factually false at the moment of the response.
+   */
+  tunnelStopped?: boolean;
+}
+
+export type ReservedNameResponse = ApiResponse<ReservedNameResult>;
 
 // ── Pi Resources ────────────────────────────────────────────────────
 
@@ -296,7 +399,27 @@ export interface PiResource {
   tools?: string;
   /** Theme-only: palette swatch colors (bg / surface / accent / text) for the card strip. */
   colors?: string[];
+  /**
+   * Raw `metadata.source` of a package-origin resolver entry whose source matched
+   * no known package row. Rendered as the card's package label rather than dropped.
+   * See change: fix-skill-discovery-parity.
+   */
+  packageSource?: string;
+  /**
+   * Skill-only provenance from the live join against a session's retained
+   * `commands_list`. Absent when the payload is scan-only or degraded.
+   * See change: fix-skill-discovery-parity.
+   */
+  status?: PiSkillStatus;
+  /** Skill-only: the path the session reported, for `loaded-elsewhere` entries. */
+  sessionPath?: string;
 }
+
+/**
+ * Provenance of a skill relative to the session that reported its loaded set.
+ * See change: fix-skill-discovery-parity.
+ */
+export type PiSkillStatus = "active" | "not-loaded" | "loaded-elsewhere";
 
 export interface PiResourceScope {
   extensions: PiResource[];
@@ -304,6 +427,8 @@ export interface PiResourceScope {
   prompts: PiResource[];
   /** Subagents from `agents/*.md`. See change: resources-card-tabs. */
   agents: PiResource[];
+  /** Themes from pi's resolver (`ResolvedPaths.themes`). See change: fix-skill-discovery-parity. */
+  themes: PiResource[];
 }
 
 export interface PiPackageInfo {
@@ -319,6 +444,26 @@ export interface PiResourcesResult {
   local: PiResourceScope;
   global: PiResourceScope;
   packages: PiPackageInfo[];
+  /**
+   * True when skills/prompts/themes came from the filesystem fallback because
+   * pi's resolver was unavailable or returned a contradicted empty result.
+   * See change: fix-skill-discovery-parity.
+   */
+  degraded?: boolean;
+  /**
+   * True when no single session has reported a `commands_list` for this folder
+   * (none, or more than one). No skill carries a `status` in that case.
+   */
+  scanOnly?: boolean;
+  /**
+   * The single reporting session behind the join, when there is exactly one.
+   * `differsFromFolder` is true when its working directory is not the scanned
+   * folder (a worktree or subdirectory), which is what makes a `not-loaded`
+   * status attributable to scope rather than to rejection.
+   */
+  contributingSession?: { sessionId: string; cwd: string; differsFromFolder: boolean };
+  /** True when the retained skill commands carried no joinable `path` at all. */
+  pathlessCommands?: boolean;
 }
 
 export type PiResourcesResponse = ApiResponse<PiResourcesResult>;
@@ -626,6 +771,20 @@ export interface NetworkInterface {
   address: string;
   netmask: string;
   cidr: string;
+  /**
+   * Human-meaningful name (`tailnet`), falling back to the device name.
+   * `utun4` says nothing to the person deciding whom to trust.
+   * See change: warn-unreachable-trusted-networks.
+   */
+  label?: string;
+  /** True for a `/32` NIC (Tailscale, WireGuard, `ppp`) — its own address only. */
+  pointToPoint?: boolean;
+  /**
+   * Trust offers this interface can honestly make. Empty for a `/32` in no
+   * recognised range — inventing one would be a guess, and a wrong trust entry
+   * is worse than none.
+   */
+  suggestions?: import("./bind-reachability.js").TrustSuggestion[];
 }
 
 // ── Recommended extensions ───────────────────────────
@@ -863,3 +1022,109 @@ export interface SetOpenSpecChangeOrderRequest {
   order: string[];
 }
 export type SetOpenSpecChangeOrderResponse = ApiResponse<void>;
+
+// ── Pi runtime selection ──────────────────────────────────────────────────
+// GET /api/pi/installs · POST /api/pi/runtime.
+// See change: select-pi-runtime-install.
+
+/** One discoverable pi install, with per-consumer usage. */
+export interface PiInstallEntry {
+  key: string;
+  label: string;
+  /** Package directory, or null when this location holds no pi. */
+  pkgDir: string | null;
+  /** File the `pi` (spawn) override would be set to. */
+  spawnEntry: string | null;
+  /** File the `pi-coding-agent` (import) override would be set to. */
+  moduleEntry: string | null;
+  version: string | null;
+  /** False ONLY when a KNOWN version is below the floor. */
+  meetsFloor: boolean;
+  /** True when the version is unreadable, so no floor check was possible. */
+  floorUnknown: boolean;
+  /** The synthesised "currently resolved" row — displayed, never selectable. */
+  readOnly: boolean;
+  usedBy: { spawn: boolean; module: boolean };
+}
+
+/** What one pi consumer currently resolves to. */
+export interface PiConsumerState {
+  path: string | null;
+  pkgDir: string | null;
+  version: string | null;
+  candidateKey: string | null;
+  pinned: boolean;
+}
+
+export interface PiInstallsResponse {
+  installs: PiInstallEntry[];
+  spawn: PiConsumerState;
+  module: PiConsumerState;
+  /** Both consumers resolve to the same install (realpath'd package dir). */
+  inSync: boolean;
+  /** CONSUMER divergence — distinct from `installSetDiverged`. */
+  consumerDiverged: boolean;
+  /** Message naming BOTH versions; null when not diverged. */
+  divergenceMessage: string | null;
+  /** INSTALL-SET divergence — >1 distinct version across enumerated installs. */
+  installSetDiverged: boolean;
+  installSetVersions: string[];
+  /** Compatibility floor used for `meetsFloor`. */
+  floor: string;
+}
+
+/** `null` for a consumer selects Automatic (clears its override). */
+export interface SetPiRuntimeRequest {
+  spawn?: string | null;
+  module?: string | null;
+}
+
+// ── Node runtime family selection ─────────────────────────────────────────
+// See change: add-node-runtime-family-selection.
+
+/** One member of the node/npm/npx family in a coherence report. */
+export interface NodeMemberCoherence {
+  ok: boolean;
+  path: string | null;
+  candidateKey: string | null;
+  handSet: boolean;
+}
+
+/** Coherence half of the node-installs payload. */
+export interface NodeCoherence {
+  /** All RESOLVABLE members share one installation root. */
+  coherent: boolean;
+  members: Record<string, NodeMemberCoherence>;
+  /** Non-null when members resolve into >1 root; names each deviator + root. */
+  mismatch: { deviatingMembers: Array<{ member: string; root: string }> } | null;
+  /** Hand-set members pointing away from the family (pre-write report). */
+  handSetDeviations: Array<{ member: string; currentPath: string }>;
+  /** Migration-adopted candidate (display only — persists nothing). */
+  selectedCandidateKey: string | null;
+}
+
+export interface NodeInstallsResponse {
+  candidates: Array<{
+    key: string;
+    label: string;
+    root: string | null;
+    nodeEntry: string | null;
+    npmEntry: string | null;
+    npxEntry: string | null;
+    version: string | null;
+    /**
+     * Hand-set deviations THIS candidate's write would produce (server
+     * pre-computes planSelection per candidate) — the pre-write confirm
+     * report. See change: add-node-runtime-family-selection.
+     */
+    pendingHandSet: Array<{ member: string; currentPath: string }>;
+  }>;
+  coherence: NodeCoherence;
+}
+
+/** Select by candidate `root` (unique per installation). */
+export interface SelectNodeRuntimeRequest {
+  root: string;
+  /** Hand-set members the user chose to overwrite anyway. */
+  discardHandSet?: string[];
+}

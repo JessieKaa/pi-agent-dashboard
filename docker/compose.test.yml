@@ -17,14 +17,38 @@
 
 services:
   pi-dashboard:
+    # Loopback-only publish for the TEST overlay (production `compose.yml`
+    # deliberately publishes on the wildcard so a LAN device can reach the
+    # dashboard). The PI_E2E_SEED path seeds a fake credential and, by default,
+    # a trust-any-peer `trustedNetworks` — sound ONLY because the harness is
+    # unreachable off-host. Without this the seeded instance would be exposed to
+    # the local network. See change: compact-warm-replay-stream (harness fix).
+    ports: !override
+      - "127.0.0.1:${DASHBOARD_PORT:-18000}:${DASHBOARD_PORT:-18000}"
+      - "127.0.0.1:${PI_GATEWAY_PORT:-18999}:${PI_GATEWAY_PORT:-18999}"
     # Per-worktree image tag so two worktrees never share/clobber a baked image
     # (the dashboard server+client run from BAKED source, not the overlay). The
     # managed e2e path passes --build; teardown removes the tag. Falls back to
     # :local for the manual base flow. See change fix-parallel-e2e-docker-collisions.
     image: "pi-dashboard:${TEST_IMAGE_TAG:-local}"
 
-    # No restart — a QA instance should die when stopped, not respawn.
-    restart: "no"
+    # `unless-stopped`, NOT "no". The intent is unchanged — an explicitly stopped
+    # QA instance stays down (that is exactly what `unless-stopped` guarantees,
+    # and `test-down.sh` runs `compose down`, which removes it regardless).
+    #
+    # What "no" additionally did was kill the harness on `POST /api/restart`: the
+    # dashboard daemon IS this container's main process, so the restart exits PID
+    # 1 and nothing brings it back. That made a supported runtime operation
+    # untestable — `oauth-redirect-base.spec.ts` MUST restart, because a server
+    # that booted with zero resolvable OAuth providers registers no `/auth/*`
+    # route at all (design D6). The base `compose.yml` already ships
+    # `unless-stopped`, so this now matches the real deployment.
+    #
+    # Trade-off accepted: a genuinely crash-looping container respawns instead of
+    # staying dead. The health gate in `test-up.sh` still fails the run when the
+    # dashboard never answers.
+    # See change: config-override-oauth-redirect-base.
+    restart: unless-stopped
 
     # Build the path-parity overlay before launching the base entrypoint.
     # Bind-mounted (below) so no image rebuild is needed.
@@ -60,10 +84,46 @@ services:
       # scenario specs clear the onboarding gate and reach guarded endpoints.
       # Default empty → manual test-up.sh QA stays UI-only.
       PI_E2E_SEED: "${PI_E2E_SEED:-}"
+      # PI_E2E_INDEPENDENT_SESSION=1 launches a pi the dashboard did NOT spawn
+      # (so `shutdownHeadlessProcesses()` cannot SIGTERM it) which therefore
+      # survives `/api/restart` and re-registers over the bridge. Required by
+      # the reconnect scenario in tests/e2e/faux-ask.spec.ts (#F6); default OFF
+      # so ordinary runs get no extra session card.
+      # See change: restore-ask-user-tool-state-on-reconnect.
+      PI_E2E_INDEPENDENT_SESSION: "${PI_E2E_INDEPENDENT_SESSION:-}"
+      # Optional comma-separated override for the PI_E2E_SEED trustedNetworks
+      # seed. Empty => trust any peer (the container, not an IP range, is the
+      # trust boundary; a VPN'd host can present a PUBLIC peer address, which
+      # made the old RFC1918-only seed fail nondeterministically).
+      PI_E2E_TRUSTED_NETWORKS: "${PI_E2E_TRUSTED_NETWORKS:-}"
       # Flow-plugin e2e peer selector (change: add-flow-plugin-e2e-tests):
       # both | no-am | legacy | bad-registration. Empty => test-entrypoint skips
       # all flow-peer wiring (non-flow specs unaffected). Requires PI_E2E_SEED=1.
       PI_TEST_PEERS: "${PI_TEST_PEERS:-}"
+      # PI_E2E_OAUTH=1 seeds a resolvable `github` OAuth provider plus
+      # `bypassUrls:["/"]` BEFORE the server boots, so `/auth/*` routes exist
+      # for oauth-redirect-base.spec.ts. A spec cannot arrange this itself:
+      # pi-state is a RAM-backed tmpfs, so every container start discards config
+      # written through the API. Requires PI_E2E_SEED=1. Unset = harness
+      # unchanged. See change: config-override-oauth-redirect-base.
+      PI_E2E_OAUTH: "${PI_E2E_OAUTH:-}"
+      PI_E2E_OAUTH_BASE: "${PI_E2E_OAUTH_BASE:-}"
+      # Throttle-cadence arm (change: reduce-bridge-tick-bandwidth). When "1",
+      # test-entrypoint stages the SYNTHETIC Agent-tick producer
+      # (qa/fixtures/faux-agent-ticks.ext.ts) and SKIPS the real subagents
+      # producer, so the synthetic `Agent` tool owns the tool name and drives a
+      # deterministic ≥ 10 s tick stream for the L3 cadence rows. The two never
+      # coexist (first-registration-wins). Requires PI_E2E_SEED=1. Unset =
+      # harness unchanged (real subagents).
+      PI_SYNTH_AGENT_TICKS: "${PI_SYNTH_AGENT_TICKS:-}"
+      # Bridge subagent-timeline strip (change: reduce-subagent-details-payload,
+      # D2). `0` forwards every frame UNSTRIPPED — the push arm of the
+      # pull-vs-push A/B, and the anti-vacuity arm proving the strip is what
+      # makes the pushes thin. Read per call by the bridge, but a container env
+      # var is fixed for the life of the harness, so each arm is a SEPARATE
+      # test-up. Unset = strip ON (production default).
+      # See change: verify-subagent-pull-under-load.
+      PI_DASHBOARD_SUBAGENT_STRIP: "${PI_DASHBOARD_SUBAGENT_STRIP:-}"
 
     volumes:
       # Path-parity: host CWD as the read-only overlay lower layer. The

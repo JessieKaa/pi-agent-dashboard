@@ -1,7 +1,8 @@
 import { mdiHeadLightbulb } from "@mdi/js";
 import { Icon } from "@mdi/react";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useId, useRef, useState } from "react";
 import { usePopoverFlip } from "../../hooks/usePopoverFlip.js";
+import { useI18n } from "../../lib/i18n/i18n.js";
 import { usePopoverBoundary } from "../../lib/state/PopoverBoundaryContext.js";
 
 // Canonical render order. `max` is opt-in: it only renders when the model's
@@ -23,16 +24,18 @@ interface Props {
 }
 
 export function ThinkingLevelSelector({ current, onSelect, supportedLevels }: Props) {
+  const { t } = useI18n();
   const levelsToRender = supportedLevels?.length
     ? THINKING_LEVELS.filter((l) => supportedLevels.includes(l))
     : FALLBACK_LEVELS;
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const dropdownId = useId();
   // In the composer/chat pane (NOT immune): measure against that offset
   // `overflow` pane, left-preserving. See change: fix-popover-container-clip.
   const boundaryRef = usePopoverBoundary();
-  const { flipUp, maxHeight, anchorRight } = usePopoverFlip(triggerRef, {
+  const { flipUp, maxHeight, minHeight, anchorRight } = usePopoverFlip(triggerRef, {
     open,
     estimatedWidth: 128, // w-32 natural width
     preferredAnchor: "left",
@@ -55,8 +58,12 @@ export function ThinkingLevelSelector({ current, onSelect, supportedLevels }: Pr
       <button
         ref={triggerRef}
         onClick={() => setOpen(!open)}
-        className="flex items-center gap-1 px-2 py-0.5 rounded text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] transition-colors"
+        className="flex items-center gap-1 text-xs px-2 py-0.5 rounded text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] transition-colors"
         data-testid="thinking-level-button"
+        aria-label={t("thinking.level", undefined, "Thinking level")}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={open ? dropdownId : undefined}
       >
         <span className="font-mono truncate flex items-center gap-1"><Icon path={mdiHeadLightbulb} size={0.5} /> {current ?? "off"}</span>
       </button>
@@ -66,17 +73,22 @@ export function ThinkingLevelSelector({ current, onSelect, supportedLevels }: Pr
             anchorRight ? "right-0" : "left-0"
           } ${flipUp ? "bottom-full mb-1" : "top-full mt-1"}`}
           data-testid="thinking-level-dropdown"
+          id={dropdownId}
+          role="listbox"
         >
-          <div className="overflow-y-auto" style={{ maxHeight }}>
+          <div className="overflow-y-auto" style={{ maxHeight, minHeight }}>
             {levelsToRender.map((level) => (
               <button
                 key={level}
+                type="button"
+                role="option"
+                aria-selected={level === current}
                 onClick={() => {
                   onSelect(level);
                   setOpen(false);
                 }}
                 className={`w-full text-left px-3 py-1.5 md:py-1.5 min-h-[44px] md:min-h-0 text-xs font-mono hover:bg-[var(--bg-tertiary)] transition-colors ${
-                  level === current ? "text-[var(--accent)] font-bold" : "text-[var(--text-secondary)]"
+                  level === current ? "text-[var(--accent-text)] font-bold" : "text-[var(--text-secondary)]"
                 }`}
               >
                 {level}

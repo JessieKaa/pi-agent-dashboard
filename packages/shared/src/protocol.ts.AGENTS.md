@@ -1,0 +1,3 @@
+# protocol.ts — index
+
+Extension↔Server WebSocket protocol. `ExtensionToServerMessage` + `ServerToExtensionMessage` unions. → see `protocol.ts.AGENTS.md` New `ProviderRefreshError { provider, message }`; `ModelsListMessage.refreshErrors?` — present only when a provider refresh failed, omitted (never `[]`) on success, never set by a bare abort. See change: upgrade-model-selector-primitives. `ProcessMetrics` gains the subagent-tick throttle counters (`tickForwarded`/`tickCoalesced`/`tickDiscardedAtTerminal`/`tickDroppedNotReady`), riding the existing `session_heartbeat` transport to `/api/health` (per-session + summed). See change: reduce-bridge-tick-bandwidth.

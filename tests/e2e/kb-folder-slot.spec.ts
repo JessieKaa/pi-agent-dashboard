@@ -1,5 +1,5 @@
-import { expect, type Page, test } from "@playwright/test";
-import { gotoDashboard } from "./helpers/index.js";
+import { expect, type Page, test } from "./fixtures.js";
+import { gotoDashboard, pinDirectory } from "./helpers/index.js";
 
 // KB folder slot — browser E2E against the disposable Docker harness.
 // Covers tasks 6.1/6.2 (session-less worktree index through the UI), 3.x (row +
@@ -20,10 +20,23 @@ const KB_FIXTURE = "/fixtures/kb-sample";
 const KB_PARENT = "/fixtures/kb-parent";
 const KB_WORKTREE = "/fixtures/kb-parent/worktrees/kb-wt";
 
+/**
+ * Trigger the folder's KB index/reindex from the folder actions menu.
+ *
+ * The KB pill lost its own `index-now` / `retry` / `reindex` controls: they are
+ * ONE `MAINTENANCE` item now. See change: move-slot-actions-to-menu.
+ */
+async function reindexFromMenu(page: Page, cwd: string): Promise<void> {
+  await page.getByTestId(`folder-actions-menu-${cwd}`).first().click();
+  const item = page.getByTestId("folder-menu-item-kb-reindex");
+  await expect(item).toBeVisible({ timeout: 15_000 });
+  await item.click();
+}
+
 /** The folder-kb-section under the nearest folder-card of a cwd's header anchor. */
 function kbRowFor(page: Page, cwd: string) {
   return page.locator(
-    `xpath=//*[@data-testid="folder-urgency-sort-${cwd}"]/ancestor::div[.//*[@data-testid="folder-kb-section"]][1]//*[@data-testid="folder-kb-section"]`,
+    `xpath=//*[@data-testid="folder-actions-menu-${cwd}"]/ancestor::div[.//*[@data-testid="folder-kb-section"]][1]//*[@data-testid="folder-kb-section"]`,
   );
 }
 
@@ -44,27 +57,13 @@ async function prepareShell(page: Page): Promise<void> {
 }
 
 /**
- * Robust pin: opens the pin dialog via whichever add-folder affordance the
- * current mode exposes (onboarding CTA or sidebar button). The PathPicker
- * re-lists /home/pi on mount and can overwrite an immediate fill (a race the
- * shared helper hits): settle the initial listing, fill, then ASSERT the value
- * stuck (auto-retry) before Select.
+ * Pin via the shared helper. This spec used to carry its own copy to settle the
+ * PathPicker's mount-time re-list before filling; that hardening now lives in
+ * `pinDirectory` itself, so every spec gets it and there is one flow to keep
+ * correct rather than two that can drift.
  */
 async function pinFixture(page: Page, absPath: string): Promise<void> {
-  const onboardingCta = page.getByTestId("onboarding-step-2-cta");
-  if (await onboardingCta.isVisible().catch(() => false)) await onboardingCta.click();
-  else await page.getByTestId("dashboard-add-folder-btn").first().click();
-  const dialog = page.getByTestId("pin-directory-dialog");
-  await dialog.waitFor({ state: "visible" });
-  const textbox = dialog.getByRole("textbox");
-  // Let the initial listing render so it can't clobber the fill below.
-  await dialog.getByRole("option").first().waitFor({ state: "visible" });
-  await textbox.fill(absPath);
-  await expect(textbox).toHaveValue(absPath);
-  const leaf = (absPath.split("/").filter(Boolean).pop() ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  await dialog.getByRole("option", { name: new RegExp(leaf) }).waitFor({ state: "visible" });
-  await dialog.getByRole("button", { name: /^select$/i }).click();
-  await dialog.waitFor({ state: "hidden" });
+  await pinDirectory(page, absPath);
 }
 
 test.describe("KB folder slot", () => {
@@ -73,10 +72,10 @@ test.describe("KB folder slot", () => {
 
     // Idempotent: pin the fixture only if it is not already in the sidebar.
     // Anchor scoping uses the unconditional per-folder header testid
-    // `folder-urgency-sort-<cwd>` (the folder group div carries no testid, and
+    // `folder-actions-menu-<cwd>` (the folder group div carries no testid, and
     // the sidebar hosts the seeded sample-git folder too — a bare
     // folder-kb-section would be ambiguous). No app testids added for E2E.
-    const cwdAnchor = `folder-urgency-sort-${KB_FIXTURE}`;
+    const cwdAnchor = `folder-actions-menu-${KB_FIXTURE}`;
     if ((await page.getByTestId(cwdAnchor).count()) === 0) await pinFixture(page, KB_FIXTURE);
 
     // The KB row for THIS folder = the folder-kb-section under the nearest
@@ -96,7 +95,7 @@ test.describe("KB folder slot", () => {
     // /api/kb/reindex runs in the dashboard-server process (no pi session) →
     // chunks>0 → the row flips to populated live.
     if ((await kbRow.getAttribute("data-state")) === "not-indexed") {
-      await kbRow.getByTestId("folder-kb-index-now").click();
+      await reindexFromMenu(page, KB_FIXTURE);
     }
     await expect(kbRow).toHaveAttribute("data-state", "populated", { timeout: 30_000 });
     await expect(kbRow.getByTestId("folder-kb-count")).toContainText(/chunks/i);
@@ -109,6 +108,9 @@ test.describe("KB folder slot", () => {
     // The fixture's single source is listed; the dbPath field is editable.
     await expect(page.getByTestId("kb-source-row")).toHaveCount(1);
     await expect(page.getByTestId("kb-dbpath")).toHaveValue(/index\.db$/);
+    // fix-kb-settings-reindex-gate: with resolved sources and a clean form,
+    // the standalone rebuild is enabled (no config edit needed).
+    await expect(page.getByTestId("kb-reindex-now")).toBeEnabled();
   });
 
   test("worktree bootstrap: Copy from parent repo seeds config + indexes", async ({ page }) => {
@@ -116,8 +118,8 @@ test.describe("KB folder slot", () => {
 
     // Pin the parent (must be a KNOWN folder for Copy-from-parent's GET
     // /api/kb/config?cwd=parent to pass the cwd guard) AND the worktree.
-    if ((await page.getByTestId(`folder-urgency-sort-${KB_PARENT}`).count()) === 0) await pinFixture(page, KB_PARENT);
-    if ((await page.getByTestId(`folder-urgency-sort-${KB_WORKTREE}`).count()) === 0) await pinFixture(page, KB_WORKTREE);
+    if ((await page.getByTestId(`folder-actions-menu-${KB_PARENT}`).count()) === 0) await pinFixture(page, KB_PARENT);
+    if ((await page.getByTestId(`folder-actions-menu-${KB_WORKTREE}`).count()) === 0) await pinFixture(page, KB_WORKTREE);
 
     // The worktree ships no config → not-indexed (empty resolved sources).
     const wtRow = kbRowFor(page, KB_WORKTREE);
@@ -155,5 +157,78 @@ test.describe("KB folder slot", () => {
     const wtRowReloaded = kbRowFor(page, KB_WORKTREE);
     await expect(wtRowReloaded).toHaveAttribute("data-state", "populated", { timeout: 30_000 });
     await expect(wtRowReloaded.getByTestId("folder-kb-count")).toContainText(/chunks/i);
+
+    // fix-kb-settings-reindex-gate — F7 (the reported complaint): the worktree
+    // card's ONLY KB path is the `→` pill; on the page it opens, `Reindex now`
+    // must be ENABLED (resolved sources non-empty, clean form) and the trigger
+    // POST must be ACCEPTED — a reachable rebuild without editing the config.
+    await wtRowReloaded.getByTestId("folder-kb-open-settings").click();
+    await expect(page.getByTestId("kb-settings-page")).toBeVisible({ timeout: 15_000 });
+    const reindexNow = page.getByTestId("kb-reindex-now");
+    await expect(reindexNow).toBeEnabled({ timeout: 15_000 });
+    const postAccepted = page.waitForResponse(
+      (r) => r.url().includes("/api/kb/reindex") && r.request().method() === "POST" && r.status() === 202,
+      { timeout: 15_000 },
+    );
+    await reindexNow.click();
+    await postAccepted;
+    // The job runs server-side; the action re-enables once it settles and the
+    // page keeps showing the live count (no wedge, no contradiction).
+    await expect(reindexNow).toBeEnabled({ timeout: 30_000 });
+    await expect(page.getByTestId("kb-config-count")).toContainText(/files/i, { timeout: 30_000 });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// add-folder-actions-menu — F8: the collapsed header cluster must stay pinned
+// top-right at ANY sidebar width. This spec already pins a deliberately long
+// fixture path (`/fixtures/kb-parent/worktrees/kb-wt`), which is exactly the
+// squeeze case, so the scenario lands here rather than in a new file.
+//
+// Sidebar width is seeded through its persisted key rather than dragged: the
+// resize seam's geometry is not the subject, the layout under 220px is.
+// ─────────────────────────────────────────────────────────────────────────────
+test.describe("folder header cluster at a narrow sidebar (F8)", () => {
+  test("the trigger stays on one line top-right and the parent path yields first", async ({ page }) => {
+    await prepareShell(page);
+    if ((await page.getByTestId(`folder-actions-menu-${KB_WORKTREE}`).count()) === 0) {
+      await pinFixture(page, KB_WORKTREE);
+    }
+
+    await page.evaluate(() => localStorage.setItem("dashboard:sidebar-width", "220"));
+    await page.reload();
+    const skip = page.getByRole("button", { name: /^skip$/i });
+    if (await skip.isVisible().catch(() => false)) await skip.click();
+
+    const cluster = page.getByTestId(`folder-header-cluster-${KB_WORKTREE}`).first();
+    const trigger = page.getByTestId(`folder-actions-menu-${KB_WORKTREE}`).first();
+    const name = page.getByTestId(`folder-header-name-${KB_WORKTREE}`).first();
+    const parent = page.getByTestId(`folder-header-parent-${KB_WORKTREE}`).first();
+    const leaf = page.getByTestId(`folder-header-leaf-${KB_WORKTREE}`).first();
+    await expect(trigger).toBeVisible({ timeout: 20_000 });
+
+    const [clusterBox, nameBox, triggerBox] = await Promise.all([
+      cluster.boundingBox(),
+      name.boundingBox(),
+      trigger.boundingBox(),
+    ]);
+    if (!clusterBox || !nameBox || !triggerBox) throw new Error("header boxes not measurable");
+
+    // One line: the cluster shares the name row's vertical band, and holds a
+    // single control so it has nothing to wrap.
+    expect(clusterBox.height).toBeLessThanOrEqual(nameBox.height + 8);
+    expect(Math.abs(clusterBox.y - nameBox.y)).toBeLessThan(nameBox.height);
+    expect(await cluster.locator("> *").count()).toBe(1);
+
+    // Top-right: the cluster ends to the right of the name region.
+    expect(clusterBox.x).toBeGreaterThanOrEqual(nameBox.x + nameBox.width - 2);
+
+    // Truncation priority: the parent path is clipped, the leaf keeps its floor.
+    const [parentClipped, leafWidth] = await Promise.all([
+      parent.evaluate((n) => n.scrollWidth > n.clientWidth + 1),
+      leaf.evaluate((n) => n.getBoundingClientRect().width),
+    ]);
+    expect(parentClipped).toBe(true);
+    expect(leafWidth).toBeGreaterThan(0);
   });
 });

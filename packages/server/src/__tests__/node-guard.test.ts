@@ -1,5 +1,8 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import * as sharedNodeVersion from "@blackbelt-technology/pi-dashboard-shared/node-version.js";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   buildEnginesRangeMessage,
   buildNodeUpgradeMessage,
@@ -125,22 +128,24 @@ describe("isOutOfEnginesRange", () => {
     expect(isOutOfEnginesRange("v22.19.0")).toBe(false);
   });
 
-  it("returns false for v22.22.x, v23.x, v24.x, v25.x within range", () => {
+  it("returns false for v22.22.x, v23.x, v24.x, v25.x, v26.x within range", () => {
     expect(isOutOfEnginesRange("v22.22.2")).toBe(false);
     expect(isOutOfEnginesRange("v23.5.0")).toBe(false);
     expect(isOutOfEnginesRange("v24.15.0")).toBe(false);
     expect(isOutOfEnginesRange("v25.0.0")).toBe(false);
     expect(isOutOfEnginesRange("v25.9.0")).toBe(false);
+    expect(isOutOfEnginesRange("v26.0.0")).toBe(false);
+    expect(isOutOfEnginesRange("v26.8.1")).toBe(false);
   });
 
-  it("returns true for v26.x and above (engines cap)", () => {
-    expect(isOutOfEnginesRange("v26.0.0")).toBe(true);
-    expect(isOutOfEnginesRange("v26.8.1")).toBe(true);
+  it("returns true for v27.x and above (engines cap)", () => {
     expect(isOutOfEnginesRange("v27.0.0")).toBe(true);
+    expect(isOutOfEnginesRange("v28.4.2")).toBe(true);
   });
 
   it("accepts versions without the v prefix", () => {
-    expect(isOutOfEnginesRange("26.0.0")).toBe(true);
+    expect(isOutOfEnginesRange("26.0.0")).toBe(false);
+    expect(isOutOfEnginesRange("27.0.0")).toBe(true);
     expect(isOutOfEnginesRange("22.19.0")).toBe(false);
     expect(isOutOfEnginesRange("25.0.0")).toBe(false);
   });
@@ -154,21 +159,67 @@ describe("isOutOfEnginesRange", () => {
 
 describe("buildEnginesRangeMessage", () => {
   it("interpolates the running version", () => {
-    expect(buildEnginesRangeMessage("v26.0.0")).toContain("v26.0.0");
+    expect(buildEnginesRangeMessage("v27.0.0")).toContain("v27.0.0");
   });
 
   it("names the engines range", () => {
-    expect(buildEnginesRangeMessage("v26.0.0")).toMatch(/>=22\.19\.0 <26/);
+    expect(buildEnginesRangeMessage("v27.0.0")).toMatch(/>=22\.19\.0 <27/);
   });
 
-  it("explains the EBADENGINE / floor link", () => {
-    const msg = buildEnginesRangeMessage("v26.0.0");
+  it("explains the EBADENGINE / engines-range link", () => {
+    const msg = buildEnginesRangeMessage("v27.0.0");
     expect(msg).toMatch(/EBADENGINE/);
     expect(msg).toMatch(/floor/);
   });
 
-  it("suggests bundled-node escape hatch", () => {
-    const msg = buildEnginesRangeMessage("v26.0.0");
-    expect(msg).toMatch(/\.pi-dashboard\/node\/bin/);
+  // Full remediation contract in one probe at the new refusal boundary.
+  // See change: fix-pi-install-node26-and-omit-dev-build (test-plan #E4).
+  it("names the version, the new range, and every remediation route when a managed Node exists", () => {
+    const msg = buildEnginesRangeMessage("v27.0.0", { managedNodeExists: true });
+    expect(msg).toContain("cannot start on Node v27.");
+    expect(msg).toContain("Required: >=22.19.0 <27");
+    expect(msg).toContain("nvm install");
+    expect(msg).toContain('PATH="$HOME/.pi-dashboard/node/bin');
+    expect(msg).toContain("brew install node");
+  });
+
+  // Managed PATH hint is emitted ONLY when `<managedDir>/node/` actually
+  // holds a managed runtime — without one the hint is dead advice.
+  // See change: unify-pi-runtime-identity (task 6.3 / test-plan E9).
+  describe("managed-Node hint existence probe (test-plan E9)", () => {
+    let managedDir: string;
+
+    beforeEach(() => {
+      managedDir = fs.mkdtempSync(path.join(os.tmpdir(), "node-guard-managed-"));
+    });
+
+    afterEach(() => {
+      fs.rmSync(managedDir, { recursive: true, force: true });
+    });
+
+    it("lists all three install paths when a managed Node runtime exists", () => {
+      const msg = buildEnginesRangeMessage("v27.0.0", { managedNodeExists: true });
+      expect(msg).toContain("nvm install");
+      expect(msg).toContain('PATH="$HOME/.pi-dashboard/node/bin');
+      expect(msg).toContain("brew install node");
+    });
+
+    it("omits the managed hint and the `.pi-dashboard` substring when absent", () => {
+      const msg = buildEnginesRangeMessage("v27.0.0", { managedNodeExists: false });
+      expect(msg).toContain("nvm install");
+      expect(msg).toContain("brew install node");
+      expect(msg).not.toContain(".pi-dashboard");
+    });
+
+    it("probes `<managedDir>/node/` on disk when not overridden", () => {
+      // No node/ under the tmp managedDir → machine without a managed
+      // runtime → hint absent.
+      expect(buildEnginesRangeMessage("v27.0.0", { managedDir })).not.toContain(".pi-dashboard");
+      // With node/ present → the managed PATH hint is emitted.
+      fs.mkdirSync(path.join(managedDir, "node"), { recursive: true });
+      expect(buildEnginesRangeMessage("v27.0.0", { managedDir })).toContain(
+        'PATH="$HOME/.pi-dashboard/node/bin',
+      );
+    });
   });
 });

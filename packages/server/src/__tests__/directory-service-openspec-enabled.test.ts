@@ -15,8 +15,8 @@ import { DEFAULT_OPENSPEC_POLL } from "@blackbelt-technology/pi-dashboard-shared
 import type { DashboardSession } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDirectoryService, type DirectoryService } from "../directory-service.js";
-import type { SessionManager } from "../session/memory-session-manager.js";
 import type { PreferencesStore } from "../persistence/preferences-store.js";
+import type { SessionManager } from "../session/memory-session-manager.js";
 
 // Mock CLI entry points so we can spy on whether they get called.
 vi.mock("@blackbelt-technology/pi-dashboard-shared/openspec-poller.js", async (importOriginal) => {
@@ -74,6 +74,7 @@ function makePrefs(pinnedDirs: string[] = []): PreferencesStore {
     setWorkspaceCollapsed: vi.fn(() => false),
     addFolderToWorkspace: vi.fn(() => false),
     removeFolderFromWorkspace: vi.fn(() => false),
+    moveFolderToWorkspace: vi.fn(() => false),
     reorderWorkspaceFolders: vi.fn(() => false),
     reorderWorkspaces: vi.fn(() => false),
     flush: vi.fn(),
@@ -129,6 +130,7 @@ describe("DirectoryService — openspec.enabled gate", () => {
       pending: false,
       changes: [],
       hasOpenspecDir: false,
+      readiness: { state: "GLOBAL_OFF" },
     });
     expect(pollOpenSpecAsync).not.toHaveBeenCalled();
     expect(runOpenSpecList).not.toHaveBeenCalled();
@@ -150,6 +152,7 @@ describe("DirectoryService — openspec.enabled gate", () => {
       pending: false,
       changes: [],
       hasOpenspecDir: false,
+      readiness: { state: "GLOBAL_OFF" },
     });
     expect(runOpenSpecList).not.toHaveBeenCalled();
   });
@@ -180,7 +183,15 @@ describe("DirectoryService — openspec.enabled gate", () => {
 
     service.reconfigurePolling({ ...DEFAULT_OPENSPEC_POLL, enabled: false });
 
-    const cleared = { initialized: false, pending: false, changes: [], hasOpenspecDir: false };
+    const cleared = {
+      initialized: false,
+      pending: false,
+      changes: [],
+      hasOpenspecDir: false,
+      // E26: the cleared payload carries GLOBAL_OFF explicitly. See change:
+      // add-openspec-init-affordances.
+      readiness: { state: "GLOBAL_OFF" },
+    };
     const cwds = new Set(broadcasts.map(b => b.cwd));
     expect(cwds.has("/a")).toBe(true);
     expect(cwds.has("/b")).toBe(true);

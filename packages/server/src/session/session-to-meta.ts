@@ -19,8 +19,16 @@ export function sessionToMeta(session: DashboardSession): SessionMeta {
     // full .meta.json overwrite (not a merge) — omitting it wipes the auto/user
     // lockout signal on the next unrelated save. See change: add-auto-session-naming.
     nameSource: session.nameSource,
+    // Same reasoning as `nameSource`: this save is a FULL overwrite, so
+    // omitting the namer state would wipe a permanent stop on the next
+    // unrelated save. See change: fix-auto-naming-reasoning-model (design D7).
+    autoNamerState: session.autoNamerState,
     attachedProposal: session.attachedProposal,
-    displayPrefsOverride: session.displayPrefsOverride,
+    // Normalize the transient `null` (a just-cleared override, kept null in
+    // memory so the WS broadcast survives JSON) back to `undefined` so the
+    // full-overwrite persistence deletes the field rather than storing null.
+    // See change: fix-clear-display-override-broadcast.
+    displayPrefsOverride: session.displayPrefsOverride ?? undefined,
     processDrawerCollapsed: session.processDrawerCollapsed,
     hidden: session.hidden,
     cwd: session.cwd,
@@ -68,6 +76,11 @@ export function sessionToMeta(session: DashboardSession): SessionMeta {
     // (absent ⇒ durable) and it would escape reaping forever.
     // See change: add-embed-session-lifecycle.
     lifecyclePolicy: session.lifecyclePolicy,
+    // Persist retained notifications. MUST be listed here because this save
+    // does a full .meta.json overwrite (not a merge) — omitting it wipes the
+    // notify log, making notifications the one transcript row type that
+    // vanishes on restart. See change: split-notify-from-prompt-request.
+    notifyLog: session.notifyLog,
     cachedAt: Date.now(),
   };
 }

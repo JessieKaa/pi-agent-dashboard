@@ -118,12 +118,21 @@ PW_E2E_USE_RUNNING=1 npm run test:e2e
 
 `PI_E2E_SEED=1` makes `docker/test-entrypoint.sh` seed a fake (never-valid)
 anthropic OAuth credential — flips `providersReady` so the LandingPage step
-CTAs unlock — and seed `trustedNetworks` (RFC1918 private blocks) so the in-container
-browser (docker-gateway source IP, non-loopback) clears the network guard for
-directory listing / providers. A spawned session registers over the bridge
-before any model call, so card-appearance does not depend on key validity.
-Without the flag the harness stays UI-only and scenario specs fail at the pin
-step.
+CTAs unlock — and seed `trustedNetworks` so the browser's non-loopback source IP
+clears the network guard for directory listing / providers. A spawned session
+registers over the bridge before any model call, so card-appearance does not
+depend on key validity. Without the flag the harness stays UI-only and scenario
+specs fail at the pin step.
+
+`trustedNetworks` defaults to `0.0.0.0/0`. Narrow it with
+`PI_E2E_TRUSTED_NETWORKS` (comma-separated CIDRs). It used to seed only the
+RFC1918 blocks, on the assumption that published-port traffic is always SNAT'd
+through a private bridge gateway — false on a host running a VPN/secure-DNS
+layer (e.g. Cloudflare WARP), where the peer the container observes can be a
+PUBLIC address. Every browser request then 403s ("Network not allowed" +
+"Server offline") and every scenario spec dies at the pin step. The trust
+boundary is the container, not an IP range: `compose.test.yml` publishes the
+test harness on `127.0.0.1` only, and its state is a throwaway tmpfs.
 
 ## Layout
 
@@ -151,6 +160,9 @@ step.
 
 ## Conventions
 
+- **Import `test` from `./fixtures.js`, never from `@playwright/test`.** This is
+  enforced (see *Session reaping* below) — `npm run lint:e2e` fails and names the
+  file. A raw Playwright import silently opts the spec out of session reaping.
 - **Select on existing `data-testid`s** (693 already shipped) — never CSS
   classes, translated text, or DOM structure. The testid→locator map lives in
   `helpers/index.ts` so a renamed testid breaks in one place. Do NOT add app
@@ -160,6 +172,61 @@ step.
   arrange step and assume no pre-existing session/folder/VCS root.
 - New browser-level scenarios go here as Playwright specs — NOT in
   `qa/tests/*.sh,*.ps1` (those stay CLI/process smoke).
+
+## Session reaping (why every spec imports from `./fixtures.js`)
+
+All specs share ONE container with a 4 GiB cap, and a spawned `pi` session costs
+**150–280 MB**. Specs used to spawn from 138 call sites and end essentially
+nothing, so sessions accumulated until the container hit its ceiling and the
+daemon died — which surfaced as ~70 fast "failures" that looked like mass
+regression but were just the harness being down (issue #433).
+
+`fixtures.ts` therefore exports the suite's `test`, wrapping every test in an
+automatic reap:
+
+1. Snapshot live session ids **before** the test body.
+2. Run the body.
+3. Settle the session list (poll until stable for 1 s, cap 5 s) so a session that
+   was still registering when the body ended is not misclassified.
+4. Shut down **only the delta** — sessions that appeared during this test.
+
+Consequences worth knowing:
+
+- **Do not rely on a session card left behind by an earlier spec.** Pin the
+  fixture and spawn your own; reuse is an optimisation, never a precondition.
+- **Sessions the harness created before the run are never touched**, because they
+  are not in any delta — including the `PI_E2E_INDEPENDENT_SESSION` pi that
+  `faux-ask.spec.ts` needs.
+- **Your own `afterEach` still sees a live session.** Playwright runs a spec's
+  `afterEach` before fixture teardown. An `afterAll` runs *after* the reap, so it
+  must not assume a live session.
+- **Liveness is judged by the session's liveness fields, not by presence in the
+  list.** A closed session keeps its record until the server removes it; treating
+  a lingering `live:false` record as live makes the budget cry wolf.
+
+### Residual-session budget
+
+After reaping, the fixture asserts live sessions ≤ `RESIDUAL_SESSION_BUDGET`
+(8, in `reap-core.ts` with its derivation). It is a **tripwire on what is left
+over**, not the container's capacity: it catches a session the per-test delta
+cannot see, at the spec that caused it, instead of as a collapse 40 specs later.
+On breach the failure lists the offending session ids and cwds.
+
+### Harness-down is reported once, loudly
+
+A liveness probe runs before each test. The harness is declared down only after
+**3 consecutive** failures — a harness merely slow under memory pressure is the
+measured state right before death, so one timeout must not condemn it. Once
+declared down, the current test fails naming the harness and the rest are
+skipped rather than run against a dead container.
+
+### Known limitation
+
+Under `PI_SPAWN_STRATEGY=tmux` (the docker default) reaping releases the session
+*record* but the server does not terminate the *process* — so container memory
+still climbs across a long run. Tracked in issue #452 / change
+`fix-tmux-session-shutdown-leak`. Out-of-band probe:
+`node scripts/probe-harness-memory.mjs`.
 
 ### Faux model round-trip (key-free)
 

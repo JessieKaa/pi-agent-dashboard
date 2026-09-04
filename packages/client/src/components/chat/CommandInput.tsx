@@ -1,13 +1,15 @@
+import { ComposerPanelSlot } from "@blackbelt-technology/dashboard-plugin-runtime";
+import type { ProviderRefreshError } from "@blackbelt-technology/pi-dashboard-shared/protocol.js";
 import type { CommandInfo, FileEntry, ImageContent, ModelInfo, ViewTarget } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import { mdiAlertOctagon, mdiClipboardText, mdiConsole, mdiDotsHorizontal, mdiEyeOutline, mdiFile, mdiFileDocumentOutline, mdiFlag, mdiFlash, mdiFolder, mdiImageOutline, mdiPlaylistPlus, mdiPlus, mdiSendVariant, mdiStop, mdiStopCircleOutline, mdiWeb, mdiWrench } from "@mdi/js";
 import { Icon } from "@mdi/react";
 import React, { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useImagePaste } from "../../hooks/useImagePaste.js";
-import { usePopoverFlip } from "../../hooks/usePopoverFlip.js";
-import { usePopoverBoundary } from "../../lib/state/PopoverBoundaryContext.js";
-import type { ChatMessage } from "../../lib/chat/event-reducer.js";
-import { extractRecentUrls } from "../../lib/preview/extract-urls.js";
+import { LIST_POPOVER_MIN_HEIGHT, usePopoverFlip } from "../../hooks/usePopoverFlip.js";
+import type { ChatMessage, PendingPrompt } from "../../lib/chat/event-reducer.js";
 import { useI18n } from "../../lib/i18n/i18n.js";
+import { extractRecentUrls } from "../../lib/preview/extract-urls.js";
+import { usePopoverBoundary } from "../../lib/state/PopoverBoundaryContext.js";
 import { ImagePreviewStrip } from "../preview/ImagePreviewStrip.js";
 import { ModelSelector } from "../settings/ModelSelector.js";
 import { ThinkingLevelSelector } from "../settings/ThinkingLevelSelector.js";
@@ -76,7 +78,12 @@ export interface CommandInputProps {
   onForceKill?: () => void;
   /** Graceful stop: finish the current turn, then end the session cleanly. */
   onStopAfterTurn?: () => void;
-  pendingPrompt?: boolean;
+  /**
+   * Status of the optimistic pending prompt, or undefined when none.
+   * Only `"sending"` gates the composer — `"sent"`/`"failed"` are settled and
+   * must re-enable it. See change: fix-optimistic-prompt-stuck-sending.
+   */
+  pendingPrompt?: PendingPrompt["status"];
   onCancelPending?: () => void;
   /** Current session id — used to reset history-navigation state on switch. */
   sessionId?: string;
@@ -139,8 +146,15 @@ export interface CommandInputProps {
   onSelectModel?: (model: string) => void;
   /** Select a thinking level. When omitted the thinking chip is hidden. */
   onSelectThinkingLevel?: (level: string) => void;
-  /** Re-request the model list; forwarded to ModelSelector's footer refresh. */
+  /** Re-request the model list; fired on the model dropdown's open transition. */
   onRefreshModels?: () => void;
+  /** Navigate to Settings → Providers; forwarded to ModelSelector's empty-state link. */
+  onOpenProviderSettings?: () => void;
+  /**
+   * Provider refresh failures for the selected session, rendered in the model
+   * dropdown footer. See change: upgrade-model-selector-primitives.
+   */
+  modelRefreshErrors?: ProviderRefreshError[];
   /**
    * Context-window usage for the focus-revealed footer indicator. Rendered
    * only when `contextWindow > 0` and `tokens` is available client-side.
@@ -194,7 +208,7 @@ function extractAtQuery(text: string): string | null {
 }
 
 /** Minimum bare-leaf length before a walk-backed `list_files` request fires. */
-export const MIN_FILE_QUERY_LEN = 3;
+const MIN_FILE_QUERY_LEN = 3;
 
 /**
  * Whether an `@`-mention query should issue a walk-backed `list_files` request.
@@ -211,7 +225,7 @@ export function shouldWalkFileQuery(query: string): boolean {
 
 type StopState = "idle" | "aborting" | "killing";
 
-export function CommandInput({ commands: externalCommands, onSend, onListFiles, fileResults, disabled, sessionStatus, retrying, onAbort, onForceKill, onStopAfterTurn, pendingPrompt, onCancelPending, sessionId, draft, onDraftChange, history, images, onImagesChange, currentCwd, onViewLocal, onOpenInlineTerminal, sessionMessages, model, models, favorites, onToggleFavorite, thinkingLevel, onSelectModel, onSelectThinkingLevel, onRefreshModels, contextUsage }: CommandInputProps) {
+export function CommandInput({ commands: externalCommands, onSend, onListFiles, fileResults, disabled, sessionStatus, retrying, onAbort, onForceKill, onStopAfterTurn, pendingPrompt, onCancelPending, sessionId, draft, onDraftChange, history, images, onImagesChange, currentCwd, onViewLocal, onOpenInlineTerminal, sessionMessages, model, models, favorites, onToggleFavorite, thinkingLevel, onSelectModel, onSelectThinkingLevel, onRefreshModels, onOpenProviderSettings, modelRefreshErrors, contextUsage }: CommandInputProps) {
   const { t } = useI18n();
   // Treat retry-sleep as "still working" for Stop/Force-Stop visibility.
   const isWorking = sessionStatus === "streaming" || retrying === true;
@@ -370,11 +384,28 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
     : dropdownMode === "file" ? (fileItems.length + urlItems.length)
     : 0;
 
-  // Flip the autocomplete dropdown above/below the composer based on viewport
+  // Chat/composer/directory-home pane when a provider supplies it (else
+  // viewport). See change: fix-popover-container-clip.
+  const boundaryRef = usePopoverBoundary();
+
+  // Flip the autocomplete dropdown above/below the composer based on available
   // space; clamp height so it never runs off-screen. See change:
   // fix-popover-viewport-flip.
-  const { flipUp: ddFlipUp, maxHeight: ddMaxHeight } = usePopoverFlip(composerRef, {
+  //
+  // `left-3 right-3` pins both composer edges, so this dropdown stays immune on
+  // the HORIZONTAL axis — but it applies a height bound, and an offset pane's
+  // bottom edge sits above the viewport's, so the vertical axis must measure
+  // against the pane or the dropdown overruns it. See change:
+  // fix-popover-pane-bounded-height (task 5.6).
+  const {
+    flipUp: ddFlipUp,
+    maxHeight: ddMaxHeight,
+    minHeight: ddMinHeight,
+  } = usePopoverFlip(composerRef, {
     open: dropdownMode !== null,
+    boundaryRef,
+    // Filterable list (commands / files narrow as you type) — generous floor.
+    minPopoverHeight: LIST_POPOVER_MIN_HEIGHT,
   });
 
   // Attach (＋) menu boundary-awareness (fix-popover-container-clip): the
@@ -382,7 +413,10 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
   // pane narrows to its 25% floor (~222px < 224px menu). Measure the horizontal
   // axis against the chat pane so it clamps/flips within the pane; vertical
   // stays hardcoded `bottom-full` (composer sits at the pane bottom).
-  const boundaryRef = usePopoverBoundary();
+  // Height-agnostic on purpose: this menu consumes only the horizontal axis
+  // (`anchorRight`/`maxWidth`) — its vertical placement is a hardcoded
+  // `bottom-full` and it applies no height bound, so there is no floor to lose.
+  // See change: fix-popover-pane-bounded-height (task 4.6).
   const { anchorRight: attachAnchorRight, maxWidth: attachMaxWidth } = usePopoverFlip(attachBtnRef, {
     open: attachOpen,
     estimatedWidth: 224, // w-56
@@ -546,7 +580,7 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
       }
 
       // Cancel pending prompt on Escape
-      if (e.key === "Escape" && pendingPrompt && onCancelPending) {
+      if (e.key === "Escape" && pendingPrompt === "sending" && onCancelPending) {
         e.preventDefault();
         onCancelPending();
         return;
@@ -554,7 +588,7 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
 
       // --- History recall (ArrowUp / ArrowDown / Escape in history mode) ---
       // Only activates when no dropdown is open and no prompt is pending.
-      if (!pendingPrompt && (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "Escape")) {
+      if (pendingPrompt !== "sending" && (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "Escape")) {
         const ta = inputRef.current;
         // Escape while in history mode: restore the in-progress draft and exit.
         if (e.key === "Escape" && historyIndex !== null) {
@@ -683,7 +717,7 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
   // --- Morphing action button (send → stop → force-stop) ---
   // One button whose glyph/behaviour derive from state, replacing the old
   // four-button cluster. See change: redesign-prompt-input.
-  const pendingIdle = pendingPrompt === true && !isWorking;
+  const pendingIdle = pendingPrompt === "sending" && !isWorking;
   const canStop = !!(onAbort || onCancelPending);
   let actionButton: ReactNode;
   if (isWorking && stopState === "aborting" && onForceKill) {
@@ -714,7 +748,7 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
     actionButton = (
       <button
         onClick={() => {
-          if (pendingPrompt) {
+          if (pendingPrompt === "sending") {
             onCancelPending?.();
           } else {
             onAbort?.();
@@ -745,7 +779,7 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
   }
 
   // Stop-after-turn slim secondary affordance (beside the action button).
-  const showStopAfterTurn = isWorking && onStopAfterTurn && stopState === "idle" && !pendingPrompt;
+  const showStopAfterTurn = isWorking && onStopAfterTurn && stopState === "idle" && pendingPrompt !== "sending";
   const stopAfterTurnNode = !showStopAfterTurn ? null : stopAfterTurnRequested ? (
     <span
       className="flex items-center gap-1 px-2 self-end text-xs text-[var(--text-muted)]"
@@ -831,13 +865,14 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
       className="border-t border-[var(--border-primary)] p-3 relative"
     >
       {/* Autocomplete dropdown — grouped by source with badges + arg hints.
-          Structurally immune to the container-clip class (fix-popover-container-clip):
-          `left-3 right-3` pins BOTH composer edges, so it can never overflow the
-          pane on either side regardless of offset — no boundaryRef needed. */}
+          `left-3 right-3` pins BOTH composer edges, so it stays immune to the
+          container-clip class HORIZONTALLY (fix-popover-container-clip). Its
+          height bound is boundary-measured though — see the hook call above
+          (fix-popover-pane-bounded-height). */}
       {dropdownMode === "command" && (
 
         <div
-          style={{ maxHeight: ddMaxHeight }}
+          style={{ maxHeight: ddMaxHeight, minHeight: ddMinHeight }}
           className={`absolute left-3 right-3 bg-[var(--bg-secondary)] border border-[var(--border-subtle)] rounded-xl overflow-y-auto shadow-lg z-10 ${
             ddFlipUp ? "bottom-full mb-1" : "top-full mt-1"
           }`}
@@ -882,7 +917,7 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
           command dropdown → structurally immune to the container clip. */}
       {dropdownMode === "file" && (
         <div
-          style={{ maxHeight: ddMaxHeight }}
+          style={{ maxHeight: ddMaxHeight, minHeight: ddMinHeight }}
           className={`absolute left-3 right-3 bg-[var(--bg-secondary)] border border-[var(--border-subtle)] rounded-xl overflow-y-auto shadow-lg z-10 ${
             ddFlipUp ? "bottom-full mb-1" : "top-full mt-1"
           }`}
@@ -1036,6 +1071,8 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
               models={models}
               onSelect={onSelectModel}
               onRefresh={onRefreshModels}
+              onOpenProviderSettings={onOpenProviderSettings}
+              refreshErrors={modelRefreshErrors}
               favorites={favorites}
               onToggleFavorite={onToggleFavorite}
             />
@@ -1086,6 +1123,15 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
           {actionButton}
         </div>
       </div>
+
+      {/* Plugin composer-panel slot (e.g. grammar). Inert until a plugin
+          claims it; receives the live draft + bounded apply callback. */}
+      <ComposerPanelSlot
+        draft={text}
+        sessionId={sessionId}
+        sessionStatus={sessionStatus}
+        onApplyText={setText}
+      />
 
       {/* Focus-revealed footer hint line + context-left indicator. */}
       {footerVisible && (

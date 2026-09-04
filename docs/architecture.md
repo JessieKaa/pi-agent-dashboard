@@ -1,27 +1,17 @@
 # PI Dashboard Architecture
 
-> **Adjacent artifact:** the public marketing site lives at `/site` and is
-> product-adjacent, not part of the dashboard runtime. It has its own Astro
-> build, its own Playwright screenshot pipeline, and its own GitHub Pages
-> deploy workflow (`.github/workflows/deploy-site.yml`). See
-> `/site/README.md` for details.
+> **Adjacent artifact:** public marketing site lives at `/site`. Product-adjacent, not part of dashboard runtime. No framework — one hand-written static page: `site/index.html`, `site/404.html`, `site/field.js` (three.js background), `site/vendor/`, `site/media/`. Zero dependencies. `npm run build -w site` = `node site/build.mjs`: copies explicit allowlist into `site/dist`, verifies every local ref in `index.html` resolves. Artifact path unchanged — `.github/workflows/deploy-site.yml` still uploads `site/dist`, copies `packages/shell` into `site/dist/app`. Release data (download URLs + byte sizes) inline in `index.html`; `site/design-scratch/scripts/sync-release.mjs` rewrites it from GitHub API on `release: published` (`.github/workflows/sync-release-version.yml`), commits to develop. `site/design-scratch/` = design source, not deployed (excluded from build allowlist + deploy push-path filter). Theme: System/Light/Dark modes, storage key `pi-theme`, inline `<head>` script resolves before first paint; dark = absence of `data-theme="light"`. See `/site/README.md` for details.
 
 
 ## Overview
 
 PI Dashboard: web-based dashboard for monitoring + interacting with pi agent sessions. Three components:
 
-```
-┌─────────────┐     WebSocket      ┌──────────────┐     WebSocket     ┌─────────────┐
-│   Bridge    │ ◄─────────────────► │  Dashboard   │ ◄───────────────► │  Web Client  │
-│  Extension  │    (port 9999)      │   Server     │    (port 8000)    │  (React)     │
-│  (per pi)   │                     │  (Node.js)   │                   │  (Browser)   │
-└─────────────┘                     └──────────────┘                   └─────────────┘
-                                          │
-                                    ┌─────┴─────┐
-                                    │  In-Memory │
-                                    │  + JSON    │
-                                    └───────────┘
+```mermaid
+flowchart LR
+    Bridge["Bridge Extension (per pi)"] <-->|"WebSocket (port 9999)"| Server["Dashboard Server (Node.js)"]
+    Server <-->|"WebSocket (port 8000)"| Client["Web Client (React)"]
+    Server --> Storage["In-Memory + JSON"]
 ```
 
 ## Components
@@ -39,7 +29,7 @@ Global pi extension running in every pi session. It:
 - **Attached-proposal artifact summary** in the content-window header (`SessionHeader.tsx`, both desktop branch and `MobileHeader`): when `session.attachedProposal` matches an entry in the polled `openspecChanges` list, the header renders the `ArtifactLettersButton` (P/D/T/S letters colored by per-artifact status, single button → opens the proposal artifact) plus a `(completedTasks/totalTasks)` counter. Surface is gated on the explicit user attach only — auto-detected `openspecChange` does not trigger it. Wired via the new `onReadArtifact` prop, threaded from `App.tsx` (`handleReadArtifact` from `useContentViews`). See change: add-attached-proposal-header-summary.
 - **Duplicate bridge prevention**: Uses `process`-level shared state (not `globalThis`) with a monotonic generation counter. When the extension is loaded multiple times (e.g., local + global npm package), only the latest instance's event handlers are active — stale listeners bail out immediately. All previous connections and timers are tracked and cleaned up on re-init.
 - **Subagent re-entry guard**: When pi-subagents launches an Agent tool, the subagent creates its own `AgentSession` which loads extensions (including the bridge) in the same process. Without protection, this would overwrite the parent bridge's global state, disconnect its WebSocket, and prevent `tool_execution_end`/`agent_end` from being forwarded — leaving the parent session stuck at "streaming" forever. The bridge stores a reference to its owning `pi` instance and skips initialization when called from a different instance (subagent).
-- Routes `ctx.ui` dialog methods (confirm, select, input, editor, multiselect, notify) through `PromptBus` (`prompt-bus.ts`)
+- Routes `ctx.ui` dialog methods (confirm, select, input, editor, multiselect) through `PromptBus` (`prompt-bus.ts`). `notify` split out — direct `notify` frame via `notify-proxy.ts`, never PromptBus. See Notify Flow.
   - Adapters register to handle prompts: `DashboardDefaultAdapter` renders generic dialogs inline; extensions (e.g. pi-flows) can register custom adapters via `prompt:register-adapter` event
   - First-response-wins: multiple adapters (TUI, dashboard, custom) can claim a prompt; the first to respond resolves it, others are dismissed
   - Bridge's TUI adapter is registered inline (captures original `ctx.ui` methods before patching) and presents `select`/`input`/`confirm`/`editor` prompts in the terminal with AbortController-based cancellation. Multiselect bypasses the TUI adapter entirely and uses the bus-routed `ctx.ui.multiselect` patch → `DashboardDefaultAdapter` → client `MultiselectRenderer` exclusively (pi 0.70 RPC's `ctx.ui.custom` is a no-op, so a TUI arm would auto-cancel the dashboard render in <1s). See changes: fix-multiselect-auto-cancel-on-dashboard, fix-multiselect-tui-arm-self-cancel.
@@ -76,6 +66,27 @@ Node.js HTTP + WebSocket server that:
 
 See change: configurable-bind-host.
 
+**Bind-vs-trust reachability.** Two settings on two different Settings pages govern whether a LAN device can reach the dashboard. `bindHost` (Server page, default `127.0.0.1`, restart-required) + `auth.bypassHosts` / top-level `trustedNetworks` (Security page, live-reloaded). A loopback or specific-NIC bind silently voids a trusted entry outside its range: TCP refused before any handler runs, so `blockEvents.record()` never fires. The entries stay listed and configured — what is missing is any SIGNAL: no block event, so `BlockEventTrustBanner` early-returns `null` and the operator gets no hint the entries are inert.
+
+- Coupling pre-existed one direction. `SettingsPanel.tsx` passes `hasGuardConfig(config)` into `ListenInterfaceField`. Server page reads Security state for the all-interfaces exposure warning. Return edge (Security reads bind state) = this change.
+- Predicate home: `packages/shared/src/bind-reachability.ts`. ONE implementation, imported by both client + server. No per-package copy, so drift structurally impossible.
+- `unreachableTrustedEntries(bindHost, entries)` returns offending ENTRIES, not a boolean. Evaluation order per entry: (1) loopback-only entry → reachable; (2) bind host not IPv4 literal (`::`, hostname) → FAIL OPEN; (3) bind host `0.0.0.0` → reachable; (4) malformed entry → skipped, never reported; (5) bind host in `127.0.0.0/8` → unreachable; (6) otherwise reachable iff entry covers bind host.
+- `127.0.0.0/8` loopback-only. `127.0.0.0/7` NOT — also covers `126.x`.
+- Predicate reads UNION of `trustedNetworks` + `auth.bypassHosts` (`collectTrustedEntries`). Mirrors `hasGuardConfig()` + runtime guard.
+- ADVISORY only. Guard code untouched — no request allowed or denied differently. ADDRESS test, not routing test: trusted `10.0.0.0/8` scores reachable for bind `10.0.0.5` even with no route to wider network.
+- Bind-host chain: `--host` → `PI_DASHBOARD_HOST` → `config.bindHost` → `127.0.0.1` (`resolveBindHost`). `resolvedBindHost` = frozen at boot, what THIS process bound. `pendingBindHost` = re-resolved against current config, what NEXT start binds. `ServerConfig.hostFlag` retains raw `--host`, so flag still wins on re-resolution. Unsaved client draft outranks both (`pendingEffectiveHost`).
+- Predicate input = RESOLVED bind host, never `config.bindHost`. Container seeds no `bindHost` key, so `config.bindHost` reads as `127.0.0.1` default while server binds `0.0.0.0` from `PI_DASHBOARD_HOST` (`docker/compose.yml`). Scoring config value would fire advisory in every container with a trusted network.
+- Surfaces: (a) `console.warn` prefixed `[bind-reachability]` at startup, matching `[openspec-poll]` / `[hydration]` convention; (b) top-level `reachability` object `{ resolvedBindHost, pendingBindHost, unreachable[] }` on `GET /api/config`, failure-isolated like `eventLoopDelay` / `storeTrim` / `notifyLog`; (c) `reachability_updated` `ServerToBrowserMessage` broadcast when `pendingBindHost` changes, replayed on connect.
+- `reachability` COMPUTED, never persisted. Stripped on config write path in `packages/server/src/config-api.ts`, alongside `resolvedTrustedNetworks`.
+- Deliberately NOT on `/api/health`. `/api/health` carries no `preHandler`; `/api/config` carries `networkGuard`. Resolved bind host + unreachable entries describe operator's private network topology, not server health — publishing unguarded hands any peer that can reach the port a map of internal subnets.
+- Advisory + `BlockEventTrustBanner` INDEPENDENT, not mutually exclusive. `bindHost=10.0.0.5` + trusted `192.168.1.0/24`: peer at `10.0.0.9` accepted by NIC, denied by guard, recorded — both banners render, advisory first.
+- `/api/network-interfaces` entries gain `label`, `pointToPoint`, `suggestions`. ONE entry per address kept: `ListenInterfaceField` renders one option per address and keys on it, so server-side dedupe would make a bind address unselectable. Trusted-networks dropdown dedupes at render time, keyed on suggestion `value` — two tunnels with different `/32` cidrs both offer `100.64.0.0/10`.
+- Interface offer table: broadcast NIC (`/24`, `/16`, …) → netmask-derived CIDR, narrow. Point-to-point `/32` in a known range → containing range, wide. Point-to-point outside every known range → no offer, shown unofferable with explanation.
+- Tailscale gives each node its own `/32` from `100.64.0.0/10`. Old netmask-only offer was `<self>/32` — an entry trusting nobody new, host already loopback-exempt.
+- One well-known-range table backs BOTH interface path + block-event path (`suggestTrustEntries`). Two routes to same decision cannot contradict.
+
+See change: warn-unreachable-trusted-networks.
+
 **Server decomposition:** The server is split into focused modules:
 - `server.ts` — Orchestrator: creates services, composes modules, manages lifecycle
 - `routes/` — REST API routes grouped by domain (session, git, file, openspec, system)
@@ -95,11 +106,17 @@ React-based responsive web UI that:
 - Provides command autocomplete with `/` prefix
 - Supports bidirectional interaction (send prompts, run commands)
 - Works on mobile with responsive layout and swipe gestures
-- Shows an onboarding `LandingPage` whenever the main pane is empty, narrating the three steps needed to go from install → first running session (Setup credentials → Add folder → Start session). Each step is a card in **pending**, **done**, or **locked** state, derived purely from client state: `useProvidersReady()` (from `GET /api/providers`), `pinnedDirectories.length`, and `sessions.size`. Satisfied steps collapse to single-line ✔ rows, so returning users see a compact status strip rather than a full onboarding wall. The `PinDirectoryDialog` used by Step ② is mounted once at the app root in `App.tsx` and shared with the sidebar "Add folder" button via a single `onOpenPinDialog` callback.
+- Shows an onboarding `LandingPage` whenever the main pane is empty, narrating the three steps needed to go from install → first running session (Setup credentials → Add folder → Start session). Each step is a card in **pending**, **done**, or **locked** state, derived purely from client state: `useProvidersReady()` (from `GET /api/providers`), `pinnedDirectories.length`, and `sessions.size`. Satisfied steps collapse to single-line ✔ rows, so returning users see a compact status strip rather than a full onboarding wall. Step ② sidebar "Add folder" button opens multi-select `AddFoldersDialog` (destination: None); pinning implicit (adding folder pins it). App uses `pinDialogOpen` state to gate dialog.
 
-**Unified dialog system** (`packages/client-utils/`): `Dialog` primitive + `Confirm` preset + `useFocusTrap` hook. `Dialog` owns portal/overlay (`bg-black/60`)/Esc/click-outside/focus-trap/ARIA/`z-[60]`/size variants (sm/md/lg)/header+footer slots (`Dialog.Footer`/`Dialog.Cancel`/`Dialog.Action`). `Confirm` wraps `Dialog` (size sm) for confirm flows. `ui:dialog` registry key exposes shell to plugins; `ui:confirm-dialog` re-skinned as adapter over `Confirm`. ~20 dialogs migrated. Legacy `ConfirmDialog` removed. See change: unify-dialog-system.
+**Unified dialog system** (`packages/client-utils/`): `Dialog` primitive + `Confirm` preset + `useFocusTrap` hook. `Dialog` owns portal/overlay (`bg-black/60`)/Esc/click-outside/focus-trap/ARIA/`z-dialog`/size variants (sm/md/lg)/header+footer slots (`Dialog.Footer`/`Dialog.Cancel`/`Dialog.Action`). `Confirm` wraps `Dialog` (size sm) for confirm flows. `ui:dialog` registry key exposes shell to plugins; `ui:confirm-dialog` re-skinned as adapter over `Confirm`. ~20 dialogs migrated. Legacy `ConfirmDialog` removed. See changes: unify-dialog-system, add-route-backed-overlay-dialogs.
 
 **Global Escape dismissal** (`packages/client-utils/src/escape-stack.ts`): single module-stable `document` `keydown` listener arbitrates Escape dismissal for portaled dismissible surfaces via LIFO stack. On Escape, only TOPMOST registered layer's `onEscape` fires (`preventDefault` + `stopImmediatePropagation`). Guarded against `e.repeat` + `e.defaultPrevented`. Listener attaches once on first registration; never detaches. New dismissible portaled overlays SHOULD use `useEscapeDismiss(active, onEscape)` hook; stacked surfaces peel one layer per Escape instead of collapsing multiple layers at once. Adopted by `Dialog`, `ImageLightbox`, `FilePreviewOverlay`; `MermaidBlock` deferred (inline, not portaled). See change: fix-stacked-escape-closes-layers.
+
+**Overlay layering (z-index)** (change: add-overlay-layering-system): single stacking order source. `packages/client/src/index.css` defines CSS custom properties `--z-base:0`, `--z-raised:10`, `--z-sidebar:20`, `--z-overlay:30`, `--z-popover:40`, `--z-dialog:50`, `--z-toast:60`, `--z-lightbox:70`. Ascending values = paints later = on top. Theme-independent; one scale covers all themes. Matching Tailwind utilities `z-base` through `z-lightbox` bind to the vars. Layer roles: base = flow content; raised = sticky headers; sidebar = sidebar/folder chrome; overlay = scrims/mobile backdrops; popover = menus/dropdowns/folder flyouts; dialog = modals/full-pane; toast = notifications; lightbox = full-screen media. Toast (60) > dialog (50) intentional — notification visible over modal. Shared `Dialog` (`packages/client-utils/src/Dialog.tsx:77`) uses `z-dialog` utility (`--z-dialog: 50`), not raw `z-[60]`. Nested dialogs tie at 50; later portal/DOM mount wins — repo-standard for stacked dialogs. Gate gap: `z-layer-lint` `SCAN_DIR = "packages/client/src"` excludes `packages/client-utils`; raw `z-[60]` survived there (raw-z gate blind spot). See change: add-route-backed-overlay-dialogs.
+
+**Portal-or-perish rule:** any box-escaping overlay (menu/popover/dropdown/dialog/toast/lightbox) MUST portal to top-level layer root (`document.body`), never inline `position:absolute`. Reason: numeric z-index orders only within nearest ancestor stacking context. Inline absolute overlay trapped by ancestor `transform`/`will-change`/`opacity`/`isolate`/`z-*`. `SessionCard` sets `isolate` per card → trapped folder popover UNDERLAPS cards. Portaling escapes contexts; token then orders portaled layers. Portal primitives: `packages/client-utils/src/LayerPortal.tsx` (portal to body, no scroll lock) for menus/popovers; `DialogPortal.tsx` (portal + body scroll lock) for modals. Portaled panel positions `fixed` from `usePopoverFlip` `triggerRect`; capture-phase window scroll re-measure → tracks ancestor (sidebar) scroll.
+
+**Enforcement:** `scripts/z-layer-lint.mjs` frozen baseline ratchet (`scripts/z-layer-baseline.json`). Freezes current raw `z-[NNNN]`/`z-<n>` in `packages/client/src`; FAILS on new occurrence outside `z-<layer>` utilities; baseline may only shrink. Wired into `quality:changed`. Phased: FolderActionsMenu fixed + Tier-A already-portaled overlays token-swapped now. ~12 inline-absolute popovers + FilePreviewOverlay deferred to follow-up `portal-inline-popovers` (allowlisted in baseline). Spec: `openspec/changes/add-overlay-layering-system/specs/overlay-layering/spec.md`.
 
 ### 4. Shared Types (`src/shared/`)
 TypeScript type definitions shared across all components:
@@ -136,8 +153,221 @@ TypeScript type definitions shared across all components:
 - **Needs-you precedence.** `error > ask_user(chat-routed) > resuming/retry > working(streaming) > active/idle > ended`. Applied uniformly across left-gutter dot (`deriveDotColorWithFlags`), rail (`deriveRailBgColor`), icon tint (`deriveIconStatusColor`, converts `bg-[var(...)]`→`text-[var(...)]`). All in `session-status-visuals.ts`. `flags.hasWidgetBarPrompt` excludes widget-bar ask_user from needs-you so only chat-routed prompts escalate (`isChatRoutedAskUser`).
 - **Non-hue shape channel.** `deriveStatusShape` + `statusShapeIcon` map status to filled/half/ring/cross marker. `SessionCard.tsx::StatusShapeBadge` overlays marker on session-status-icon (`data-status-shape`). Color-blind-safe redundant encoding.
 - **Label split.** `ActivityIndicator`: ask_user → "Needs you" (`--status-needs-you`); idle/active → "Idle" (muted). "Waiting for input" retired.
-- **Folder needs-you rollup.** `FolderNeedsYouPill` counts chat-routed ask_user child sessions per folder (`countNeedsYou` / `needsYouSessionIds`), excludes widget-bar via per-session `WidgetBarProbe` + `useHasWidgetBarPrompt`. Hidden at 0. Click → scroll+select first blocked. Mobile ≤375px hides label.
-- **Opt-in urgency sort.** `useFolderUrgencySort` per-folder pref, default off, localStorage `dashboard:folder-urgency-sort`. When on, `SessionList` floats ask_user sessions first within active tier via `floatAskUserFirst`. Toggle `mdiSortVariant` in folder header.
+- **Folder status capsule** (change: unify-folder-status-capsule). `FolderStatusCapsule` = folder header's ONLY liveness surface. Renders in BOTH collapse states. Replaces `FolderNeedsYouPill` + collapsed-only `FolderStatusRollup` + raw `(N)` count — all DELETED, incl. `countStatusRollup`. Segments by `countStatusCapsule(sessions, flags)` (`packages/client/src/lib/session/session-status-visuals.ts`). Fixed severity order `CAPSULE_SEGMENT_ORDER` = needs-you > error > working > idle; magnitude never reorders. Zero-count segments absent; no countable sessions → no capsule at all (all-ended folder shows none; its `N ended` disclosure row still reports size). Excludes `ended` + `hidden` before shape derivation. `flags.widgetBar` tri-state `(id) => boolean | undefined`; `true` or `undefined` excludes that ask_user session from EVERY bucket. Still per-session `WidgetBarProbe` + `useHasWidgetBarPrompt`, now capsule-owned. needs-you uses explicit predicate, not `deriveStatusShape`; re-adds `!hasError` guard — errored ask_user counts once, as error. `notice` shape folds into `idle` bucket; retrying counts as `working`. Counts cap at `999+`. Non-idle segments = `<button>`s → first session of that state via `firstIds[bucket]`; idle = inert `<span>` + aria-label. Activation `stopPropagation()` → SessionList reveal path (`onSeekToCard` / `revealRequest`): inherits guarded expand, layout-settled scroll, hidden/filtered degrade toasts. Colors from `--status-*` family only, never `--severity-*`; no new CSS custom property. Capsule `flex-none` + `whitespace-nowrap`; sheds nothing; folder name absorbs width pressure. Test ids: `folder-status-capsule-<cwd>`, `folder-capsule-seg-{needs-you,error,working,idle}-<cwd>`.
+- **Opt-in urgency sort.** `useFolderUrgencySort` per-folder pref, default off, localStorage `dashboard:folder-urgency-sort`. When on, `SessionList` floats ask_user sessions first within active tier via `floatAskUserFirst`. Toggle = folder actions menu item `urgency-sort` (`mdiSortVariant`), `aria-pressed` bound to `urgencySort.isOn(cwd)`. Per-folder persisted preference unchanged.
+
+### EventBus Forwarding Mechanism (subscription-based, change: fix-automation-run-lifecycle)
+
+**Host topology.**
+
+- `EventBus` = `node:events` wrapper. `pi-coding-agent/dist/core/event-bus.js`. Methods: `emit` / `on` / `clear`. NO wildcard channel.
+- One bus per pi process. Shared by all extensions.
+- `pi.events` = PER-EXTENSION facade over that bus. `createExtensionAPI` -> `events: { emit, on }`. `pi-coding-agent/dist/core/extensions/loader.js`.
+
+**Why NOT an emit intercept.**
+
+- Patching `pi.events.emit` mutates only the patching extension's facade.
+- Foreign emissions bypass the patch. Emitters affected: pi-flows, pi-subagents.
+- Old bridge patched `emit`. Consequence: zero live `flow_*` / `subagent_*` `event_forward` ever left the bridge.
+- Flow cards rebuilt from persisted `custom/flow-event` JSONL. `packages/shared/src/state-replay.ts`.
+- Automation runs with a `flows.run` action stayed `status: "running"`.
+- Stale-run reaper finalized them `error: "run exceeded max age"` ~30 min later.
+- Measured: 101 runs, 0 reached `done`.
+- Proof: bridge `pi.events.on("flow:complete")` fired; patched `emit` never entered for that channel.
+
+**Current mechanism.**
+
+- `registerEventBusForwarding`. `packages/extension/src/flow-event-wiring.ts`.
+- ONE `pi.events.on(channel, ...)` subscription per declared channel.
+- `on()` observes every emitter.
+- Declared set = keys of `FLOW_EVENT_MAP` + `SUBAGENT_EVENT_MAP` + optional `extraMaps` (currently none passed).
+- Channel list IS the contract. Undeclared channel -> never forwarded.
+- New channel -> new map entry. Identity entry when no rename wanted.
+- Retired: wildcard forwarding of any unknown channel. Unimplementable without an emit intercept.
+
+**Forward gates.** `forwardBusEvent`, same file.
+
+- Subagent channel -> forward only when `sessionReady && isActive() && connection.isConnected`.
+- Else buffer latest-wins per agent in `SubagentFrameBuffer`. Flushed on re-register / reconnect.
+- Other declared channel -> forward when `sessionReady && isActive()`.
+- Forwarding failure never propagates to the emitter.
+- Forwarding failure drops that live frame. Nothing re-sends it. Subagent frames are the exception (buffered).
+
+**Teardown.** dispose returned by `registerEventBusForwarding`.
+
+- Removes only the bridge's own subscriptions.
+- Restores nothing. Bridge never replaces a host function.
+
+### Subagent Timeline Push/Pull Split (change: reduce-subagent-details-payload)
+
+**Why thin ticks.**
+
+- Producer builds ONE `snapshotDetails()` object.
+- Feeds BOTH carriers: `subagents:*` EventBus frame + pi-core `tool_execution_update`.
+- `entries[]` append-only → tick size grows linearly with run length.
+- Long run = fat intermediate ticks.
+- Solution: strip timeline from intermediate ticks.
+- Push terminal frame fat.
+- Pull full timeline on demand.
+
+**Strip module.**
+
+- File: `packages/extension/src/subagent-frame-strip.ts`.
+- Exports `stripSubagentEntries`, `stripForForward`, `NON_TERMINAL_STATUSES`.
+- Strips `details.entries` on FORWARD path when frame status `queued` or `running`.
+
+**Allowlist, never negation.**
+
+- `NON_TERMINAL_STATUSES` = explicit allowlist.
+- Never `!terminal`.
+- `AgentStatus` also has `stopped`; negation would strip it and lose that run's timeline.
+- `stopped` counts as terminal: never stripped.
+
+**Strip clones.**
+
+- Strip CLONES data.
+- `SubagentFrameBuffer` retains frames BY REFERENCE.
+- Mutating strip would corrupt the pull source.
+- Fat snapshot survives intact for resync.
+
+**Call-site allowlist.**
+
+- Strip applied at explicit call sites.
+- NEVER inside `sendEventForward`.
+- Sites: EventBus forward path (`flow-event-wiring.ts` `forwardBusEvent`).
+- Sites: buffered-frame flush + resync reply (`packages/extension/src/subagent-forward-sites.ts` — `flushBufferedSubagentFrames` strips, `serveSubagentResync` does NOT).
+- Sites: `tool_execution_update` carrier in `bridge.ts`.
+- Strip inside `sendEventForward` would strip the resync reply.
+- EventBus-only strip would leak every frame drained by the buffer.
+
+**Terminal frames never stripped.**
+
+- `completed`/`failed`/`aborted`/`stopped`/`error` forward full.
+- Terminal frame = durable record behind `tool_execution_end` backfill.
+- Second independent terminal guard: `stripForForward(data, channel)` never strips when `channel` in `TERMINAL_CHANNELS` (`subagents:completed`, `subagents:failed`).
+- Guard fires regardless of `details.status`.
+- Both signals must be wrong to lose a timeline.
+
+**Full-snapshot invariant preserved.**
+
+- Every frame still an idempotent FULL snapshot.
+- Latest-supersedes.
+- No delta encoding.
+- No wire key.
+- No version negotiation.
+- No producer change.
+- Dropped thin tick leaves no permanent hole.
+
+**Pull path.**
+
+- Client requests `subagent_resync_request`.
+- Bridge answers from retained fat snapshot as synthetic `subagents:started` frame.
+
+**Server resync locator.**
+
+- `locateSubagentTimeline` (`packages/server/src/persistence/memory-event-store.ts`) now also matches `subagent_*` eventTypes carrying `details.entries`.
+- Before: resync reply fell to generic pass.
+- Before: any array > 20 items became string `"[array truncated]"`.
+- Before: reducer rendered no timeline.
+- Head-tail budget now applies: head + `⋯ N steps hidden ⋯` sentinel + tail.
+- `DEFAULT_MAX_EVENT_DATA_SIZE` = 262144.
+
+**Open-inspector liveness.**
+
+- File: `packages/client/src/hooks/useSubagentResyncCadence.ts`.
+- Mounted detail view re-fires `subagent_resync_request` on backoff cadence.
+- Base 2000 ms, doubles per idle tick, ceiling 30000 ms, resets on entry growth.
+- ONE timer per subagent → inline inspector + popout do not double-fire.
+- No `emptyTimeline` precondition on this trigger (open-time trigger keeps it).
+
+**Requester-scoped delivery.**
+
+- Request carries `requestId`.
+- Bridge echoes it on reply as `__resyncRequestId`.
+- Server routes reply to that one connection (`packages/server/src/pairing/subagent-resync-routing.ts`, `ResyncRequesterRegistry`, TTL 30000 ms).
+- Unknown/expired token falls back to normal broadcast.
+
+**Counters.**
+
+- `storeTrim.subagentTicks` / `subagentTickBytes` / `subagentFatTicks` / `subagentTickFatBytes` on `/api/health` (additive).
+- Bridge `SubagentFrameStats.resyncCadence` counts pull-loop requests.
+
+**Rollback. PARTIAL, not total.**
+
+- One flag: `PI_DASHBOARD_SUBAGENT_STRIP=0` forwards unstripped.
+- Flag disables STRIPPING ONLY.
+- Wire payload returns to pre-change shape: intermediate ticks fat again.
+- These stay ACTIVE under the flag: `locateSubagentTimeline` `subagent_*` gate.
+- Stay active: resync cadence in `useSubagentResyncCadence.ts`.
+- Stay active: requester-scoped routing (`requestId` / `__resyncRequestId`).
+- Stay active: additive `storeTrim` subagent-tick counters.
+- Each of those is additive or a bug fix. None depends on the strip.
+- No producer, protocol, or store rollback exists to do.
+
+**Known regression, stated deliberately.**
+
+- Run dying with NO terminal frame (crash/kill) leaves only thin ticks in store.
+- Recovery needs a LIVE bridge with agent still in the 64-slot `SubagentFrameBuffer`.
+- Evicted or post-reset agents answer `resyncNoop`.
+- Client keeps its last rendered state.
+
+### Retry Lifecycle (change: retry-forever-with-stop-control)
+
+Pi owns the retry loop. Dashboard configures + observes + renders it. Attempts fire sequentially; each produces ONE complete `agent_start` … `agent_end` event cycle. Final attempt produces ONE `agent_settled` event terminal marker.
+
+**1. Retry ownership & settings.**
+
+- Pi `RetrySettings` = `{ enabled, maxRetries, baseDelayMs, provider: {timeoutMs, maxRetries, maxRetryDelayMs} }`.
+- Session-layer delay = `baseDelayMs * 2^(attempt-1)`. Uncapped. No ceiling.
+- `retry.maxDelayMs` REMOVED from session layer. pi migrates to `retry.provider.maxRetryDelayMs` (different layer, different semantics).
+- Overshoot consequence: next attempt lands ~2x elapsed. Scale-invariant. Tuning `baseDelayMs` shifts which attempt lands where, never the ratio.
+- Dashboard runs NO retry loop. Raising `retry.maxRetries` is the whole "retry forever" mechanism.
+- `resume mode:"continue"` cannot re-drive live turn (refused `resume.already_active`). For ended session resolves to `pi --session <file>` which reopens IDLE + drives no turn. No re-drive mechanism exists — none needed, since pi never settles turn while budget remains.
+
+**2. Bridge observation model** (`packages/extension/src/retry-tracker.ts`).
+
+- pi fires ONE FULL `agent_start` … `agent_end` cycle PER ATTEMPT. Exactly one `agent_settled` after final `agent_end`.
+- Old model keyed on "error `message_end` then fresh assistant `message_start` in same turn". Never matched. Emitted ZERO events. Retry surface was dead in production.
+- New rules: error `message_end` records pending error text → emits nothing. Error `agent_end` = attempt over + another coming → emits `auto_retry_start` + `auto_retry_waiting` (carries `attempt`, `delayMs`, `nextAttemptAt`), does NOT clear chain. `agent_settled` = SOLE terminal → emits `auto_retry_end`, clears chain.
+- Waiting signal suppressed once `attempt >= maxAttempts`.
+- `agent_settled` carries NO `messages` (verified pi 0.81.1/0.83), so tracker remembers terminal disposition via `lastEndWasError` at `agent_end`.
+- `-1` sentinels REMOVED. `maxAttempts` / `delayMs` sourced read-only from pi settings via `packages/extension/src/pi-retry-settings.ts` (defaults 3 / 2000; unreadable → `delayMs: 0` → surface renders elapsed-only).
+- pi 0.83 exposes retry lifecycle events to RPC/SDK consumers ONLY. ExtensionAPI has no `auto_retry_*` and nothing on EventBus. `willRetry` in 0.83 is compaction-only (`session_before_compact`/`session_compact`). Bridge is extension → must observe-synthesize.
+
+**3. Settings write + reload-on-save** (`packages/server/src/pi-agent-settings.ts`).
+
+- Reads/writes all SIX native fields: `retry.{enabled,maxRetries,baseDelayMs}` + `retry.provider.{timeoutMs,maxRetries,maxRetryDelayMs}` in GLOBAL `~/.pi/agent/settings.json`. Blank `provider.timeoutMs` OMITTED on write (never `0`/`null`).
+- Write is MERGE-PRESERVING: every other key survives, including `retry.provider.*`.
+- Project `<cwd>/.pi/settings.json` NEVER written.
+- Distinct from `config-api.ts`, which writes dashboard's own `~/.pi/dashboard/config.json`.
+- Validation: `maxRetries` non-negative integer; `baseDelayMs` positive integer. Invalid → nothing written.
+- No UI cap on `maxRetries`; long tail WARNED, never capped.
+- REST: `GET/PUT /api/pi-retry` (`packages/server/src/routes/pi-retry-routes.ts`), auth-gated by same network guard as `/api/config`.
+- pi reads settings only at session construction. Write alone inert for running sessions.
+- On successful save server routes every target through `dispatchReload`.
+- Target set = `reloadTargetSessionIds` = `piGateway.getConnectedSessionIds()` ∪ `headlessPidRegistry.listSessions()`.
+- Connected-only set missed headless sessions with dead bridge WS. See change: fix-out-of-band-reload.
+- Failed write reloads nothing.
+- **UI placement + save.** Editor renders on Settings **Sessions** tab (NOT Providers). Reason: 3 fields (`enabled`, `maxRetries`, `baseDelayMs`) turn-level not provider-scoped; observable effect on session (waiting / attempt n / countdown / Stop). Sibling turn-lifecycle settings co-located.
+- Enclosing section titled "Retry".
+- NO private Save button. Registers with panel unified-Save draft registry via `useSettingsDraftSource({id:"pi-retry", page:"sessions", isDirty, commit, reset})`. See change: unify-settings-save-contract.
+- Consequences: one Save commits every dirty store. Sessions nav shows per-page dirty dot. Leave guard offers Save / Discard / Cancel.
+- `commit` THROWS on invalid input or failed PUT → host `Promise.allSettled` keeps source dirty + names it in `settings.savePartialFail`. Never false success.
+- `reset` restores loaded policy (powers Discard).
+- Registered `page` MUST match mount tab or dirty dot lands on wrong nav item.
+- `retry.provider.*` fields surfaced in UI under subheading "Provider / SDK request controls". WARNING: wait routed through that layer emits no event and no callback → renders as ordinary streaming with no attempt count, no countdown. Invisible-wait fact true + reason warning exists.
+
+**4. Collapse-vs-dismiss rule** (`packages/client/src/components/session/SessionBanner.tsx`).
+
+- While retry pending, dismiss DEGRADES TO COLLAPSE. Never clears state.
+- Collapsed pill carries: error text, bare attempt number, countdown, Stop retrying, expand control.
+- State-clearing dismiss offered ONLY when no retry sub-status carried.
+- Collapse sticky PER FAILURE CHAIN: later attempts of same chain stay collapsed; new chain renders expanded.
+- Attempt rendered BARE ("attempt 7"), never "of N" — `maxRetries` user-set + typically large.
+- Countdown from `nextAttemptAt`, else computed `startedAt + delayMs`; degrades to "still waiting… (N s elapsed)" on overrun or when `delayMs` is 0.
+- "Stop retrying" aborts session → cancels pi's chain. Sole abort control in banner. Session Stop has identical effect, honored even while collapsed. Measured: abort during 16 s backoff terminated chain in 2 ms (`ctx.abort()` → `AgentSession.abort()` → `abortRetry()`).
+- NO Retry control on settled surface (would need missing re-drive mechanism).
+- Sidebar session card shows only amber working-token mark (no per-card countdown — avoids N timers in render-hot component).
 
 ### Interactive UI Flow (PromptBus — extension dialog → browser → response)
 1. Extension calls `ctx.ui.confirm()` / `select()` / `input()` / `editor()` / bridge-patched `multiselect()`
@@ -173,6 +403,31 @@ TypeScript type definitions shared across all components:
 **Resilience:**
 - **Page refresh**: Server replays pending `prompt_request` messages when a browser subscribes. Client deduplicates by `requestId` or pending title match.
 - **Bridge reconnect**: Bridge replays pending PromptBus requests on WebSocket reconnect so dashboard dialogs survive server restarts.
+
+### Notify Flow (`ctx.ui.notify` → browser, split from prompt_request)
+
+Change: `split-notify-from-prompt-request`. `ctx.ui.notify` used to ship over `prompt_request`. Every consumer treated it as an unanswered ask → `trackPromptRequest` → `currentTool="ask_user"` re-armed on every quiescent moment → permanent "Needs you", false unread, `questionFirst` reorder, and a session the embed-lifecycle reaper could never reclaim. Now a dedicated `notify` message type end to end.
+
+**Protocol:**
+- `NotifyMessage` in `packages/shared/src/protocol.ts` (`ExtensionToServerMessage`): `{ type: "notify", sessionId, notifyId, message, level? }`. No `promptId`, no `component`, no `placement`.
+- `BrowserNotifyMessage` in `packages/shared/src/browser-protocol.ts` (`ServerToBrowserMessage`), same shape.
+- `NotifyLevel` = `"info" | "success" | "warning" | "error"` in `packages/shared/src/types.ts`. Normalized by `normalizeNotifyLevel` (`packages/shared/src/notify.ts`): unrecognized → `"info"`; omitted when caller passes none.
+
+**Bridge** (`packages/extension/src/notify-proxy.ts`): `createNotifyProxy` builds the `ctx.ui.notify` replacement `bridge.ts` installs. Calls pi's original notify, then sends the `notify` frame. Never PromptBus.
+
+**Server routing** (`packages/server/src/event-wiring.ts`): `msg.type === "notify"` branch = owner/`ended` guard → append to notify log → `sendToSubscribers`. No `trackPromptRequest`, no `currentTool` write, no unread stamp, no `questionFirst` reorder, no `session_updated` broadcast.
+
+**Permanent version-skew guard:** pre-split bridge publishes to npm independently of the server. The `prompt_request` branch early-outs on `prompt.type === "notify"` AFTER the owner/`ended` guard and BEFORE `trackPromptRequest`, via `fromLegacyPromptRequest(msg)` (`packages/server/src/pairing/notify-log.ts`). Reads `component.props.message`/`level`, falls back to `prompt.question`, normalizes level. Server owns the normalization, so a browser never receives the raw legacy frame and the client needs no legacy branch.
+
+**Notify log** (`packages/server/src/pairing/notify-log.ts`, wired in `packages/server/src/pairing/browser-gateway.ts`): bounded per-session, `NOTIFY_LOG_CAP = 50`, oldest-first eviction. Strictly separate from `pendingPromptRequests`: never feeds `hasPendingPromptRequests`, the reaper's `hasPendingAsk` union, or the `currentTool` fold. NOT cleared in `clearPendingRequestsForSession` — an ended session keeps its rows; reapability protected by exclusion, not deletion.
+
+**Durability:** a notify is not a `DashboardEvent`, so `event_replay` cannot restore it. `appendNotify` mirrors the log onto `DashboardSession.notifyLog`; `sessionToMeta` enumerates it (full-overwrite `.meta.json` save); `sessionFromMeta` restores it on cold start; `memory-session-manager.register()` carries it across a bridge reattach. `replayNotifyLog(ws, sessionId)` re-sends on browser subscribe, called at ALL FOUR sites in `packages/server/src/browser-handlers/subscription-handler.ts` right after `replayPendingUiRequests` (stale-lastSeq full replay, delta with events, delta without events, cold on-disk hydration). Deliberately a sibling function, not folded into `replayPendingUiRequests`. `hydrateNotifyLog(sessionId)` (`packages/server/src/pairing/browser-gateway.ts`) seeds the in-memory log from restored `DashboardSession.notifyLog`; called at the top of BOTH `replayNotifyLog` AND `appendNotify`. Reason: append onto an empty in-memory list mirrors back a one-row array via `sessionManager.update` — wipes persisted history before any browser saw it (restart + bridge-reattach path).
+
+**Client:** `addNotify` in `packages/client/src/lib/chat/event-reducer.ts` appends ONLY an `interactiveUi` row (`ui-<notifyId>`, content `notify`) to `messages`, never an `interactiveRequests` entry — transcript position is insertion order in `messages`. Dedup by `notifyId`, not message text, so a warm reconnect replay is idempotent. Handled in BOTH reducers: `packages/client/src/hooks/useMessageHandler.ts` (main app) and `packages/client/src/hooks/useSessionState.ts` (embed). `NotifyRenderer` still reached via the interactive-renderer registry (`["notify", NotifyRenderer]`).
+
+**Accepted skew:** old client + new server resolves on reload (client ships with the server). Old server + new bridge drops the notification for the skew window — no catch-all forward, no version handshake; accepted, bounded.
+
+See change: `split-notify-from-prompt-request`.
 
 ### Command Flow (browser → pi)
 1. User types prompt or command in browser
@@ -258,7 +513,7 @@ Key properties:
 | extension → server → browser | `ui_data_list { sessionId, event, items }` | Row data for `table`/`grid` views. |
 | browser → server → extension | `ui_management { sessionId, action, event, params }` | Data fetch (`action: "list"`) or user action. |
 
-**Replay on reconnect:** Server caches `Session.uiModules` and `Session.uiDataMap` (per-event item cap = 1000, last-write-wins on overflow). The replay site is `replayUiState(ws, sessionId, ctx)` in `packages/server/src/browser-handlers/subscription-handler.ts`, called immediately after every existing `replayPendingUiRequests(ws, sessionId)` site (4 sites: stale-lastSeq full replay, delta replay, no-events path, lazy load from disk). Replay ordering: events → pending UI requests → UI module state.
+**Replay on reconnect:** Server caches `Session.uiModules` and `Session.uiDataMap` (per-event item cap = 1000, last-write-wins on overflow). The replay site is `replayUiState(ws, sessionId, ctx)` in `packages/server/src/browser-handlers/subscription-handler.ts`, called immediately after every `replayNotifyLog` site (4 sites: stale-lastSeq full replay, delta replay, no-events path, lazy load from disk). Replay ordering: events → pending UI requests → notify log → UI module state.
 
 **Phase-2 surface (shipped):**
 
@@ -317,7 +572,7 @@ sequenceDiagram
 
 **Relationship to existing capabilities:**
 - `interactive-ui-dialogs` / `ui-proxy` / PromptBus — handle one-shot `ctx.ui.*` dialogs (request/response, awaited). The extension-ui-system handles persistent push-based descriptors (no awaiting). Orthogonal mechanisms; both ship.
-- `extension-ui-forwarding` (catch-all `pi.events.emit` forwarding) — kept for arbitrary extension events; the new system is the *declarative* path for UI specifically.
+- `extension-ui-forwarding` (catch-all `pi.events.emit` forwarding) — kept for arbitrary extension events; the new system is the *declarative* path for UI specifically. Runtime behaviour stands. No authored spec — file removed (0-byte placeholder since initial commit). See change: repair-corrupted-main-specs.
 - pi-flows: in Phase 3 pi-flows itself adopts the system to surface registered workflows (breadcrumb), gates, and cards (agent-metric) for any flow-using extension automatically.
 
 **No-dashboard fallback:** When no bridge is connected, `ui:list-modules` is never emitted; extension listeners are dormant; slash commands fall back to existing text-output behavior. Extensions remain pi-runnable in pure-pi mode without code changes.
@@ -352,11 +607,12 @@ Descriptor-only slots (existing in `extension-ui-system`): `management-modal`, `
 
 `packages/dashboard-plugin-runtime/` is a new workspace package containing all runtime pieces:
 
-- **`src/slot-registry.ts`** — `createSlotRegistry()` returns a typed `Map<SlotId, ClaimEntry[]>` sorted by `(priority, pluginId)`. Filter helpers: `forSession`, `forFolder`, `forTab`, `forCommand`, `forToolName`.
-- **`src/manifest-validator.ts`** — hand-rolled manifest validator; throws `ManifestValidationError` with `pluginId` and `reason`.
+- **`src/slot-registry.ts`** — `createSlotRegistry()` returns a typed `Map<SlotId, ClaimEntry[]>` sorted by `(priority, pluginId)`. Filter helpers: `forSession`, `forSessionRendered`, `forFolder`, `forCommand`, `forToolName`, `forActionId`. Registry also exposes read-only `isPluginEnabled(id)`.
+- **`src/manifest-validator.ts`** — hand-rolled manifest validator; throws `ManifestValidationError` with `pluginId` and `reason`. Validates `shell-overlay-route` `presentation` is `"page"`|`"dialog"`; unknown value FATAL, not warn-and-default — typo like `"modal"` would silently restore the behaviour the author opted out of. See change: add-route-backed-overlay-dialogs.
 - **`src/plugin-context.tsx`** — `PluginContextProvider` wraps the entire app. A nested `CurrentPluginLayer` is pushed per contribution so `usePluginConfig<T>()` and `logger` resolve to the contributing plugin's id. `applyPluginConfigUpdate` updates the in-memory config store and re-renders subscribers.
-- **`src/slot-consumers.tsx`** — one component per slot id. Each wraps contributions in a `SlotErrorBoundary` (per-claim scope). Reads registry from the provider.
+- **`src/slot-consumers.tsx`** — one component per slot id. Each wraps contributions in a `SlotErrorBoundary` (per-claim scope). Reads registry from the provider. `ShellOverlayRouteSlot` renders matched claim body ONLY, inside `flex-1 min-h-0 relative` height wrapper. No dialog chrome, no container selection. `dialogContainer` prop + `OverlayContainerProps`/`OverlayContainerComponent` types removed. Container choice belongs to HOST (`App.tsx`): reads claim's effective `presentation` via exported `useShellOverlayRoutePresentation` hook (default `"dialog"`; `"page"` opts out → full viewport desktop + mobile), lifts dialog claim out of content region into `RouteBackedOverlay`. Seam could not work — underlay must cover VIEWPORT; wrapping from inside slot puts underlay inside content region. Hook returns string, avoids `client-utils` → `dashboard-plugin-runtime` dependency cycle. Rationale: design D2a (SUPERSEDED). See change: add-route-backed-overlay-dialogs.
 - **`src/slot-error-boundary.tsx`** — React error boundary scoped to one claim. Logs with plugin id and slot id; renders nothing for the failing claim without suppressing siblings.
+- **`src/__tests__/bundled-overlay-claims.test.ts`** — repo gate on BUNDLED `shell-overlay-route` claims: explicit `depth`; `depth: 2` requires `parentPath`; `parentPath` interpolable from claim path's own `:params`; claim nested under `/folder/:x` or `/session/:x` must NOT declare `depth: 1`. Third-party manifests keep runtime degradation to `/` as safety net. See change: add-route-backed-overlay-dialogs.
 - **`src/vite-plugin/index.ts`** — `viteDashboardPluginsPlugin` generates `packages/client/src/generated/plugin-registry.tsx` with named imports (tree-shaking). Watches manifests during dev and triggers HMR.
 - **`src/server/loader.ts`** — `discoverPlugins(repoRoot?)` (single module-level cache), `loadServerEntries(deps)` (per-plugin dynamic-import, failure isolated), `getPluginStatusStore()`.
 - **`src/server/server-context.ts`** — `createServerPluginContext(deps, pluginId)` — namespaced logger, typed config accessors.
@@ -382,10 +638,12 @@ Descriptor-only slots (existing in `extension-ui-system`): `management-modal`, `
 
 #### Health endpoint observability
 
-`/api/health` exposes three additive measurement fields (no behavior change). Existing clients ignore unknown fields. See change: instrument-session-hydration-timing.
+`/api/health` exposes five additive measurement fields (no behavior change). Existing clients ignore unknown fields. See change: instrument-session-hydration-timing.
 - `eventLoopDelay: { meanMs, p99Ms, maxMs }` — `perf_hooks.monitorEventLoopDelay` histogram, ns→ms. Resets window each read.
 - `hydration: HydrationSample[]` — ring buffer, ≤20 newest-first samples. Process-local, no persistence. Sample `{ sessionId, wallMs, fileBytes, entryCount, eventCount, at }` recorded by `loadSessionEvents`.
 - `eventLoopSpikes: { at, ms, turn }[]` — ring buffer, ≤50 newest-first, process-local, additive. Retains worst-case event-loop stalls. Two feeds: dedicated `monitorEventLoopDelay` sampler (own instance, never the boot histogram `/api/health` resets → no reset race; records `turn: null` for stalls no poll turn owns) + per-turn self-records from the openspec poll path (`turn: "tickOpen" \| "dirPollPre" \| "dirPollPost"`). Sub-threshold ~700 ms stall retained even when nobody polls `/api/health`. See change: attribute-openspec-poll-eventloop-stalls.
+- `notifyLog: { evictedEntries, bySession }` — from `browserGateway.getNotifyLogStats()` (`packages/server/src/pairing/notify-log.ts` `getStats()`). `evictedEntries` = total cap-50 evictions; `bySession` = per-session counts. Cap-50 eviction = silent transcript loss → counted beside `droppedFrames` / `storeTrim`. See change: split-notify-from-prompt-request.
+- `storeTrim: { trimmedEvents: { total, toolExecutionEnd, bySession }, evictedSessions, collapsedUpdates }` — from `eventStore.getTrimStats()` (`packages/server/src/persistence/memory-event-store.ts`). `trimmedEvents` + `evictedSessions` pre-existing: per-session cap trims, whole-session LRU evictions. See change: instrument-event-store-trim. NEW `collapsedUpdates`: cumulative count of superseded `tool_execution_update` events dropped at retention. Collapse keeps ≤2 `tool_execution_update` per `toolCallId`: pinned creating tick (first-wins `type`/`description`) + newest tail. Retention-only — never suppresses live broadcast; browser still receives every tick. Predecessor dropped only when successor subsumes it (superset gate on `partialResult.details`). Counters cumulative for process lifetime, never reset on read. No event store wired → `EMPTY_TRIM_STATS` (all-zero), exported from store. Harness A/B (4 sessions × 4 sustained subagent rounds): retained `tool_execution_update` per buffer 36 → 2; buffer share 18.4% → 1.2%. See change: collapse-superseded-tool-execution-updates.
 
 **Bundled-by-default plugins:** The plugin loader treats all plugins identically (same manifest, same discovery, same `enabled` flag, same failure isolation). What distinguishes "bundled-by-default" plugins (initial set: `git-plugin`) is purely operational — the build pipeline always includes them in `packages/`. Their absence is a deliberate user opt-out, not a normal state. OpenSpec, Flows, and Subagents plugins are bundled in standard builds but their absence is a normal use case (e.g. a workspace without OpenSpec).
 
@@ -445,19 +703,63 @@ Settings ▸ Plugins tab lists every discovered plugin (enabled or not) with dis
 
 **Toggle workflow.** `PluginsSection` calls `POST /api/plugins/:id/toggle` (`packages/server/src/routes/plugin-activation-routes.ts`). Route writes `plugins.<id>.enabled` via config-api partial merge, broadcasts `plugin_config_update { id, config }` to every browser. Effect is **restart-required**: runtime claim filter (`SlotRegistry.setEnabledSet`) only re-reads enabled-set when client mounts or receives `plugin-config-update` event for the bundle's current plugin set; flipping `enabled` for a plugin whose server entry already loaded doesn't unload it. UI surfaces restart-required banner by comparing toggle timestamp to `/api/health.startedAt`.
 
-**Declarative requirements.** Plugins declare `requires: { piExtensions?, binaries?, services? }` in their manifest (`PluginManifest.requires`, validated by `manifest-validator.ts`). At plugin load, `loader.ts` runs `runRequirementProbes(manifest.requires, requirementDeps)` from `packages/dashboard-plugin-runtime/src/server/requirement-probes.ts`. Probes:
+**Declarative requirements.** Plugins declare `requires: { piExtensions?, binaries?, services?, paths? }` in their manifest (`PluginManifest.requires`, validated by `manifest-validator.ts`). At plugin load, `loader.ts` runs `runRequirementProbes(manifest.requires, requirementDeps)` from `packages/dashboard-plugin-runtime/src/server/requirement-probes.ts`. Probes:
 
 - `probePiExtension(id)` cross-refs installed pi-extension set (deps.listInstalled).
 - `probeBinary(name)` resolves via tool registry.
 - `probeService(name)` dispatches to service-probe map (e.g. `service-probes/pi-model-proxy.ts::detectPiModelProxy`).
+- `probePath(rawPath, deps)` — existence check on absolute path. Never executes, never shells.
 
 Results populate `PluginStatus.requirements` + flat `missingRequirements: string[]`; surfaced via `GET /api/plugins`. 30s in-process cache keyed by category+name. `server.ts` invokes `refreshRequirementProbesFor(pluginIds)` on every successful `package_operation_complete` + broadcasts `plugin_config_update` for any plugin whose missing-set changed — install/uninstall of a pi-extension lights up dependent plugin without restart.
+
+**Path requirements (`paths`).** Fourth category, after `piExtensions`/`binaries`/`services`. Declared `PluginRequirements.paths?: string[]` in `packages/shared/src/dashboard-plugin/manifest-types.ts` — absolute filesystem paths that must exist (e.g. `.app`-bundled binaries not on PATH). Report field `PluginRequirementReport.paths: {name,satisfied}[]` (`packages/shared/src/dashboard-plugin/plugin-status.ts`) always present, `[]` when none declared.
+
+`probePath(rawPath, deps)` (`packages/dashboard-plugin-runtime/src/server/requirement-probes.ts`) = existence check only (fs.existsSync-class). Never executes path, never shells. A `paths` entry MAY be exactly one `${configKey}` placeholder (regex `^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$`). Resolved from declaring plugin's validated config — schema defaults applied, config read not shell expansion. Key must exist in `configSchema`; resolved value must be absolute. Failure → `satisfied: false`, never throws.
+
+Wiring: `runRequirementProbesFor` probes `paths` after `services` — preserves category ordering. `missingFromReport` appends unsatisfied paths last. Paths share existing 30s TTL cache.
+
+Reconciliation: `shouldReconcilePath` (`packages/apple-tools/src/reconcile.ts`) writes discovered non-default path back to `imcpServerPath` via `updatePluginConfig` — only when config unset/empty or at schema default. Never overwrites explicit operator override. Runs in plugin server (owns store), not CLI.
+
+Client: unsatisfied `paths` requirement renders non-actionable warning pill — no [Install] — in `packages/client/src/components/packages/PluginsSection.tsx` (data-testid `missing-path-<name>`).
 
 **UI cross-references.** `RecommendedExtensions.tsx` reads `EnrichedRecommendedExtension.dashboardPluginInstalled` (computed server-side in `recommended-routes.ts::enrichEntry` from `RecommendedExtension.dashboardPlugin`) + renders `+plugin: <id>` badge linking to Plugins tab.
 
 **Restart-required model.** `usePluginEnabledSet` snapshots `/api/health.startedAt` ISO timestamp on first load. Subsequent `plugin_config_update` events update enabled-set live for claim filtering, but components that consumed plugin server entries (already loaded) require a restart to drop. `PluginsSection` compares toggle time to snapshot and renders "Restart required" banner when divergent.
 
-**Settings consolidation.** Plugin-contributed `settings-section` claims render only under owning plugin row in Settings ▸ Plugins. Legacy `claim.tab` manifest field preserved for back-compat manifests; `SettingsPanel` no longer consumes it. See change: add-plugin-activation-ui (settings-consolidation).
+**Settings consolidation.** Plugin-contributed `settings-section` claims render on owning plugin's dedicated left-nav page `/settings/plugins/<id>` — contract in `#### Plugin settings pages` below. Legacy `claim.tab` manifest field preserved for back-compat manifests but inert; `SettingsPanel` no longer consumes it. See change: add-plugin-activation-ui (settings-consolidation).
+
+#### Plugin settings pages (`plugin-settings-pages`)
+
+Plugin-contributed `settings-section` claims render on owning plugin's dedicated page `/settings/plugins/<id>`. One render path only: `SettingsSectionByPluginSlot` inside `PluginSettingsPage.tsx`. See change: plugin-settings-pages.
+
+**Slot contract.**
+
+- `SettingsSectionByPluginSlot` = only consumer. Consumes BOTH refs claims AND intent broadcasts (`useSlotIntents("settings-section", null)`).
+- Order: claims first, registry comparator (ascending `priority`, tie-break `pluginId.localeCompare`); then intents in store order. `IntentNode` carries no priority.
+- `SettingsSectionSlot` inert — returns `null` for any `tab`. `SettingsPanel.tsx` mounts zero of them; repo-lint enforces in `packages/shared/src/__tests__/plugin-activation-contracts.test.ts`. `forTab` deleted from `slot-registry.ts`.
+- `claim.tab` accepted by manifest but INERT. `manifest-validator.ts` no longer throws on unknown `tab`.
+
+**Page chrome — host-owned, no opt-out.** `PluginSettingsPage.tsx` renders identity, status pill, enable toggle, metadata chips, error + missing-requirement banners. Plugin supplies body only. Chrome renders only fields `GET /api/plugins` returns (`PluginRow`): no `version`/`description`/`source`/`icon`.
+
+**Routes.** `/settings/:page?/:sub?` at BOTH `App.tsx` and `SettingsPanel.tsx`. `:sub` interpreted only when `:page === "plugins"` (design D2). `VALID_SETTINGS_TABS` unchanged. Unknown id or settings-less plugin → activation index + not-found notice.
+
+Folder-scoped `/folder/:encodedCwd/settings/:page?` unchanged; `VALID_FOLDER_SETTINGS_PAGES` excludes `plugins`.
+
+**Settings eligibility.** Plugin contributes settings = registers `settings-section` refs claim OR holds `settings-section` intent in intent store. One predicate governs all three: nav-rail child membership, activation-index cog affordance, route eligibility for `/settings/plugins/<id>`. `PluginRow.claims` built from manifest only (`plugin-activation-routes.ts`) — intents invisible. Claims-only test strands intent-only plugin: slot renders contribution, nav child absent, URL bounces to activation index. Implementation: `contributesSettings()` in `packages/client/src/components/settings/SettingsPanel.tsx`; passed to `PluginsSection` — all three sites share it.
+
+**Nav rail children.** Plugins where `enabled !== false` AND contributes settings (claim OR intent), sorted by display name, each with health dot. Keys on `enabled`, NOT `loaded` — failed-load plugin must stay reachable (design D4).
+
+**Disabled plugin page.** Chrome + disabled notice + re-enable affordance. No body; component never mounts. Intent filtering happens in consumer, not registry: `SettingsSectionByPluginSlot` calls `isPluginEnabled(pluginId)` and drops plugin's intent when it returns false. `SlotRegistry.isPluginEnabled(id)` = read-only accessor — `true` before any `setEnabledSet` call, else set membership. Added because registry previously exposed `setEnabledSet` with no getter. Registry's own filter (inside `getClaims`) covers claims only — exactly why consumer must filter intents itself (design D6/D7/D8).
+
+**Enable state = desired state, not runtime.** `POST /api/plugins/:id/toggle` writes `config.plugins.<id>.enabled`, broadcasts `plugin_config_update`, returns `restartRequired: true`. `GET /api/plugins`.status + `GET /api/health`.plugins[] both come from `getPluginStatusStore()` — runtime load state captured at server boot — neither reflects flip until restart. `usePluginList` (`packages/client/src/hooks/usePluginToggle.tsx`) keeps desired-state overlay: seeded from `GET /api/config`.plugins on mount (survives reload), updated from `plugin_config_update` payload + toggle response cascade. `status.loaded` untouched — stays runtime truth, explained by restart-required banner.
+
+**Save stays global, one fan-out.** `SettingsDraftSource.page` now OPTIONAL. `PluginSettingsPageProvider` supplies owning plugin id; `useSettingsDraftSource` rewrites `page` → `plugins/<pluginId>` BEFORE `registry.upsert`. Rewrite lives in hook, not registry — `draftRegistry` memoized in `SettingsPanel` scope, above plugin page; ancestor closure cannot read descendant's context.
+
+**Save Bar.** Names every dirty page, no cap; plugin pages labelled `Plugins › <Display Name>`; each entry navigates. Header carries changed-page count badge.
+
+**Nav guards.** Rail navigation guards ONLY when leaving plugin page whose own sources dirty — plugin draft state dies on unmount. Built-in→built-in unguarded — built-in draft state lives in `SettingsPanel`'s `useState`.
+
+**Disable-on-dirty.** Disabling plugin from its own dirty page resolves unsaved-changes confirm BEFORE rail drops nav child.
 
 #### Plugin bridge↔server channel (generic)
 
@@ -494,10 +796,49 @@ Automation plugin = `packages/automation-plugin/`. Schedule-triggered background
 - Folder format `<scope>/.pi/automation/<name>/automation.yaml` (+`prompt.md` for prompt action). Dual scope: per-folder + global (`~/.pi/automation/`).
 - Central server-owned scheduler arms trigger registry. Phase-1 trigger kind `schedule` (5-field cron).
 - Fired run spawns pi session stamped `kind="automation"` via `ServerPluginContext.spawnSession` hook (gated priority<=100).
-- Board hides run unless effective visibility `shown`. Run always watchable in Automation view (`/automation/run/:sid`).
+- Board hides run unless effective visibility `shown`. Run always watchable in Automation view (`/folder/:encodedCwd/automations/run/:sid`).
+- Old path `/automation/run/:sid` declared `parentPath` `/folder/:encodedCwd/automations` but never captured `:encodedCwd`. `interpolateParentPath` returned null; back degraded to `/`.
+- New path carries board cwd. Cold-load back resolves to owning board.
+- See change: add-route-backed-overlay-dialogs.
 - Run results `runs/<date>-<name>/result.md`. Auto-archive empty. Keep-100 retention.
 - UI via shell slots: sidebar-folder-section, command-route `/automation`, shell-overlay-route, session-card-badge, settings-section general.
 - See change: add-automation-plugin.
+
+### Plugin Spawn Capability Scope (`add-plugin-spawn-scope`)
+
+- `ServerPluginContext.spawnSession(opts: PluginSpawnOptions)` gains optional `scope` block.
+- `scope` constrains spawned session tool/skill/extension surface.
+- First-party trusted plugins only (priority <= 100).
+- `scope.tools` (string[]) → `--tools a,b,c` (comma-joined single arg).
+- `scope.excludeTools` (string[]) → `--exclude-tools a,b,c` (comma-joined single arg).
+- `scope.noBuiltinTools`, `scope.noTools`, `scope.noSkills` (bool) → bare flags.
+- `scope.skills` (string[]) → repeatable `--skill <path>`.
+- `scope.extensions` (string[]) → repeatable `-e <path>`.
+- NO `noExtensions` toggle. Bridge (control channel) must survive. Disabling extension discovery stops dashboard bridge loading → session uncontrollable. (design D2/D6)
+- `scope.extensions` ADDITIVE allowlist. Discovery still runs, bridge loads.
+- `extensionConfig[name][key]` projects to namespaced env `PI_EXT_<NAME>_<KEY>=value` (NOT argv).
+- Name+key uppercased, non-`[A-Z0-9_]` → `_`.
+- Headless mechanism only (plugin spawns headless-only).
+- `extensionConfig` values now `string | string[]`. Scalar env verbatim. Array → `JSON.stringify`. (D8)
+- env NAME normalization splits camelCase first. `allowedRoots` → `ALLOWED_ROOTS`. Then uppercase. Then non-`[A-Z0-9_]` → `_`.
+- Mapper `pluginSpawnToSessionOptions(opts): MappedSpawnOptions` in `packages/dashboard-plugin-runtime/src/server/server-context.ts`.
+- Total + pure. NEVER throws (plugin input untrusted JS).
+- Flattens `scope` → flat `SessionFlags` argv fields + `extensionConfig`.
+- Malformed containers treated absent.
+- Non-string/empty/NUL argv entries dropped.
+- NUL env values dropped.
+- Conflicting `noTools` + `tools` both forwarded. Pi arbitrates precedence. (D3)
+- Empty array ⇒ no flag emitted.
+- `scope` absent ⇒ argv + env byte-identical to pre-change.
+- Host hook (`packages/server/src/server.ts`) calls mapper BEFORE `pendingAutomationRunRegistry.enqueue`.
+- Rejected input cannot strand stale `cwd`-keyed stamp. (D7)
+- Consumers (automation-plugin, flows, REST spawn) do NOT populate `scope` yet. Future opt-in. Plumbing only.
+- Part B: host-cwd-policy registry. `CwdPolicyRegistry` + pure `mergeCwdPolicy` in `packages/server/src/spawn-process/cwd-policy.ts`.
+- cwd-keyed. Tighten-only. Composed across ancestors. Merged into every `spawnPiSession`.
+- `registerCwdPolicy`/`unregisterCwdPolicy` on plugin ctx. Trust-gated.
+- Registration requires CANONICAL containment (no lexical fallback — symlink-escape guard).
+- `resolve()` matches canonical-OR-lexical (fail-toward-applying).
+- See change: add-plugin-spawn-scope.
 
 ### Hermes Memory Settings Plugin (`add-hermes-memory-settings-plugin`)
 
@@ -512,6 +853,76 @@ New package `packages/hermes-memory-plugin` (client + server + shared). Settings
 - `requires.piExtensions: ["pi-hermes-memory"]` — section + routes active only when extension installed.
 - Runtime caveat: hermes reads config once at extension load → edits apply to newly started sessions only ("applies to new sessions" notice in the UI), not running ones.
 - Structured logging: path + field count on read/write success, failure reason on error, NEVER field values (config may hold model/provider hints).
+
+### MCP Endpoint (`add-dashboard-mcp-server`)
+
+New plugin `packages/mcp-server-plugin/`. Headless — no client entry, `claims: []`. Mounts `POST /mcp` on `ctx.fastify`, the shared Fastify instance every plugin gets. Seven other plugins register routes the same way.
+
+**Protocol.** Implements MCP revision `2026-07-28` ONLY. No legacy `2025-06-18` / `2025-11-25`. Both reintroduce `initialize` + `Mcp-Session-Id`, the two mechanisms this endpoint exists to refuse. Unsupported version → `UnsupportedProtocolVersionError`. Stateless: no `initialize` handshake. No `Mcp-Session-Id` (never minted, never echoed, ignored on input). No `Last-Event-ID` resumption.
+
+`MCP-Protocol-Version` header required on EVERY POST. Must agree with `params._meta["io.modelcontextprotocol/protocolVersion"]`. Disagreement → `400 HeaderMismatch`. Check order observable:
+- absent header → `MissingHeader`
+- absent `_meta` → `MissingMeta`
+- non-string body version → `UnsupportedProtocolVersion`
+- only then judged supported
+
+**Method / error mapping.**
+- Unknown method → `404` + JSON-RPC `-32601`. Unknown tool → `404` + `-32601`.
+- Malformed body → `-32700` (unparseable) or `-32600` (valid JSON, not JSON-RPC).
+- Fastify body-parse failure normalised into JSON-RPC parse error.
+- Never `500`. Handler rejection → `-32603`, never an unhandled rejection.
+- Non-POST methods → `405` + `Allow: POST`.
+- Explicitly registered: GET, DELETE, PUT, PATCH, OPTIONS.
+- HEAD NOT registered. Fastify derives HEAD from GET. Returns same 405. Asserted in tests, not registered.
+- Reason: Fastify falls an unmatched method through to `setNotFoundHandler`. In `--dev`, that proxies Vite and returns 200 + SPA HTML. Conformance failure that looks like success.
+
+**Encapsulated scope.** Routes register inside a Fastify `register` scope, not on the shared instance. Load-bearing: `setErrorHandler` global on the instance called on. Call on `ctx.fastify` → replaces dashboard handler, breaks SPA fallback.
+
+**Auth boundary.** `createNetworkGuard` applied per-route. `/mcp` sits outside it, self-guards. Every request needs a bearer credential, INCLUDING loopback. No `isGenuinelyLocal` parameter exists. Handler reads `Authorization` directly, never `request.isAuthenticated` (global hooks set that for cookies + device tokens). Cookie-authenticated browser cannot reach `/mcp`.
+
+Two credential kinds resolve to one `McpCaller`:
+- session-scoped MCP tokens → `{ kind:"session", sessionId }`, has originating session
+- paired-device bearers → `{ kind:"device", deviceId }`, no originating session
+
+**Session tokens.** Opaque 256-bit. `mcp_` prefix. SHA-256 at rest. Plaintext returned once at mint. Constant-time compare. Flat-array scan, no membership-timing leak. No independent expiry — a token's lifetime IS its session's lifetime. IN-MEMORY only: no `mcp-tokens.json`. Registry dies with the plugin. All die on restart. Sessions re-mint when bridge re-registers. Revocation: `onSessionEnded` / bridge disconnect (primary), explicit `mcp/revoke-token`, process exit / plugin unload.
+
+**Minting.** `mcp/mint-token` over the session's own bridge WebSocket. Server attributes it to the session the CONNECTION registered as (`currentSessionId`), never `msg.sessionId`. `mcp/revoke-token` revokes by session.
+
+`plugin_pi_message.sessionId` a REQUIRED protocol field (`protocol.ts:593`), always present. `pi-gateway.ts` previously preferred it over the connection — a bridge could name any session and receive that session's credential. `plugin_pi_message` now excluded from body-sessionId precedence. Other message types keep prior behaviour.
+
+Guarantee stated exactly: "the session this connection registered as". Not spoofable per-message — what the self-target guard needs. NOT a claim about pi-gateway port authentication. `currentSessionId` itself set from the first `register` message. Pre-existing bridge trust model. Out of scope here.
+
+**Self-target guard.** Refuses a session-targeting tool call (`send_prompt`, `abort`) whose target equals the caller's own resolved session. Target normalised for equality (trim, one quote pair, lowercase) — bypass-proof. Catches DIRECT self-targeting only. Indirect A→B→A loop permitted, documented out of scope. Device callers have no originating session, structurally outside the guard.
+
+**Tool surface.** Curated allowlist over `ServerPluginContext`. 5 of 19 allowlisted (`sessionManager`, `sendToSession`, `spawnSession`, `abortSession`, `onEvent`), 14 denied. Partition total — future member fails `assertContextPartitionTotal`. Tools: `list_sessions`, `send_prompt`, `spawn_session`, `abort`. `abort` maps to `abortSession` (soft-only, false on a disconnected bridge), NOT `abortSpawnedRun`. `sessionId` an ordinary required argument (revision removed protocol sessions).
+
+**Streaming.** `subscriptions/listen`, a long-lived POST-response stream. `params.sessionIds[]` required; absent/empty/non-array → `-32602`. No subscribe-to-all. Filter applied per subscription before write. Authorisation re-checked per delivery. Revoked mid-stream → terminates it. Slow consumer → subscription TERMINATED at `MAX_BUFFERED_EVENTS` (1000) buffered events. Does NOT silently drop events. Subscription dies with its request.
+
+**Provisioning.** Writes `~/.pi/agent/mcp.json` key `pi-dashboard` on server start. HTTP `url` shape, not stdio `command` (iMCP writes `command`). `protocolVersion` pinned `2026-07-28` — never omitted, else legacy handshake. Merge-only. Atomic rename. Refuses unparseable file. Foreign shape under the reserved key → refuses the whole write, file untouched. Failure logged, never thrown — provisioning a convenience, not a precondition for serving `/mcp`.
+
+**Prerequisite.** `pi-mcp-adapter >= 2.20.0` for the local-pi path. Below that, "legacy remains the default", handshake silently degrades. Runtime probe reports floor + installed + failure mode (`absent` / `below-floor` / `unparseable`).
+
+**Config reference.** `MCP_BODY_LIMIT_BYTES` 1 MiB body cap. `MAX_BUFFERED_EVENTS` 1000 buffered events.
+
+```mermaid
+sequenceDiagram
+    participant C as MCP client
+    participant S as /mcp (encapsulated scope)
+    participant R as McpTokenRegistry
+    participant B as Bridge (session socket)
+    C->>S: POST /mcp (Authorization: Bearer, MCP-Protocol-Version)
+    S->>S: authenticate(header) → McpCaller
+    S->>S: resolveProtocolVersion(header, params._meta)
+    S->>S: dispatchRpc (method allowlist)
+    Note over S,R: session token kind
+    B->>S: mcp/mint-token (over session's own socket)
+    S->>R: mintForSession(sessionId from socket key)
+    R-->>B: plaintext token (once)
+```
+
+**Seam change.** `RegisterPiHandlerFn` widened to `(msg, sessionId)`. Gateway passes its socket key through `dispatchPluginPiMessage`. Additive — `(msg)`-only handlers still valid. `sessionId` from the socket key, never the message body — a plugin can attribute a bridge message as a trust decision.
+
+See change: add-dashboard-mcp-server.
 
 ### Bootstrap & First Run (R3, immutable bundle)
 
@@ -530,6 +941,38 @@ Compatibility skew helpers in `pi-version-skew.ts` (`readPiCompatibility`, `read
 Pre-R3 builds installed pi/openspec/tsx into `~/.pi-dashboard/node_modules/` at runtime. R3 leaves that directory untouched. `detectLegacyManagedDir({ homedir })` in `packages/shared/src/legacy-managed-dir.ts` returns `{present, path, pkgCount, sizeMb}`. Doctor surfaces a warning-severity row "Legacy install directory" with a `rm -rf <path>` suggestion. Server `cli.ts` logs the path once at startup after the `[bootstrap] ready` line. Repo-lint `no-managed-dir-reference.test.ts` blocks any new write into the legacy directory from `packages/electron/src/lib/`, `packages/server/src/`, or `packages/shared/src/` outside the explicit allowlist.
 
 See change: eliminate-electron-runtime-install.
+
+### Cold-Start Session Recovery (Exit Intent & Boot State)
+
+Offer sessions for recovery after server restart. Distinguish crashes (sessions lost) from deliberate exits (sessions live, will reattach). See change: fix-recovery-exit-intent.
+
+**Boot record.** File `~/.pi/dashboard/boot-state.json`. One O(1) write per exit, not per session (exit paths have ~100 ms and cannot walk sidecars). Shape: `{ bootId, exitIntent, at, ring: BootRecord[] }`. `bootId` = server `liveEpoch`. `ring` = 8 most recent prior boots (`BOOT_RING_SIZE`). Atomic write via `writeJsonFile` (tmp + rename). Owner: `packages/server/src/persistence/boot-state.ts`. Exports `stampBootStart(bootId)`, `recordExitIntent(intent)`, `resolveExitIntent(liveEpoch)`, `readBootState()`, `_resetBootStateForTests()`.
+
+**Exit intent vocabulary.** `packages/shared/src/boot-state.ts`. `ExitIntent = "restart" | "shutdown" | "user-quit" | "idle" | "signal" | "ephemeral"`. Null = crash (nothing recorded). Function `isRecoveryAllowed(intent)` returns false ONLY for `restart`, `shutdown`, and `ephemeral` — those exits leave sessions RUNNING and announce a bridge quiesce longer than the reattach grace window, so sessions reattach after any window that could retract them. `ephemeral` joins the recovery-suppressing set so a parent-death exit is not treated as a crash to recover from (change: fix-autostart-discovery-precedence). Other exits + null allow recovery via the liveness gate: offer session, retract if it re-registers inside the grace window.
+
+**Recording points.** `POST /api/restart` → `restart`. `POST /api/shutdown` → `shutdown`, or `user-quit` when request body is `{userQuit:true}` (Electron `stopServerIfNeeded` in `packages/electron/src/lib/server-lifecycle.ts` sends it). Idle timer → `server.stop()` → `idle`. New SIGTERM/SIGINT handler in `packages/server/src/cli.ts::runForeground()` → `signal` then `server.flush()` then `process.exit(0)`. Crash/SIGKILL records nothing → stays null. `recordExitIntent` is write-once per boot (first writer wins), so `spawnRestart`'s SIGTERM→SIGKILL ladder cannot overwrite `restart` with `signal`. Write failure logged, never thrown; unwritten intent = dirty boot = over-offer (conservative direction).
+
+**Classification.** `packages/server/src/server.ts` gains one conjunct: `isRecoveryAllowed(resolveExitIntent(session.liveEpoch))`. Resolution matches session's `liveEpoch` against current record then ring; unresolvable → null → allowed (back-compat: absent record behaves exactly like old build).
+
+**Behavior change.** `server.stop()` NO LONGER clears per-session `live` markers. Records `exitIntent:"idle"` instead. Marker consumption on dismiss / liveness-retract / offer-broadcast unchanged.
+
+**Timing constants.** `packages/shared/src/recovery-timing.ts`: `RESTART_QUIESCE_MS = 5000`, `RECONNECT_HEADROOM_MS = 2000`, `RECOVERY_REATTACH_GRACE_MS = RESTART_QUIESCE_MS + RECONNECT_HEADROOM_MS` (7000). Previously grace was 2500, closed BEFORE the quiesce window, made bridge-reattach liveness unreachable on restart path.
+
+**Offer broadcast timing.** `ask` mode NO LONGER broadcasts offer immediately. Deferred until grace window closes, then sent once with only surviving candidates. `graceUntil` still on wire for mid-window client connect.
+
+**Resume gate.** `resume_session` `mode:"continue"` probes keeper sidecar: `KeeperManager.isKeeperAlive(sessionId)` reads `<sid>.rpc.sock.pid`, checks keeper PID + pi PID. Refuses with `code:"resume.already_active"` when alive, so stale offer never double-spawns one sessionId.
+
+**Observability.** Logs: `[recovery] <id>: suppressed-by-intent (boot <epoch> exited via <intent>)`, `[recovery] N candidate(s) after exit-intent gate; awaiting liveness`, `[recovery] grace window closed; offering N candidate(s)`, `[recovery] retracted candidate <id> (<reason>)`, `[recovery] refused reopen of <id>: keeper still alive`, `[boot-state] exit intent recorded: <intent> (boot <id>)`.
+
+### Ephemeral Server Lifecycle (change: fix-autostart-discovery-precedence)
+
+A server started with `--ephemeral` exists only to serve the pi agent that booted it. When that boot parent dies, the server exits and reclaims its ports + memory instead of leaking them. Target: isolated-verification instances. Standalone + Electron-hosted servers excluded by construction — nothing passes the flag for them.
+
+- **Opt-in: flag ONLY.** `--ephemeral` in `packages/server/src/cli.ts` (`parseArgs` → `buildConfig` → `config.ephemeral`). NO env var; never inferred from temp `HOME`, bind address, or port. An inherited `PI_DASHBOARD_EPHEMERAL=1` in a shell would make a real standalone dashboard exit when that shell dies.
+- **Watch** — `packages/server/src/lifecycle/ephemeral-parent-watch.ts`. Independent, unconditional 5 s interval (fixed `DEFAULT_INTERVAL_MS` 5000, overridable only via the `intervalMs` dep seam); armed only when ephemeral. Idle timer CANNOT host the check — its `start()` early-returns when `config.autoShutdown` is false (the default, the exact isolated-verification config) and it terminates via raw `process.exit(0)` (the undrained-exit path this design forbids). Interval cadence IS the exit-latency bound.
+- **Kill-decision liveness** — `isBootParentProvablyDead` (`packages/server/src/lifecycle/boot-parent-liveness.ts`). Dead ONLY on ESRCH (Tier-1 signal-0 probe) or Windows Tier-2 signalled-exit (reuse-immune koffi handle, authoritative where it exists). `EPERM` + any other errno = ALIVE (parent alive but owned by another user / hardened). Alive-biased: reads-alive → occasionally fails to exit, never a false exit.
+- **Exit path** — proven-dead parent → `server.stop({ exitIntent: "ephemeral" })` (`server.ts` wiring), fired exactly once. Graceful drain (`shutdownHeadlessProcesses` reaps spawned pi, `recordExitIntent`, flush, tunnel teardown). Never `process.exit`.
+- **Health field** — `/api/health` exposes `ephemeral` (boolean, `config.ephemeral === true`) via `packages/server/src/routes/system-routes.ts`.
 
 ### Force Kill Escalation
 The Stop button supports two-click escalation for stuck sessions:
@@ -602,6 +1045,112 @@ Failure modes (placeholders are visible, not silent):
 
 See change: `chat-markdown-local-images-and-math`.
 
+### User image attachments — two-phase display fit
+
+Distinct path from local-image inlining above.
+That feature rides existing event/asset stream.
+Adds no HTTP route.
+This one adds `GET /api/sessions/:sessionId/attachments/:attachmentId`.
+Same `{type:"image"}` events.
+Different handling.
+
+**Problem.** pi delivers pasted screenshots as full-resolution base64 inside the event. Shape: `{type:"image", data, mimeType}`. `memory-event-store.ts` bounds each event by total serialized size. Over-ceiling event data replaced by `{__truncated}` placeholder. Result: image-bearing user message lost `data.message` entirely. Row never rendered. Silent. Measured size distribution n=1587 over 3137 transcripts: p50 125.7 KB, p90 757.3 KB, p99 2233.3 KB, max 10.5 MB.
+
+**Design.** Fit each image block to a DISPLAY derivative before store.
+768 px long edge.
+JPEG q75 when re-encoding.
+`DEFAULT_MAX_EVENT_DATA_SIZE` raised 20_000 -> 262_144 (256 KiB).
+Raise sound only WITH the fit.
+Raw payloads at 256 KiB cover just 74.9%.
+Fitted output bounded.
+`DEFAULT_TRANSCRIPT_CAP_BYTES` derives 0.75 x ceiling.
+Moves 15 KB -> 192 KiB (D9, accepted, coupling kept).
+
+**Two-phase flow** (key data-flow fact):
+
+```mermaid
+sequenceDiagram
+    participant pi as pi (agent)
+    participant bridge as Bridge (extension)
+    participant server as Dashboard server
+    participant fit as Fit worker pool
+    participant client as Browser (event-reducer)
+
+    pi->>bridge: pasted screenshot<br/>{type:"image", data: base64, mimeType}
+    bridge->>server: event_forward (image event)
+    server->>server: prepareEventForIngest()<br/>(attachment-ingest.ts) strips image bytes
+    server->>server: placeholder block<br/>{data:"", attachmentId, attachmentState:"pending"}<br/>attachmentId = sha256(original base64)
+    server->>client: row event stored + broadcast IMMEDIATELY
+    server->>fit: fit-worker-pool.ts fits off main loop<br/>(768px long edge, JPEG q75)
+    fit-->>server: fitted derivative
+    server->>client: SEPARATE stored+broadcast attachment_fitted<br/>{attachmentId, data, mimeType, state:"ready"|"failed"}
+    client->>client: event-reducer.ts patches pending block by attachmentId
+    client->>client: user clicks image → lightbox (fitted derivative as fallbackSrc)
+    client->>server: GET /api/sessions/:sessionId/attachments/:attachmentId<br/>(original bytes, zoom view)
+```
+
+- Phase 1: `prepareEventForIngest()` (`packages/server/src/attachments/attachment-ingest.ts`) strips image bytes, leaves placeholder block `{data:"", attachmentId, attachmentState:"pending"}`. Row event stored + broadcast IMMEDIATELY.
+- Phase 2: `fit-worker-pool.ts` fits off the main loop. `attachment-resolver.ts` emits a SEPARATE stored+broadcast event `attachment_fitted` with `{attachmentId, data, mimeType, state:"ready"|"failed"}`.
+- In-process fallback (workers disabled/unspawnable) capped at pool `size`. Unbounded fallback ran N concurrent jimp decodes on the MAIN thread. Exact event-loop stall the pool exists to prevent.
+- Client reducer (`event-reducer.ts`) patches the pending block by `attachmentId`.
+- `attachmentId` = sha256 of the ORIGINAL base64. Content-addressed.
+- Addressed by hash NOT by seq: client live fold is append-only and never sees a seq; replay can reorder; hash is also the originals-endpoint key.
+- One resolution patches EVERY occurrence of that hash (same screenshot pasted twice shares one id).
+- BOTH ingest paths fit: live `event-wiring.ts` AND session hydration in `subscription-handler.ts`. Hydration rebuilds events from the transcript with full-resolution bytes, so skipping it would re-trigger the original bug on reload.
+
+**User image attachments.** `prepareEventForIngest()` replaces image payloads with pending placeholders when fitting runs; `attachment_fitted` patches them later. Without a fit worker, under-ceiling image blocks may remain. `event-reducer.ts` derives `imageCount` and retained images from user message blocks. `ChatView` renders the localized attachment-count notice and fitted thumbnails/lightbox. User prompt retry preserves image data.
+
+**MIME admission.** `image-mime.ts` (`packages/server/src/attachments/image-mime.ts`) single source of truth for which inline image mimes the pipeline takes OWNERSHIP of. Exports `isFittableImageMime(mime)`. Two gates consume it, MUST agree: `prepareEventForIngest` (what to strip into pending) + `fitImageBlockForDisplay` (what it can fit). They diverged once. Ingest stripped ANY image block. Fit returned non-allow-listed mime UNCHANGED. Resolution event then carried full-resolution bytes it existed to replace. Busted per-event ceiling. Truncated. Block stranded on "pending" forever. Block rejected here never PROMISED a resolution. Stays inline under existing ceiling. `image/svg+xml` absent on purpose. Script-bearing markup, not safely re-encodable bitmap. Deliberately jimp-free. Ingest path runs on the event loop for EVERY event.
+
+**Input-size guard.** Every other budget in module measures OUTPUT. `Jimp.read` allocates `width*height*4`. Driven by the HEADER. 20000x20000 PNG: few KB on the wire, ~1.6 GB decoded. Guard parses declared w/h from PNG/GIF/JPEG/WebP header. No pixel decode. Refuses >40 MP or >25 MB BEFORE decode. Constants `DISPLAY_MAX_DECODE_PIXELS` = 40_000_000, `DISPLAY_MAX_INPUT_BYTES` = 25_000_000. Exports `readImageDimensions(bytes)`. Fails CLOSED. Unparseable header ⇒ `failed`, never unbounded decode. 40 MP clears any real screen capture. 6K display ~20 MP.
+
+**Budget guarantee.** `DISPLAY_MAX_BYTES` = 240_000. Measured in BASE64 bytes (what the store stores). Below 256 KiB ceiling with envelope headroom. Fit enforces the budget. PNG first. Then JPEG quality ladder 75/60/45/30. Then up to 2 halvings. Reports `failed` if it cannot comply. Reason: over-budget derivative makes its OWN `attachment_fitted` event exceed the ceiling -> `{__truncated}` -> `attachmentId` destroyed -> placeholder stuck pending forever.
+
+**Originals endpoint.** `GET /api/sessions/:sessionId/attachments/:attachmentId` (`packages/server/src/routes/attachment-routes.ts`).
+Backed by session transcript (`original-store.ts`).
+Transcript already holds full-resolution bytes.
+No new durable store.
+Eviction inherently safe.
+Transcript scanned line-by-line.
+Peak memory bounded by largest entry, not file size.
+NOT load-bearing.
+Fitted image already inline.
+Failure degrades only the zoom view.
+Client passes fitted derivative as lightbox `fallbackSrc`.
+
+Gates, in order: `networkGuard`; session exists + has `sessionFile`, else 404.
+Then id shape-checked `^[0-9a-f]{64}$` (400).
+Check precedes transcript recovery, not every lookup.
+Request input never becomes a path component.
+Lookup scoped to that session's transcript.
+Valid digest from another session simply not found.
+No ownership table needed.
+Allow-list png/jpeg/jpg/gif/webp.
+`image/jpg` added. Alias of already-served format.
+Was fittable but not servable.
+Rendered fitted, 404'd on zoom.
+Test asserts invariant: fittable ⊆ servable.
+Lists cannot drift apart silently again.
+Serving stays stricter in general.
+`image/svg+xml` refused by both.
+Unknown session + unknown hash both return 404.
+Route cannot probe which session ids exist.
+Responses carry `nosniff` + `default-src 'none'; sandbox`.
+Cache-Control: `no-store, private`.
+Endpoint authenticated.
+Serves private user screenshots.
+Year-long `max-age` persisted bytes to browser/proxy disk caches.
+Bytes outlived session + credential that unlocked them (CWE-524).
+Content-addressing makes bytes immutable.
+Does NOT make them safe to persist.
+Cost: zoom re-fetches each time.
+Thumbnail unaffected.
+Fitted derivative already inline.
+
+**Animated GIF.** Exempt from fitting (D11). Resize would flatten animation. Detected by counting Image Descriptor `0x2C` blocks, short-circuit at 2. Stays subject to the existing ceiling.
+
+See change: fit-attachments-for-display.
+
 ### Edit Tool Diff Rendering (desktop vs mobile)
 `ToolCallStep` gates renderer mounting with `{expanded && <Renderer />}` — Edit cards default to collapsed, so no diff tokenization runs until the user expands. On expand, `EditToolRenderer` branches on `useMobile()` (the project-wide `width < 768px OR height < 600px` predicate):
 - **Desktop** (`!isMobile`): renders `<RichDiff oldText newText filePath maxHeight="20rem" />` — syntax-highlighted via `@git-diff-view/react` + lowlight, matching `FileDiffView` quality; height capped for chat scroll UX.
@@ -621,29 +1170,64 @@ The shared `<RichDiff>` component is also consumed by `DiffPanel` (Path A / chan
 - `index.ts`: `flow:abort` and `flow:toggle-autonomous` event listeners added
 - `flow-tui.ts`: `autonomousMode` included in `flow:flow-started` event data
 
-### `/reload` Flow (two code paths)
-Reload from the dashboard (via `pnpm run reload`, the reload button, or `/reload` typed into the chat composer) follows one of two paths depending on how the pi session was spawned. The server transparently selects the right path:
+### `/reload` Flow (server-side dispatch ladder)
+Reload from the dashboard routes through a single server entry point: `dispatchReload(sessionId)` in `packages/server/src/rpc-keeper/dispatch-reload.ts`. Dispatch is a four-step ladder — busy check, kill-and-respawn, bridge forward, terminal error — selected by how the session was spawned. Falls through until one path succeeds.
 
 ```mermaid
 flowchart TD
-    A[Browser sends send_prompt text="/reload"] --> B[server handleSendPrompt]
-    B --> C{shouldInterceptReload?<br/>text === "/reload"<br/>no images<br/>headlessPidRegistry.getPid defined}
-    C -->|Yes — headless session| D[handleHeadlessReload]
-    D --> D1[Emit command_feedback 'started']
-    D1 --> D2[headlessPidRegistry.killBySessionId<br/>SIGTERMs old pi]
-    D2 --> D3[spawnPiSession with<br/>sessionFile+mode:'continue'<br/>strategy:'headless']
-    D3 --> D4[headlessPidRegistry.register new PID]
-    D4 --> D5[Emit command_feedback 'completed']
-    D5 --> D6[New pi bridge re-registers<br/>with same sessionId —<br/>sessionManager preserves<br/>tokens/cost/context/attachedProposal]
-    C -->|No — tmux/wt/wsl-tmux| E[piGateway.sendToSession→bridge]
-    E --> F[bridge command-handler parses /reload]
-    F --> G[Calls globalThis-RELOAD_KEY fn]
-    G --> H{Was /__dashboard_reload<br/>typed in TUI first?}
-    H -->|Yes| I[session.reload in-place]
-    H -->|No| J[Error logged to bridge stderr<br/>User must bootstrap via TUI]
+    T[Six triggers]
+    E[dispatchReload sessionId]
+    B{isReloadBusy?}
+    REF[command_feedback error refuse]
+    P{headlessPidRegistry getPid defined?}
+    S[handleHeadlessReload SIGTERM + spawnPiSession continue]
+    C{piGateway isSessionConnected?}
+    F[piGateway.sendToSession send_prompt text /reload]
+    DONE[command_feedback completed keyed /reload]
+    ERR[command_feedback error no path]
+
+    T --> E
+    E --> B
+    B -->|compacting OR streaming + bridge| REF
+    B -->|not busy| P
+    P -->|PID defined| S
+    P -->|no PID| C
+    C -->|connected| F
+    C -->|not connected| ERR
+    F -->|delivered| DONE
+    F -->|send failed| ERR
+    S --> DONE
 ```
 
-**Why two paths?** pi-coding-agent's `ExtensionContext` (delivered to `session_start` handlers) has no `reload()` method — only `ExtensionCommandContext` (given to command handlers) does. Bridge workaround: registers `__dashboard_reload` as command, captures `ctx.reload` into `globalThis[RELOAD_KEY]` when user first invokes in pi's TUI. Headless sessions have no TUI, so capture never happens. Server-side interception is transparent kill-and-respawn achieving same user-visible outcome (fresh settings, extensions, skills/prompts/themes) without in-process reload. `memorySessionManager.register` carries accumulated state when same `sessionId` re-registers, so user sees brief reconnect flicker but keeps tokens, cost, context usage, attached proposal. `/reload` does NOT send `session_unregister`; reconnect keeps the current session owner. Stale bridge messages cannot replace the current owner during reload. See change: headless-reload-via-respawn.
+**Triggers** — six sources route through `dispatchReload`; pi-core update is the one exception:
+1. Reload button / `/reload` in composer → browser `send_prompt` → `packages/server/src/browser-handlers/session-action-handler.ts` `handleSendPrompt`.
+2. `scripts/reload-all.sh` → same browser path.
+3. pi retry-policy settings save → `server.ts` `reloadConnectedSessions`.
+4. Package install/remove → `packageManagerWrapper.setReloadSessions`.
+5. pi-core update complete → `piCoreUpdater.onAllComplete` → `respawnForRuntimeSwap` (NOT `dispatchReload`).
+6. `POST /api/resources/reload` → `routes/resource-activation-routes.ts`.
+
+**Predicate gate** — `isBareReloadCommand` in `browser-handlers/session-action-helpers.ts`. `text === "/reload"` exactly, zero images, says nothing about session shape. Replaced old `shouldInterceptReload`, which also required a headless PID and thereby made kill-and-respawn the default.
+
+**Why no in-process path.** Earlier revision wrote `/__dashboard_reload` to the session's RPC keeper, on the claim that pi RPC mode runs the line through `session.prompt()` WITH command handling. Measured in the docker harness with `keeperLog.capturePiOutput = true`: it does not. pi's RPC `{type:"prompt"}` performs NO slash-command dispatch. Dispatched `/__dashboard_reload` arrived at the model as an ordinary user prompt and produced a full agent turn (`agent_start` → user message → assistant reply → `agent_end`). Control: pi built-in `/help` written to the same socket behaved identically — so not the `__` prefix, not our registration. Consequence: kill-and-respawn is the ONLY mechanism that reloads a headless session. Note: `rpc-keeper/dispatch-router.ts` `dispatch_extension_command` uses the same `writeRpc` + `{type:"prompt"}` mechanism and therefore has the same defect — separate live bug, own change.
+
+**Ladder step 1 — busy check.** `isReloadBusy` runs FIRST. Refuse if `session.compacting === true`. Refuse if `status === "streaming"` AND `piGateway.isSessionConnected(sessionId)`. Stale `streaming` on a bridge-dead session does NOT refuse — pinned there forever, and exactly what respawn rescues.
+
+**Ladder step 2 — kill-and-respawn.** `headlessPidRegistry.getPid(sessionId)` defined → `handleHeadlessReload` (SIGTERM + `spawnPiSession` `mode:"continue"`), streaming guard suppressed. Registered PID wins over a live bridge: the bridge path is a no-op for a dashboard-spawned session whose `globalThis[RELOAD_KEY]` was never captured in a TUI.
+
+**Ladder step 3 — bridge forward.** No PID, `isSessionConnected` true → `piGateway.sendToSession(sid, {type:"send_prompt", text:"/reload"})`. Gated on the RETURN VALUE, not the probe: the socket can close between the two.
+
+**Ladder step 4 — terminal error.** Neither → terminal `command_feedback {status:"error"}`. A session with NO registered PID is NEVER respawned: would start a second pi against a terminal-hosted session's file.
+
+**Feedback contract** — exactly one terminal `command_feedback` per reload, `command` field always `/reload`.
+
+**Bridge side** — `packages/extension/src/command-handler.ts` no longer emits an unconditional `completed`. `BridgeCommandOptions.reload` returns a `ReloadOutcome` (`{ok:true} | {ok:false, reason}`). `bridge.ts` wraps the captured `globalThis[RELOAD_KEY]` call in try/catch, including a SYNCHRONOUS throw: the captured fn is single-use per process because the first `ctx.reload()` invalidates the runner, so a second call throws out of `assertActive()` where a `.catch()` cannot reach it.
+
+**Compaction signal** — `DashboardSession.compacting` (new, `packages/shared/src/types.ts`). Derived in `packages/server/src/session/event-status-extraction.ts` from bridge-forwarded `session_before_compact` (true) and `session_compact` (false). Cleared in `memory-session-manager.unregister`; never carried onto a re-registration.
+
+**Fan-out target set** — `reloadTargetSessionIds(connectedIds, registry)` = `piGateway.getConnectedSessionIds()` UNION `headlessPidRegistry.listSessions()`. The old connected-only fan-out could never reach a headless session whose bridge WS had died.
+
+**pi-core update is a BINARY swap** — `ctx.reload()` cannot replace pi-core, so `respawnForRuntimeSwap` respawns unconditionally (including connected + streaming), and reports `error` for a session with no `sessionFile` or no registered PID. See change: fix-out-of-band-reload.
 
 ### Server Restart (single-orchestrator path)
 
@@ -698,6 +1282,74 @@ Adoption ratchet: `packages/client/src/__tests__/state-feedback-adoption.test.ts
 
 Reference: `--status-*` tokens defined once in `index.css` (owned by change improve-dashboard-attention-routing). `statusPresentation` references, does not redefine.
 
+### Composer grammar check
+
+Opt-in grammar + spell + writing-improvement check for composer draft. LLM-only backend. Gate: `~/.pi/dashboard/config.json` `plugins.grammar.enabled` (default `false`). Change: `add-composer-grammar-check`, `grammar-llm-only-with-explore`.
+
+**Configuration.** Owned by grammar plugin. Config namespace `plugins.grammar.*` in `packages/shared/src/config.ts`. `parseGrammarConfig` validates + clamps; drops any legacy persisted keys (`backend`, `languagetool.url`). Values:
+- `enabled` (boolean, default `false`)
+- `llm.provider` (string) — model provider (Anthropic/Google)
+- `llm.model` (string) — model ID. See `docs/grammar-model-guidance.md` for recommendations
+- `autoCheck` (boolean, default `true`) — debounced auto-check on keystroke
+- `debounceMs` (integer, default 1200, clamp 300–10000)
+- `minChars` (integer, default 12, clamp 1–500) — skip check below this length
+- `maxChars` (integer, default 4000, clamp 100–20000) — truncate draft if longer
+- `language` (`"auto"`, default `"auto"`)
+
+**Legacy config coercion.** Pre-LLM configs persisted `backend="languagetool"` + `languagetool.url`. Server-side `migrateLegacyConfig()` prunes on first request (no-throw, silent). Schema `additionalProperties:false` rejects unknown keys on write.
+
+**Wire contract.** `packages/shared/src/grammar-types.ts`:
+- `GrammarSuggestion` — `{ offset, length, original, replacement, kind, message }`. `original` source-of-truth for apply.
+- `GrammarCheckResult` — `{ correctedText, suggestions[], summary, language, truncated }`. No `backend` field (LLM-only).
+- `GrammarHealth` — config probe response. No `languagetool` block.
+- `GrammarErrorCode` — error discriminant. `GrammarBackendKind` = `"llm"` (1-member enum).
+
+**Server.** Grammar plugin: `packages/grammar-plugin/src/server/`:
+- `grammar-service.ts` `checkGrammar()` — gate `enabled → grammar_disabled`; empty text → `empty_text`; clip to `maxChars` → `truncated` flag; never throws.
+- `getGrammarHealth()` — config + LLM model availability probe.
+- `backends/llm.ts` — resolve provider creds via `InternalRegistry.getModelRegistry()` + `getStreamSimpleFn()`. Model dispatch via pi-ai `streamSimple`. Temperature 0. Offsets relocated by `original` token, never trusted. Prompt hardens against injection: `<text>…</text>` wrapper, "proofread only" directive. System prompt asks for corrections + writing improvement. Output cap 8192 tokens, timeout 45 s.
+- `abort.ts` `withTimeoutSignal` — abort in-flight requests.
+- Routes: `packages/grammar-plugin/src/server/routes/grammar-routes.ts`, registered in dashboard server:
+  - `POST /api/grammar/check { text, language? }` — auth-gated (`networkGuard`). Route opt-out of Fastify `connectionTimeout` (relaxes for long-running models).
+  - `GET /api/grammar/health` — auth-gated.
+- Config re-read per request → model switch needs no restart.
+- Error → HTTP: `grammar_disabled` 409, `empty_text` 400, `backend_unconfigured` 400, `backend_unreachable` / `backend_bad_response` 502, `backend_timeout` 504.
+- One structured `[grammar]` log line per call. NO draft text logged.
+
+**Client.** `packages/client/src/hooks/useGrammarCheck.ts`:
+- Fetch `/api/grammar/health` once for config.
+- Manual `checkNow` + debounced auto-check.
+- Abort in-flight on new keystroke / session switch.
+- Skip auto-check while streaming, below `minChars`, or on `/` · `!` · `!!` prefixed drafts.
+- Offset-safe `applyAll()` / `accept()` / `dismiss()`.
+
+**UI.** Grammar panel mounts in two places:
+- Composer draft (main chat): `packages/client/src/components/chat/GrammarPanel.tsx` renders above composer (sibling to `QueuePanel` in `App.tsx`).
+- Explore/New Change dialogs: `ComposerPanelSlot` in draft editors (explorers, change filer).
+- Diff-highlighted corrections + summary. Per-suggestion Accept/Dismiss + Apply-all button.
+- `CommandInput.tsx` Check toolbar button + ⌘G shortcut (`onGrammarCheck` prop). Same panel renders both surfaces.
+
+**Privacy.** LLM backend: draft leaves machine to provider. Provider credentials resolved server-side, never reach browser.
+
+**Model recommendations.** See `docs/grammar-model-guidance.md`: latency/quality/cost tradeoffs, recommended defaults (claude-haiku-4-5), weak-model warnings.
+
+**Data flow:**
+
+```mermaid
+flowchart LR
+    A["Composer draft"] --> B["debounce | ⌘G / Check button"]
+    B --> C["useGrammarCheck"]
+    C --> D["POST /api/grammar/check"]
+    D --> E["grammar-service"]
+    E --> F["LLM backend"]
+    F --> G["Provider API"]
+    G --> H["GrammarCheckResult"]
+    H --> I["GrammarPanel"]
+    I --> J{"User action"}
+    J -->|Apply-all| K["onDraftChange updates draft"]
+    J -->|Accept/Dismiss| K
+```
+
 ### Auto-Resume on Prompt
 When a user sends a prompt to an ended session, the server automatically resumes it:
 1. Server detects `send_prompt` for a session with `status === "ended"` and a valid `sessionFile`
@@ -746,6 +1398,153 @@ Plugin content-view claims (e.g. flows-plugin) remain predicate-driven, out of s
 6. Thinking level changes (via pi keybinding) are detected when `model_select` events fire, on reconnect, and immediately after `set_thinking_level` commands
 7. Browser can send `set_thinking_level` to change thinking level remotely
 
+### Model selector pairing rule
+
+Two classes of model selector exist:
+
+- RUN-CONFIGURING: picks the model a session/run EXECUTES with. MUST pair a thinking-level control.
+- REFERENCE-LISTING: names a model for an allow-list, ordering, or alias mapping. MUST NOT pair one.
+
+```mermaid
+flowchart TD
+    A[Model selector] --> B{RUN-CONFIGURING?}
+    B -->|yes| C[MUST pair thinking-level control]
+    B -->|no| D[REFERENCE-LISTING: MUST NOT pair]
+```
+
+Run-configuring surfaces, all five now paired:
+
+- Chat composer model row — `packages/client/src/components/chat/CommandInput.tsx`
+- Settings → Sessions → Default Model — `packages/client/src/components/settings/SettingsPanel.tsx`, persists `config.defaultThinkingLevel`
+- OpenSpec run-config row — `packages/client/src/components/openspec/useOpenSpecRunConfigRow.tsx`
+- Roles → assign model to `@role` — `packages/roles-plugin/src/RolesSettingsSection.tsx`
+- Automation → Create, direct-model branch — `packages/automation-plugin/src/client/CreateAutomationDialog.tsx`
+
+Reference-listing surfaces, deliberately excluded: Model Proxy preferred-models list and Model Proxy alias→model table, both in `packages/client/src/components/settings/ModelProxySection.tsx`.
+
+Encoding. Roles + automation carry level as `:<level>` suffix on the EXISTING model ref string: `"<provider>/<id>:<level>"`. No second field. No parallel level map. pi parses it with `splitThinkingSuffix` (`packages/extension/src/provider-register.ts`). Reason: second field drifts from refs written by pi's own `/roles` command.
+
+Canonical levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. `off` = no override → writes bare ref. Split takes the LAST `:` only when the tail is a canonical level, so provider ids containing `:` (e.g. `openrouter/vendor:free`) survive.
+
+No server change. `resolveModel()` (automation-plugin `server/model-resolver.ts`) passes suffixed ref through. `sessionFlagsToArgv()` (`packages/shared/src/platform/spawn-mechanism.ts`) emits `["--model", ref]` verbatim. Nothing in that chain inspects or strips the suffix. Both guarded by tests.
+
+`@role` automation branch renders NO level control — role's own ref owns the level. One owner per value.
+
+UI shape named `ModelLevelPair`: model left, level right, one bordered container, persistent `MODEL`/`THINKING` captions, saved ref echoed in mono below. Full contract: `openspec/changes/add-default-thinking-level/mockups/ui-plan.md`.
+
+See change: add-default-thinking-level.
+
+### Auto Session Naming (change: fix-auto-naming-reasoning-model)
+
+Bridge-side. `packages/extension/src/auto-session-namer.ts`. After each terminal turn (`agent_end`), eligible session asks naming model for short topic title. Gate: `autoNameSessions` preference (`preferences_update` message).
+
+**Naming model resolution.**
+
+- `@naming` first, fallback `@fast`. `resolveNamingModel()` in `packages/extension/src/role-manager.ts`.
+- `naming` in `DEFAULT_ROLE_NAMES`.
+- Unassigned `naming` ⇒ `@fast` ⇒ identical resolution to pre-role behavior.
+- Neither configured ⇒ permanent stop + one `auto_name_error` naming both slots.
+- Configured in Settings → Roles (Roles panel, `/settings/plugins/roles`), NOT inline on sessions page. Auto-name toggle carries pointer `auto-name-model-pointer`.
+
+**Adaptive output cap.**
+
+- `TITLE_MAX_TOKENS_BASE = 1024` on first attempt.
+- `TITLE_MAX_TOKENS_ESCALATED = 2048` once session records a `starved` verdict.
+- Cap = ceiling, not charge. Non-reasoning model bills ~2 output tokens.
+- Measured on `deepseek/deepseek-v4-flash` + summarizer prompt.
+- Caps 16/64/256/512: `finish_reason=length`, empty content.
+- Cap 1024: returned `NULL`. 24 reasoning tokens.
+- Cap 2048: returned title. 724 reasoning tokens.
+- Reasoning spend nondeterministic. No cap guarantees a title.
+
+**Starvation failure mode.**
+
+- Reasoning model spends whole cap on reasoning tokens.
+- Stream ends truncated. `done` reason `"length"`. No text.
+- Old bug: empty text mapped onto `wait`.
+- `wait` = same verdict as legitimate `NULL` sentinel. Non-terminal.
+- Result: naming retried forever, applied nothing, emitted nothing.
+- Measured: 0 of 3380 sessions `nameSource: "auto"`.
+- Measured: 0 `auto_name_error` lines in 6.8 MB `server.log`.
+- Fix: parse keys on stream stop reason BEFORE text.
+- `length` / `toolUse` ⇒ `starved`. Text NEVER applied.
+- `stop` + empty ⇒ `starved`.
+- `NULL` / over-40-chars / over-6-words ⇒ `waiting`.
+
+**Attempt budget.**
+
+- 3 attempts per session (`ATTEMPT_BUDGET`), shared by `starved` + `waiting`.
+- Exhaustion ⇒ permanent stop + exactly one `auto_name_error`. Remedy matches dominant cause; tie ⇒ `starved`.
+- Transient errors + aborts spend no budget.
+
+**Persistence.**
+
+- Stop persists in session `.meta.json` (`autoNamerState`), survives process restart.
+- Clears when RESOLVED naming reference changes or blocking cause (credentials/registry) resolves.
+- Clearing resets budget AND re-arms error.
+
+**Diagnostics.**
+
+- Every attempt reports exactly one deduplicated outcome.
+- Server retains last outcome per session — `packages/server/src/auto-name-outcome-store.ts`.
+- Bound 500. ABSOLUTE.
+- Eviction prefers non-`stopped` entries.
+- `stopped` entries alone at the bound: OLDEST `stopped` evicted.
+- Protection is an ORDER, never indefinite retention.
+- Readable at `GET /api/auto-name-outcomes`.
+- Rendered in Settings → Diagnostics. `starved` shown distinctly from `waiting`.
+
+See change: fix-auto-naming-reasoning-model.
+
+### HTTP Role Read Surface (change: add-roles-read-api)
+
+**Endpoint.**
+
+- `GET /api/roles` — read-only role catalogue. Ungated beyond dashboard auth gate. No `pi-proxy-...` Bearer key. No live pi session required. Mirrors `GET /api/models` envelope + auth posture.
+
+**Route ownership and registration.**
+
+- Owned by roles-plugin, NOT `packages/server/src/routes/`. Manifest entry `"server": "./src/server/index.ts"` in `packages/roles-plugin/package.json`. Entry point `registerPlugin(ctx)` calls `mountRolesRoutes(ctx.fastify)` in `packages/roles-plugin/src/server/index.ts`. Route impl at `packages/roles-plugin/src/server/roles-routes.ts`. Registered WITHOUT `networkGuard` preHandler. Host owns `fastify.listen`; plugin only registers.
+
+**Response structure.**
+
+- Envelope: `{ object: "list", data: RoleGroup[] }`.
+- Each group: `{ preset, active, roles }`.
+- Live group first (`preset: null`); then preset groups in stored order. Exactly one group `active: true`.
+- Row: `{ role, ref, assigned, builtin }` always; `model`, `provider`, `thinkingLevel` added only when derivable.
+- `ref: null` for unassigned role (expected state, never an error).
+- `builtin` = role name in `DEFAULT_ROLE_NAMES`.
+
+**Role axis construction.**
+
+- Canonical axis = (defaults → user-added → assigned) ∪ preset-only names (first-referencing-preset order) − `removedRoles`.
+- Same axis + order in every group.
+- `ref` split: last colon → `model`/`thinkingLevel`; first `/` → `provider`.
+- Bare legacy id → `provider` omitted, never guessed. Stored value never rewritten.
+- Model registry NOT consulted.
+- Dangling `activePreset` (names no stored preset) → live group active.
+- Duplicate preset names collapse first-wins.
+
+**Resilience and error handling.**
+
+- Never 503. Never empty `data`.
+- Missing / unparseable / EACCES / EISDIR / TOCTOU config all degrade to "no assignments" → overlay still yields built-in names with `ref: null`.
+- Config file never created or modified by read.
+- Credential safety: rows built field-by-field from role/preset maps. Parsed config never serialized or spread into response. Credential-bearing sibling key of `providers.json` cannot reach payload.
+
+**Per-key ownership split of `~/.pi/agent/providers.json`.**
+
+- `role-manager.ts` (`packages/extension/src/`) = SOLE WRITER of role slice: `roles`, `rolePresets`, `activePreset`, `roleNames`, `removedRoles`. Atomic tmp+rename; preserves sibling keys.
+- `provider-routes.ts` (`packages/server/src/routes/`) writes `providers` key of same file. Atomic tmp+rename; preserves other fields.
+- Role slice reading is NON-exclusive. Every reader normalizes through one shared TOTAL normalizer `parseRoleConfig(raw)` in `packages/shared/src/role-schema.ts`. Pure role-schema helpers (`DEFAULT_ROLE_NAMES`, `effectiveRoleNames`, `overlayRoles`, `splitRef`/`joinRef`, types) live there — no `node:fs`, so client bundles it. `role-manager.ts` `loadRoleConfig` keeps file read but delegates normalization to `parseRoleConfig`.
+
+**Declared read corrections vs old `roles:get-all`.**
+
+- Structurally invalid preset entry now dropped (was relayed uninspected).
+- Role with both removal marker AND assignment now omitted (old trailing spread reintroduced it).
+
+See change: add-roles-read-api.
+
 ### Context Usage Tracking
 1. On each `turn_end`, the bridge calls pi's `ctx.getContextUsage()` API to get real-time context usage (tokens used + actual context window from the provider)
 2. Bridge enriches the `turn_end` event with this `contextUsage` data before forwarding to the server
@@ -783,10 +1582,16 @@ See change: add-session-uncommitted-indicator-and-commit.
 Dashboard derives new worktree path as `<repoRoot>/.worktrees/<slugifyBranch(branch)>` when `POST /api/git/worktree` body omits `path`. `addWorktree` calls `ensureWorktreeExcludeLine(cwd)` first — idempotently appends `.worktrees/` to `<repoRoot>/.git/info/exclude` so parent repo ignores nested checkouts (untouched if line already present). Bridge `detectWorktree` populates `GitInfo.gitWorktree.mainPath`; `resolveSessionGroupPath` collapses worktree sessions under parent repo's pinned-directory group. See change: add-worktree-spawn-dialog.
 
 ### Git worktree lifecycle (push / PR / merge / close)
-Dashboard exposes 5 endpoints under `/api/git/worktree/*`: `remove`, `merge`, `push`, `pr`, `diff-stat`. Localhost-gated. Each forwards stable `{code, stderr}` errors (`active_sessions`, `dirty_worktree`, `branch_not_merged`, `dirty_main`, `merge_conflict`, `base_not_found`, `no_remote`, `auth_failed`, `non_fast_forward`, `gh_not_found`, `gh_not_authed`, `pr_exists`, `pushed_but_pr_failed`) produced by pure stderr→code mappers in `git-worktree-lifecycle.ts`.
-`/remove` pre-flight calls `activeSessionsUnder(path, sessions)`: non-empty → returns `active_sessions` + `sessionIds`; client `CloseWorktreeDialog` shuts those sessions down then retries with `--force`. `mergeWorktree` runs `git merge --no-ff` into `resolveDefaultBase(cwd, head)` (origin/HEAD → `develop` → `main` → `master`). `gh` resolved via shared tool registry. Client probes `gh` via `/api/tools/gh` at `WorktreeActionsMenu` mount (module-level cache); hides Open PR when unavailable; View PR #N link survives without gh because it opens an existing URL.
+Dashboard exposes 7 endpoints under `/api/git/worktree/*`: `remove`, `remove-batch`, `prune`, `merge`, `push`, `pr`, `diff-stat`. Localhost-gated. Each forwards stable `{code, stderr}` errors (`active_sessions`, `dirty_worktree`, `branch_not_merged`, `dirty_main`, `merge_conflict`, `base_not_found`, `no_remote`, `auth_failed`, `non_fast_forward`, `gh_not_found`, `gh_not_authed`, `pr_exists`, `pushed_but_pr_failed`, `cwd_invalid`, `is_main_worktree`) produced by pure stderr→code mappers in `git-worktree-lifecycle.ts`.
+`/remove-batch` body `{ items: Array<{cwd, force?, deleteBranch?}> }`. Cap 50 items enforced before any git runs — `batch_too_large` 400; non-array `items` → `items_invalid` 400. Returns `{ results }` in INPUT ORDER, one per item. Never aborts on first failure. Item result: `{ cwd, ok, code, sessionIds?, branchDeleted?, branchDeleteCode? }`. `code` widens `RemoveCode` with `active_sessions | cwd_invalid | is_main_worktree`. Sits behind `networkGuard` + `validateCwd`.
+`/prune` wraps `git worktree prune` in resolved main worktree. Returns `{ pruned }`. REPO-GLOBAL — clears every stale registration, not one row. Sits behind `networkGuard` + `validateCwd`.
+`/remove` pre-flight calls `activeSessionsUnder(path, sessions)`: non-empty → returns `active_sessions` + `sessionIds`; client `CloseWorktreeDialog` shuts those sessions down then retries with `--force`. `remove` gains `deleteBranch?: boolean`. Runs `git branch -d <branch>` (NEVER `-D`) in main worktree after successful removal. Branch name captured BEFORE removal (unrecoverable after). Success payload widens to `{ removed: true, branchDeleted: boolean, branchDeleteCode? }`. Refused branch delete still HTTP 200 — removal succeeded. `remove` also rejects main worktree removal with `is_main_worktree` 400; previously mapped to `git_failed` → 500. `mergeWorktree` runs `git merge --no-ff` into `resolveDefaultBase(cwd, head)` (origin/HEAD → `develop` → `main` → `master`). `gh` resolved via shared tool registry. Client probes `gh` via `/api/tools/gh` at `WorktreeActionsMenu` mount (module-level cache); hides Open PR when unavailable; View PR #N link survives without gh because it opens an existing URL.
 Cwd-loss detection probes at three sites feed `DashboardSession.cwdMissing`: (1) bridge VCS 30 s tick (`sendCwdMissingIfChanged`, debounced via `BridgeContext.lastCwdMissing`) emits new `cwd_missing` extension message; (2) server `session-scanner.ts` stamps ended sessions at boot; (3) `/api/git/worktree/remove` optimistic broadcast for every session under removed path. New `cwdMissing?: boolean` on `DashboardSession` + `cwd_missing` protocol message both additive — older bridges harmless `undefined`. `spawn-preflight.ts` emits BOTH legacy `DIR_MISSING` reason and new `cwd_missing` code during one-release overlap.
 See change: add-worktree-lifecycle-actions.
+`BranchDeleteCode = "deleted" | "unmerged" | "no_branch" | "branch_gone" | "delete_failed"` DISJOINT from `RemoveCode` (asserted by a test). Generic failure `delete_failed`, not `git_failed`. Never reuses `branch_not_merged` — that `RemoveCode` makes `CloseWorktreeDialog` auto-tick `--force` and retry.
+`GET /api/git/worktrees` entries gain `exists: boolean` (one `statSync` per entry). Consumers MUST treat `undefined` as present — falsy test marks every row missing when new client pairs with older server.
+Manage-worktrees surface removes worktrees with NO entry in session map. `active_sessions` guard does not fire. Menu gate on folder being a git repository, never on live sessions.
+See change: manage-worktrees-filter-cleanup.
 
 ### Child Process Scanning
 1. Bridge scans child processes every 10s via `process-scanner.ts` (two-phase: capture new PGIDs during active bash calls, then check tracked PGIDs)
@@ -796,6 +1601,56 @@ See change: add-worktree-lifecycle-actions.
 5. Server stores processes on the session object and forwards to subscribed browsers as `process_list_update`
 6. New browser connections receive current processes via the initial `session_added` message
 7. Session cards display processes with elapsed time and a kill button (sends SIGTERM to process group)
+
+### Folder → workspace add flow (redesign-folder-workspace-add-flow)
+
+**DirectoryHomeView eligibility guard removed.** Any groupable cwd renders home page (session list + spawn prompt). Gone: props `pinnedDirectories`, `workspaceFolders`, `pinnedDirectoriesLoaded`, `workspacesLoaded`, `onPinDirectory`; testids `directory-home-loading`, `directory-home-not-pinned`; i18n keys `directoryHome.notPinnedTitle`, `notPinnedBody`, `pinCta`. App drops `workspaceFolderSet` memo + `pinnedDirsLoaded`, `workspacesLoaded` state + their `useMessageHandler` setters (handlers `pinned_dirs_updated`, `workspaces_updated` no longer flip loaded flags).
+
+**Pin now implicit visibility primitive.** Adding folder always pins (`pin_directory`). `AddToWorkspaceMenu` + add dialog offer NO "Pin to dashboard". Safe: `visibleTopPinned`/`visibleTopUnpinned` already filter workspace-owned cwd out of top tier (renders once); redundant pin = fallback so removing from workspace leaves folder visible at root.
+
+**Add-to-workspace affordance.** LABELLED PILL: `mdiViewGridPlus` glyph + visible text label "Workspace", lives inside folder actions menu WORKSPACE group. Session-card copy removed. `aria-haspopup="menu"` + `aria-expanded` + `aria-label`/`title` "Add to workspace…". Popover state keyed by SCOPE (`folder:<cwd>`). Old `+ws` text token removed. `renderAddToWorkspaceButton(cwd,label,scopeKey,testId,wrapperClass)` builds pill, passes as `headerAction?: React.ReactNode` to `renderGroup` (5th param); `renderGroup` routes it into the menu instead of the cluster. See change: add-folder-actions-menu.
+
+**Folder-header cluster never wraps.** `folder-header-cluster-<cwd>` = `flex-none whitespace-nowrap`; name region `folder-header-name-<cwd>` = `min-w-0` absorbs squeeze; parent path `folder-header-parent-<cwd>` = `flex-[0_1_auto] min-w-0` collapses first; leaf `folder-header-leaf-<cwd>` = `min-w-[6ch]` floor.
+
+**PathPicker opt-in multi-select.** `selection?: {selected:Set<string>; onToggle}` (absent = single-select, unchanged for existing callers e.g. PinDirectoryDialog). Multi-select: row body navigates (never `onSelect`), per-row checkbox (`path-picker-check-<path>`, `role=checkbox`, `stopPropagation`) toggles basket, trailing chevron (`path-picker-open-<path>`) descends; Space toggles highlighted row, Enter descends. Emoji → `@mdi/js` (`mdiArrowUp`, `mdiFolder`, `mdiFolderPlusOutline`); git/pi stay text badges. Optional `sessionCounts?: Map<pathKey,number>` → session badge (`path-picker-sessions-<path>`). `userEditedRef` mount-race guard (change compact-warm-replay-stream) preserved.
+
+**AddFoldersDialog** (`packages/client/src/components/workspace/AddFoldersDialog.tsx`): multi-select picker + removable-pill basket (persists across navigation) + single-select workspace destination (radio, default None, empty state "None — no workspaces yet", eager `+ New workspace…` that becomes selected once `workspaces_updated` echo lands) + count-bearing commit (`add-folders-commit`). Commit sends `pin_directory` for every path FIRST, then `add_folder_to_workspace` per path when destination set (pins first → folder never momentarily invisible). Reuses existing per-path messages, no new protocol. Wired to both entry points: App sidebar `+ Add Folder` → dest None; `SessionList` workspace-scoped `+ Add Folder` → that workspace preselected. `PinDirectoryDialog` retained ONLY for packages move-to-local single-select picker (`UnifiedPackagesSection`).
+
+See change: redesign-folder-workspace-add-flow.
+
+### Folder actions menu (add-folder-actions-menu)
+
+**Cluster = one control.** `folder-header-cluster-<cwd>` holds EXACTLY ONE control: `FolderActionsMenu` trigger. Component `packages/client/src/components/folder/FolderActionsMenu.tsx`. Exports `FolderActionsMenu`, `FolderMenuItem`, `FOLDER_MENU_GROUPS`, `FolderMenuGroup`.
+
+**Trigger.** Glyph `mdiFolderCogOutline`. `mdiDotsHorizontal` REJECTED — `WorktreeActionsMenu` renders it on worktree session cards inside the folder body; two identical triggers, different scopes, one card. Testid `folder-actions-menu-<cwd>`. Carries `aria-haspopup="menu"` + `aria-expanded`. `onClick` calls `stopPropagation` — header row navigates to the directory home page, so opening must not navigate nor toggle collapse.
+
+**Panel.** Testid `folder-actions-menu-panel-<cwd>`, `role="menu"`, `data-menu-form="sheet"|"popover"`. Items carry `role="menuitem"`, testid `folder-menu-item-<id>`. Keyboard: ArrowDown/ArrowUp rove focus over `[role=menuitem]`; Escape closes + returns focus to trigger. Outside `mousedown`/`touchstart` closes.
+
+**Groups.** Host-owned fixed taxonomy, stable order: `workspace` then `directory` (`FOLDER_MENU_GROUPS`). Group heading testid `folder-menu-group-<group>`. Group renders only when it holds >=1 item. Item ids: `add-to-workspace`, `remove-from-workspace`, `pin`, `urgency-sort`, `directory-settings`. Directory-group order: pin, urgency-sort, directory-settings.
+
+**Open state.** `SessionList` owns `folderMenuFor`, keyed by SCOPE `folder:<cwd>` — mirrors `addToWsMenuFor`; a cwd key would co-open a folder row and a same-cwd card.
+
+**Form factor.** Mobile: `useMobile()` (compound `<768w OR <600h`, reused verbatim) → full-width sheet via `DialogPortal`, `data-menu-form="sheet"`. Desktop → `usePopoverFlip` popover, `data-menu-form="popover"`.
+
+**Node escape hatch.** `FolderMenuItem.node`: item that carries its own popover + testid renders its own node. Only user today = add-to-workspace, so `renderAddToWorkspaceButton(cwd,label,scopeKey,testId,wrapperClass,asMenuItem)` keeps `add-to-workspace-btn-<cwd>` + `AddToWorkspaceMenu` popover verbatim; `asMenuItem` adds `role="menuitem"`.
+
+**Placement gating preserved, not widened.** add-to-workspace only on top-level rows gated `onCreateWorkspace || workspaces.length`; remove-from-workspace only on workspace-owned rows; pin only outside a workspace container.
+
+**Pinned indicator.** Inert indicator, testid `folder-pinned-indicator-<cwd>`, `aria-hidden="true"`, `mdiPin`, NOT a button, no tabindex. Lives in name region, not cluster — keeps cluster at exactly one control. Pin/unpin action lives in the menu.
+
+**Open-home button deleted.** `mdiOpenInNew` GONE. Testid `folder-open-home-<cwd>` GONE. Header row `folder-home-row-<cwd>` = only open affordance; leaf `folder-header-leaf-<cwd>` gains `group-hover:underline`, row gains `group`.
+
+**SessionCard prop removed.** `renderAddToWorkspace` REMOVED. Testid `session-card-add-to-workspace-<id>` GONE. Workspace membership is directory-scoped; per-session rendering produced N identical buttons with one effect.
+
+**FolderActionBar Directory Settings.** `mdiCog` REMOVED (moved to menu item `directory-settings`). `FolderActionBar` returns `null` when it holds nothing — predicate composed from exported `shouldShowProjectInit(status,onInitializeProject)` (`ProjectInitButton.tsx`) + `shouldShowWorktreeInitButton(status)` (`WorktreeInitButton.tsx`) + `useInitRun(cwd)` + cleanup gate, so it cannot drift from what the buttons render.
+
+**Prop rename.** `onOpenPiResources` → `onOpenDirectorySettings` on `SessionList`; `useContentViews` `handleOpenPiResources` → `handleOpenDirectorySettings`. Route unchanged: `buildFolderSettingsUrl(cwd)` (page segment omitted → route handler defaults `packages`). Only the name lagged; label + `aria-label` already read "Directory Settings".
+
+**Accepted echoes (recorded, not fixed).** Trigger cog vs item `mdiCog`; `mdiPin` indicator vs `mdiPin` action.
+
+**Known dead path, PRE-EXISTING, NOT fixed.** `AddToWorkspaceMenu` remove entry unreachable on folder rows — renders only when `currentWorkspaceId !== null`, but `visibleTopPinned`/`visibleTopUnpinned` filter workspace-owned folders out of the top tiers, the only rows carrying the affordance.
+
+See change: add-folder-actions-menu.
 
 ### OpenSpec Polling (Server-Side)
 
@@ -843,11 +1698,75 @@ Observability: `DEBUG=pi-dashboard:openspec-poll` (or any `DEBUG=...pi-dashboard
 
 **Session-load worker.** Session-event hydration (JSONL parse + replay) runs on a `worker_threads` pool, off main event loop. `packages/server/src/session-load-worker.ts` exports `loadAndReplay(req)`: runs `loadSessionEntries` (JSONL parse + tree-walk) and `replayEntriesAsEvents(...).map(m => m.event)` projection IN-WORKER; only final `events` array crosses thread boundary. `parentPort` bootstrap wires `loadAndReplay` onto a thread; tests + fallback import function directly. Worker output `{jobId, success, events, error, entryCount?}`. `packages/server/src/session-load-worker-pool.ts` runs fixed slots = `max(1, min(maxConcurrentSpawns, os.cpus().length))`; FIFO queue when slots busy; per-request timeout default `30000ms`; lazy spawn per slot via `new Worker(url, {execArgv: process.execArgv})` so jiti hook propagates. Main thread owns per-session `loadingSet` dedup, `eventStore.insertEvent`, and `session_updated` + `event_replay` broadcast (in `directory-service.ts::loadSessionEvents` + `browser-handlers/subscription-handler.ts`); worker never touches store or sockets. `cancel(jobId)`: queued job dropped from queue, resolves `"cancelled"`; in-flight job abandoned, its result discarded on arrival, worker NOT terminated for plain cancel (only timeout/crash terminates slot). `directory-service.ts` exposes `cancelLoad(sessionId)` via `inFlightLoadJobs` map; `subscription-handler.ts` unsubscribe case calls `cancelLoad` when `getSubscribers(sessionId).length === 0`; `subscription-handler.ts` treats `result.error === "cancelled"` as no-op (no `dataUnavailable`, no replay). Fallback: spawn fail / worker crash / non-zero exit / per-request timeout → in-process `loadAndReplay` for that request; `pool.load().result` never rejects. Config: `DashboardConfig.sessions.useLoadWorker` (default `true`) in `packages/shared/src/config.ts`; `false` → permanent in-process path, no `worker_threads` spawn. Plumbed `server.ts` `ServerConfig.sessions` → `cli.ts` → `createDirectoryService` `options.useLoadWorker`. `events` bytes identical to in-process projection; parity test enforces (`packages/server/src/__tests__/session-load-worker.test.ts`). Copies `openspec-poll-worker-pool` scaffold, not extracted (rule-of-three deferred to third consumer). See change: offload-session-events-load-to-worker.
 
+### OpenSpec Readiness (add-openspec-init-affordances)
+
+One server-derived per-cwd readiness state gates every OpenSpec affordance — folder-card section, session-card OPENSPEC subcard. Clients render from `OpenSpecData.readiness`; they never re-derive from raw signals. See change: add-openspec-init-affordances.
+
+**State table.** `deriveOpenSpecReadiness` folds `openspec.enabled`, `openspec.optOutDirectories`, `openspec.offerInitialization`, `hasOpenspecDir`, `initialized`, `pending`, `hasOpenSpecSkills`, recorded-vs-current update signature into `{ state, reason }`. Precedence = table order, first match wins:
+
+| state | condition | folder card | session card OPENSPEC subcard |
+|---|---|---|---|
+| `GLOBAL_OFF` | `openspec.enabled === false` | nothing | hidden |
+| `OPTED_OUT` | cwd in `openspec.optOutDirectories` | nothing (re-enable via folder `⋯` menu) | hidden |
+| `PENDING` | poll in flight | grey loading spinner | existing placeholder |
+| `ABSENT` | no `<cwd>/openspec/` | one-line pill: Initialize + dismiss | hidden (offer made once on folder card, not per session) |
+| `BROKEN` | `hasOpenspecDir && !initialized` — reason `missing-changes-dir` \| `cli-failed` | Repair (`missing-changes-dir` only) \| error text | rendered disabled + reason |
+| `STALE` | `missing-skills` \| `profile-stale` | Update | rendered disabled + reason |
+| `READY` | otherwise | `OpenSpec (N) →` board nav | live controls |
+
+`BROKEN`·`cli-failed` offers no Repair — re-running init cannot fix a failing CLI, and the invocation carries `--force` that would auto-clean a directory holding real proposals. `missing-skills` wins over `profile-stale` when both hold (it breaks the session-card controls). `ABSENT` renders no section when `offerInitialization === false`; `BROKEN`/`STALE` render no dismiss (user already opted in; silencing a broken state is not a resolution). Disabled subcard renders exactly one focusable control — routes to the folder card's OpenSpec section (`missing-changes-dir`/`cli-failed`/`missing-skills`; scrolls + expands + focuses) or Settings → OpenSpec Workflow Profile (`profile-stale`); reason text is the accessible explanation, not a `title` attribute.
+
+**Derivation lives server-side.** `deriveOpenSpecReadiness` in `packages/server/src/openspec/readiness.ts`. `finalizeOpenSpecData` (directory-service.ts) attaches `hasOpenSpecSkills` + `readiness` at every `pollOne` exit; broadcast on every `openspec_update` and WS on-connect snapshot. Disabled-transition cleared payload carries `readiness: { state: "GLOBAL_OFF" }` explicitly, never omits it — a current client is never forced into the legacy gate mid-transition. Legacy fallback: `readiness` absent (older server) → previous `hasOpenspecDir || pending` gate, no disabled or stale presentation.
+
+**Reconfiguration re-broadcast.** `reconfigurePolling` diffs readiness-affecting keys (`enabled`, `optOutDirectories`, `offerInitialization`) against the previous config; poll-tuning writes (interval, concurrency, jitter, worker flag) never trigger a readiness broadcast. `optOutDirectories` membership change re-broadcasts only the affected cwds; `enabled`/`offerInitialization` change re-broadcasts every cached cwd.
+
+**`hasOpenSpecSkills`.** Stat `<configRoot>/.pi/skills/openspec-explore/`. Config root via `resolveConfigRoot` (git-worktree/git-operations.ts): a worktree answers from its main checkout, because `.pi/skills/openspec-*` is gitignored and never checks out into a worktree. Root resolution memoized per cwd (stat-pass budget, P4); unresolvable → fall back to the cwd.
+
+**Config keys** (`OpenSpecPollConfig`): `openspec.optOutDirectories: string[]` (default `[]`; pathKey-normalized at parse, trailing-slash spellings collapse to one entry), `openspec.offerInitialization: boolean` (default `true`; `false` suppresses only the ABSENT offer — `BROKEN`/`STALE`/`READY` unaffected; distinct from `openspec.enabled`, which disables the feature). Both writable via `PUT /api/config` partial `{ openspec: {...} }` — deep-merged, every other key preserved.
+
+**Update-signature provider.** `currentGlobalSignature` option injected into `createDirectoryService` from the routes layer. Signature is machine-global, identical for every cwd → computed at most once per poll tick, memoized per generation. Invalidated by global profile save and successful init/update via `directoryService.invalidateOpenSpecSignatureCache()`. Provider failure → signature check skipped, no cwd ever falsely STALE. A cwd with no recorded signature is never STALE on that basis — only a recorded signature that differs from the current one triggers `profile-stale`.
+
+**POST /api/openspec/init.** Spawns `openspec init <cwd> --tools pi --force` via the tool-registry resolver (never a bare `openspec` command). Contract:
+- Body `{ cwd, confirm? }`. `cwd` validated against union(session cwds, pinned dirs) WITHOUT the `hasOpenSpecRoot` filter — the update-status helper filters to initialized projects and excludes exactly the directories init targets.
+- 400 when `<cwd>/openspec/` exists without `confirm: true` — deliberately coarse presence check; the CLI's internal legacy-artifact definition is unreachable through public exports.
+- `init --help` support probe cached per process; unsupported CLI refused with diagnostic naming the resolved binary, before any spawn.
+- Per-cwd lock: second request while an invocation is in flight → `409 Conflict`, no second spawn.
+- 60 s timeout — runner kills the process, partial stderr returned, lock released.
+- argv exactly `<resolved-cli> init <cwd> --tools pi --force`, passed as an array, never a shell string. No `--profile` (CLI accepts only `core|custom`; dashboard profile may be alias `expanded`); no `--no-animation`/`--no-copilot-cloud` (pinned CLI 1.6.0 registers only `--tools`/`--force`/`--profile`; commander strict). `--tools pi` writes `.pi/skills/openspec-*` + `.pi/prompts/opsx-*.md` — omitting it reproduces the dead-buttons defect.
+- `healExpandedProfileConfig` before the spawn (mirrors the update route).
+- Success: records the cwd's update signature, invalidates the signature cache, forces `refreshOpenSpec` so the new readiness broadcasts without waiting for the poll interval. Failure: `{ success: false, error, stderr? }`.
+
 ### OpenSpec board
 
 Board route `/folder/:encodedCwd/openspec` (`OpenSpecBoardView`) replaces inline `FolderOpenSpecSection` accordion. `FolderOpenSpecSection` now slim nav entry `OpenSpec (N) →` to board route.
 
 Groups = columns. Always-present Ungrouped column. Proposal cards draggable (@dnd-kit): reassign group + reorder within group.
+
+**Drop-target resolution.** Collision detection = `pointerWithin`, single `DndContext` prop; applies to card AND column drags. No `closestCorners` fallback: `closestCorners` empty only when zero droppables exist; fallback makes `over` non-null in the board gutter, turns intended cancel into commit into a neighbouring column. Null `over` = real cancel.
+
+Drop slot resolved by ONE midpoint rule, direction- and scope-independent: `index` = count of cards in target column (excluding moved card) whose rect midpoint Y is at/above pointer Y; exact midpoint resolves after. Result = index into the without-moved list — `computeReorder`'s existing contract, so no caller `+1`.
+
+Pure resolver `resolveDropSlot` in `packages/client/src/lib/openspec/openspec-board-order.ts`; `computeReorder` unchanged.
+
+Resolution runs on `onDragMove`, not `onDragOver` (`onDragOver` deps are `[overId]` — does not fire on a midpoint crossing inside one droppable).
+
+Resolution lives in `DropSlotProbe`, headless child of `<DndContext>`: `droppableRects` reachable only through `useDndContext()`; the parent of `<DndContext>` measures 0 rects. `pointerY = activatorEvent.clientY + delta.y`. Rects read via scroll-live `rect.top`/`rect.bottom` getters, not the frozen `rect.rect` snapshot.
+
+`handleDragEnd` only commits. Re-resolves slot from end event itself, via `resolveMoveSlot` — no trust in last `onDragMove`. Rect map reaches it through `dropRectsRef`, ref `DropSlotProbe` keeps current; parent still never calls `useDndContext()` (would measure 0 rects). `dropSlot` state drives INDICATOR only, not the commit.
+
+colKey-only guard insufficient: one-frame flick off append rail onto card in SAME column agrees on column, disagrees on index → colKey-only guard commits stale "last" slot. Found by CodeRabbit on PR #438.
+
+Commit bails when `over` null (gutter / page margin) and when re-resolved slot's column ≠ end event's target.
+
+Whole column accepts drops: body keeps its `useDroppable` (dnd-kit auto-scroll walks the OVER NODE's ancestors → scroller must stay on the drop path) plus a second `col-root:<groupKey>` droppable on the column root for header + outer padding.
+
+Drag-only append rail `rail:<groupKey>`: sticky to the body's visible bottom edge, ≥44px, present in empty columns; resolves to last position. `resolveDropTarget` normalises `rail:<k>`/`col-root:<k>` back to the bare group key in ONE place — a namespaced droppable id never persists as a group key.
+
+Indication: insertion marker painted into the existing flex gap via a pseudo-element on the card following the slot (no inserted flex child). Final slot has no following card → the rail's active state indicates it — driven by the resolved slot being last, not pointer-over-rail. Vertical `SortableContext` strategy neutralised with an explicit no-op (`strategy={undefined}` falls back to `rectSortingStrategy` and still displaces → decouples visual position from data order, invalidates the midpoint count).
+
+Production test hooks: `data-drop-target` (column root), `data-drop-slot="<index>"` (column body), `data-rail-active` (rail).
+
+No persistence/protocol change: `changeOrder[]` keeps its shape. See change: fix-openspec-board-drop-targeting.
 
 Per-change order persisted in groups.json `changeOrder` keyed by groupId (`__ungrouped__` sentinel = `OPENSPEC_UNGROUPED_KEY`). Mutated via PUT `/api/openspec/groups/change-order` → `store.setChangeOrder`. Broadcast via `openspec_groups_update`. Ordering applied client-side by `orderChangesForGroup` (`openspec-board-order.ts`): persisted names first, unordered appended by `defaultChangeSort`, stale entries ignored.
 
@@ -923,6 +1842,65 @@ Package operations use pi's `DefaultPackageManager` API on the server, serialize
 Why a separate system? Pi's `DefaultPackageManager` only manages packages listed in `settings.json packages[]` (extensions/skills/prompts/themes). The pi CLI binary itself and the dashboard server package are installed directly via `npm -g` (or into `~/.pi-dashboard/` in the Electron case) and are invisible to pi's manager. `PiCoreChecker` + `PiCoreUpdater` (`pi-core-checker.ts` + `pi-core-updater.ts`) fill that gap.
 
 Core update progress delivered via typed `pi_core_update_progress` / `pi_core_update_complete` browser-protocol messages (not `package_progress` channel). Fanned out to `UnifiedPackagesSection` + `PiUpdateBadge` via `pi-core-event` DOM event. Successful core update triggers `/reload` to connected pi sessions, same as extension updates.
+
+### Project-scope disable of global resources
+
+Disabling a resource for one project writes the pi-standard settings form for the resource's *origin*. Writer: `packages/server/src/pi/resource-activation-toggle.ts`. pi itself enforces the result — no dashboard-side enforcement, no spawn flags. Endpoint: `POST /api/resources/toggle`.
+
+**Origin classification — by path, never by metadata.**
+
+- Longest-prefix match of the resolved absolute path against candidate base dirs.
+- Candidates: every package root, every `.agents` base dir pi reported, `<cwd>/.pi`, `~/.pi/agent`, `~/.agents`. Module: `resource-origin.ts::collectOriginCandidates`.
+- NOT by `metadata.scope` / `metadata.source` / `metadata.baseDir`.
+- A project-scope disable of a global resource mutates exactly those fields: `scope` → `project`, `source` → `local`, `baseDir` undefined.
+- Metadata-keyed classifier cannot recognise, on re-enable, the resource it re-declared. Path stable across the operation; metadata not.
+- Longest-prefix order-independent. `cwd === $HOME` makes `<cwd>/.pi` a strict ancestor of `~/.pi/agent`; an ordered scan would misclassify.
+
+**Four origins, four project-scope forms:**
+
+| origin | written form |
+|---|---|
+| loose under `<cwd>/.pi` | `-<rel to .pi>` in `skills`/`extensions`/`prompts`/`themes` |
+| loose under an `.agents` base dir | `-<rel to that base dir>` |
+| package-contributed | `{ source, autoload: false, <type>: ["-<rel to package root>"] }` in `packages` |
+| loose under a global base dir | resource's own FILE as `~`-prefixed plain entry + anchored glob exclusion `!**/<agent dir rel to home>/<rel>` |
+
+**Package delta rules.**
+
+- `autoload: false` mandatory on a project delta; destructive to omit. Without it pi resolves the entry at project scope, misses the user install path, drops the package's entire contribution.
+- Delta form project-scope only. At global scope `dedupePackages` discards a second same-scope entry; the toggle mutates the existing entry in place.
+- Entries matched by normalised identity, never raw source string. npm → name without version. git → host/path unified across SSH + HTTPS. local → resolved path. (`packageIdentity` mirrors pi's `getPackageIdentity`.)
+- A genuinely project-owned non-delta entry keeps ordinary filter semantics; never gains `autoload: false`.
+
+**Global-loose rules.**
+
+- Re-declares the resource's own FILE, never a directory. Prompts, themes and flat `.md` skills have the shared root as their directory; re-declaring a root pulls every sibling into project-scope pattern evaluation.
+- Exclusion is an anchored glob. Absolute path machine-local; `~` pattern inert everywhere (`normalizeExactPattern` never expands `~`).
+- Re-enable removes the exclusion and writes nothing in its place. No `+` force-include.
+- Re-declared resource reports `scope: project` / `source: local`.
+
+**Ownership, trust, tracking.**
+
+- Plain-entry ownership recorded in `~/.pi/dashboard/resource-entry-ownership.json`, NOT in `.pi/settings.json`. Keeps the settings file pi-standard, one settings write per toggle, ownership machine-local.
+- Re-enable removes the plain entry only when this dashboard wrote it (`resource-entry-ownership.ts`). Un-owned entry left behind; residue inert.
+- `<cwd>/.pi/settings.json` git-tracked → a project-scope disable shared with collaborators + inherited by every worktree.
+- `POST /api/resources/trust` — persists a project-trust decision through pi's `ProjectTrustStore`. Client names an option id only (`trust` / `trust-parent` / `decline`); server re-derives that option's updates via `trustOptionsFor`. Requires an outstanding trust challenge raised by a real toggle — none → 409.
+- Toggle returns `trust_required` (403) when the folder needs a decision; client presents the dialog, then retries. Gate: `resource-toggle-trust.ts::resolveToggleTrust`.
+
+**`defaultProjectTrust` consequence.**
+
+- Toggle guarantees an explicit recorded trust decision exists after the write.
+- EXCEPT `defaultProjectTrust: always` — proceeds WITHOUT recording. Deliberate: folders the user merely toggled are not enrolled into a durable trust record.
+- CONSEQUENCE: tightening `always` → `ask`/`never` later stops previously written disables applying until the folder is trusted explicitly.
+- Writing `.pi/settings.json` itself makes a folder trust-requiring (`TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES` begins with `settings.json`). First toggle in a fresh folder prompts once where pi would not have.
+
+**Settings-write caveat.**
+
+- pi's write is NOT JSONC-preserving. `persistScopedSettings` does a whole-file `JSON.parse` → `JSON.stringify(mergedSettings, null, 2)` round trip: comments discarded, file reformatted.
+- A settings file containing comments fails to parse; pi retains `projectSettingsLoadError` and `saveProjectSettings` returns WITHOUT writing.
+- The toggle fails loudly (409) on a settings load error instead of reporting success.
+
+Only newly-started sessions see a change: `PackageManager.resolve()` runs at session start. `/api/resources/reload` reloads affected sessions. See change: project-scope-disable-global-resources.
 
 ### Settings → Packages tab
 
@@ -1094,6 +2072,60 @@ Optional OAuth2 authentication protects the dashboard when accessed remotely.
 8. WebSocket upgrade requests are also validated — external connections without valid cookie or trusted network get 401
 9. Supported providers: GitHub (hardcoded endpoints), Google/Keycloak/OIDC (via OIDC discovery)
 
+#### `auth.redirectBaseUrl` — reverse-proxy OAuth base
+
+Optional string field in `~/.pi/dashboard/config.json`.
+No default.
+Absent = previous behaviour unchanged.
+Change: `config-override-oauth-redirect-base`.
+
+**Purpose.** Dashboard behind reverse proxy on stable custom domain: `https://pi.example.com` → nginx → `:8000`.
+No dashboard-managed tunnel.
+Without field `buildRedirectUri()` emits `http://localhost:8000/auth/callback/github`.
+Provider rejects with `redirect_uri_mismatch`.
+
+**Base precedence** (`buildRedirectUri(provider, port, baseOverride?)`, `packages/server/src/auth/auth.ts`):
+1. `auth.redirectBaseUrl` — highest
+2. `getTunnelUrl()` — active tunnel
+3. `http://localhost:<port>` — fallback
+
+Trailing slashes stripped from winning base.
+Empty string treated as absent — falls through.
+
+**Path prefix supported.** `https://pi.example.com/pi` → `https://pi.example.com/pi/auth/callback/github`.
+
+**Call sites** (`packages/server/src/auth/auth-plugin.ts`):
+- `/auth/login` — single-provider auto-redirect
+- `/auth/start/:provider` — authorize redirect
+- `/auth/callback/:provider` — token exchange
+
+OAuth2 requires token-endpoint `redirect_uri` byte-identical to authorize-endpoint one.
+
+**Operator MUST register same callback URL with provider too** (GitHub/Google/Keycloak app settings).
+Config field alone not enough.
+
+**Hot reload.** `PUT /api/config` → `writeConfigPartial` → `loadConfig()` → `fastify._reloadAuth(newConfig)` → `authState.redirectBaseUrl` reassigned.
+No restart needed.
+
+**Trap — boot-time empty provider registry.** `registerAuthPlugin` returns early on zero resolvable providers ("Auth configured but no providers resolved — auth disabled") BEFORE registering `/auth/*` routes and BEFORE installing `_reloadAuth`.
+Server booted with zero resolvable OAuth providers → any `auth.*` change via `PUT /api/config` inert until restart.
+
+**Validation** (`warnOnInvalidRedirectBase()`, `packages/server/src/auth/auth.ts`).
+Warns at plugin registration + every auth reload when value not absolute `http`/`https` origin, or carries query string / fragment.
+Value still USED, never discarded.
+Typo = visible provider rejection + log line, not silent no-op.
+
+**Scope — OAuth redirect URIs only.** Pairing QR codes, `GET /api/tunnel/endpoints`, "Accessible at" surfaces still derive from `getTunnelUrl()`.
+Dashboard with `redirectBaseUrl` set advertises tunnel host in those places.
+Known + accepted.
+Top-level `publicBaseUrls` stays separate — not an OAuth tier (D7).
+
+**Settings UI field.** Settings ▸ Security carries the input — `packages/client/src/components/settings/SettingsPanel.tsx`, testid `redirect-base-url-input`.
+Writes `auth.redirectBaseUrl` through existing `PUT /api/config` path.
+Empty input sends `""` — clears override. Omitting key PRESERVES old value instead.
+Help text states provider-side registration requirement.
+Gateway action writes same key when oauth mode selected (see Gateway URL Management).
+
 ### Server-Keypair Device Pairing
 
 Second auth path beside OAuth. Pairs a device to a server via QR/copy-string. Mints long-lived bearer token. Change: `add-server-keypair-pairing`.
@@ -1108,7 +2140,7 @@ Server ensures persistent Ed25519 keypair at `~/.pi/dashboard/identity.key` (060
 
 #### QR / copy-string pairing
 
-Two QR kinds (D1). **Pairing QR** = secure payload `{v,id,code,urls[]}` = protocol version, fingerprint, one-time ~60s code, TLS-only reachable URLs. `urls[]` holds https/wss only (D14) — never self-signed LAN; includes MagicDNS with provisioned `tailscale cert`; Gateway provider endpoints plus operator-configured `pairing.publicBaseUrls`. Rendered as QR plus copyable base64url string. **Link QR** = per no-TLS http mesh/LAN endpoint. Encodes bare URL string only — no pairing payload, no crypto.subtle, no bearer. Link-QR arrival governed by `config.trustedNetworks`. Module `packages/server/src/pairing.ts`.
+Two QR kinds (D1). **Pairing QR** = secure payload `{v,id,code,urls[]}` = protocol version, fingerprint, one-time ~60s code, TLS-only reachable URLs. `urls[]` holds https/wss only (D14) — never self-signed LAN; includes MagicDNS with provisioned `tailscale cert`; Gateway provider endpoints plus operator-configured `publicBaseUrls` (legacy `pairing.publicBaseUrls` fallback). Rendered as QR plus copyable base64url string. **Link QR** = per no-TLS http mesh/LAN endpoint. Encodes bare URL string only — no pairing payload, no crypto.subtle, no bearer. Link-QR arrival governed by `config.trustedNetworks`. Module `packages/server/src/pairing.ts`.
 
 #### Compare-code approval — D12
 
@@ -1150,7 +2182,7 @@ Payload plus handshake carry `v`. Server keeps backward-compatible pairing route
 
 #### Operator pairing view — client
 
-Operator-side pairing view = `packages/client/src/components/PairingView.tsx`. Mounts Settings → Security ("Pair a device"). Client-only change: no new server route. `/api/pair/payload` + `/api/pair/approve` already shipped by `add-server-keypair-pairing`. Change: `wire-nonzrok-pairing-view`.
+Operator-side pairing view = `packages/client/src/components/Gateway/GatewayPairQR.tsx`. Gateway settings page + toolbar Gateway dialog. ONE surface; Settings → Security renders a link (`security-pair-link` testid → `/settings/gateway`, scrolls `#connect-a-device`). `PairingView.tsx` deleted (duplicate; drifted non-compliant). `QrCodeDialog.tsx` deleted (orphan; no importer). `noSecureRoad` flag keys the no-secure-road block on the `no_reachable_endpoint` response; endpoint-count empty rendering remains separate. No server route changed. `/api/pair/payload` + `/api/pair/approve` already shipped by `add-server-keypair-pairing`. Change: `wire-nonzrok-pairing-view`, `collapse-pairing-into-gateway`.
 
 On open calls `GET /api/pair/payload` → `{v,id,code,urls[]}`. Renders QR (`qrcode` dep, `QRCode.toCanvas` idiom) plus base64url copy-string. Device accepts raw JSON or base64url via `decodePayloadString`. Shows fingerprint `id`, one-time code TTL countdown (~60s, `CODE_TTL_MS`), advertised `urls[]`.
 
@@ -1159,6 +2191,142 @@ Approval: operator types numeric confirm code shown on device → `POST /api/pai
 `no_reachable_endpoint` → empty state. Pairing needs secure context. Empty state offers Start tunnel (`/tunnel-setup`) plus `http://localhost` same-machine note. Never implies plain-http LAN pairs in a browser.
 
 Gate: `reachableUrls()` (`packages/server/src/pairing.ts`) read-time filter (D4/D14) advertises only secure `wss`/`https` endpoints. Keeps `urls[]` secure. `createPayload()` returns null when no reachable url → route returns `{success:false,error:"no_reachable_endpoint"}` (HTTP 200).
+
+### Gateway URL Management
+
+Change: `config-override-oauth-redirect-base`.
+Operator declares reachable gateway URLs + auth posture in one statement.
+Server reads at runtime via mtime-gated config snapshot.
+
+#### `publicBaseUrls` — promoted to top level
+
+`pairing.publicBaseUrls` promoted to top-level `publicBaseUrls?: string[]`.
+Source: `packages/shared/src/config.ts`.
+Read through `resolvePublicBaseUrls(config)`.
+Top-level first.
+Legacy `pairing.publicBaseUrls` fallback.
+Else `[]`.
+NOT in `DEFAULTS`.
+Never seeded by `ensureConfig()`.
+Absence selects the legacy fallback.
+`[]` default would orphan existing entries.
+
+Consumers:
+- `server.ts` `getReachableUrls`
+- `system-routes.ts` `GET /api/tunnel/endpoints`
+- client `gateway-config-ops.ts`
+
+OAuth-isolation rule (D7): `publicBaseUrls` NOT an OAuth redirect-base tier, at any arity.
+Reason: list vs scalar arity.
+OAuth `redirect_uri` = one pre-registered origin.
+Operator states it in `auth.redirectBaseUrl`.
+
+TLS gate unmoved (D8).
+Stays read-time in `PairingManager.reachableUrls()`.
+Non-loopback `http://` entry in promoted list never reaches a pairing QR.
+
+Client writer `appendPublicBaseUrl(config, url, {allowInsecure})` = single writer.
+Seeds top-level from legacy on first write.
+
+#### Gateway action — one statement, one write
+
+One operator statement → ONE `PUT /api/config`.
+Writes:
+- `publicBaseUrls`
+- `cors.allowedOrigins`
+- `auth.redirectBaseUrl` (iff oauth mode)
+- `trustedNetworks` (iff trusted-network mode)
+- `gateways[]` provenance record
+
+Code: pure algebra `packages/client/src/lib/gateway/gateway-action.ts`.
+Exports:
+- `validateGatewayDraft`
+- `buildGatewayAddPatch`
+- `buildGatewayRemovePatch`
+- `computeGatewayStatus`
+- `buildGatewayFixPatch`
+
+UI: `packages/client/src/components/Gateway/GatewayUrlManager.tsx`.
+Rendered by BOTH `GatewayPage.tsx` and `GatewaySetupGuide.tsx`.
+One shared component — cannot drift.
+
+Scheme rules:
+- `http://` → trusted network REQUIRED
+- `http://` → QR pairing ineligible
+- `http://` → OAuth ineligible
+- `https://` → trusted network optional
+- `https://` → both eligible
+- At least one auth mode mandatory either way
+
+CIDR prefill reuses `suggestTrustEntries`.
+Exact `/32`.
+Never a subnet.
+
+Provenance `wrote{}` = exact values.
+Remove deletes only recorded values STILL EQUAL in live config.
+Limit: identical-value authorship indistinguishable.
+Removing clears an operator's hand-set `auth.redirectBaseUrl`.
+Both dialogs say so.
+
+Status computed on read, never persisted.
+States: OK / Incomplete / Conflicting / Ineligible.
+Fix = reconcile-to-record delta write.
+Never re-run add.
+
+Status checks trusted networks against the EFFECTIVE merge.
+Merge = top-level `trustedNetworks` ∪ `auth.bypassHosts`.
+Settings writes the second key.
+
+**D15 — persisting is not applying.** CORS `origin` callback + `networkGuard` read mtime-gated snapshot (`packages/server/src/config-snapshot.ts`).
+Exports: `getConfigSnapshot`, `liveCorsAllowedOrigins`, `liveTrustedNetworks`.
+Boot closure replaced.
+`statSync` ~1.9 µs steady state.
+Full read+parse ~24.5 µs.
+Cache MUST stay mtime-gated.
+Boot snapshot silently reinstates the bug.
+Hand-edited `config.json` never passes through the writer.
+
+`_reloadAuth(newAuth, fullConfig)` now merges top-level `trustedNetworks` exactly as boot does.
+Fixes PRE-EXISTING bug.
+Any auth-carrying `PUT /api/config` dropped them until restart.
+
+New route `DELETE /api/config/auth/providers/:id`.
+`deleteAuthProvider` in `config-api.ts`.
+Idempotent.
+Refuses last provider without `?force=true`.
+Lockout, not disable.
+
+New route `GET /api/auth/diagnostics`.
+Returns `{redirectBase, source, authActive, providerCount}`.
+Guarded.
+Loopback-reachable.
+Same line mirrored to `server.log` at register/reload.
+
+#### `trustProxy` stays off — D14
+
+Fastify constructed WITHOUT `trustProxy`.
+Deliberate.
+`trustProxy` rewrites `request.ip` from `X-Forwarded-For`.
+`request.ip` = what BOTH authorization bypasses read:
+- `auth-plugin.ts` auth-gate bypass
+- `localhost-guard.ts` `networkGuard` bypass
+
+Enabling makes both gates header-forgeable.
+Includes the gate on `PUT /api/config`.
+Also splits REST from the WS upgrade path.
+WS upgrade authorizes on `socket.remoteAddress`.
+
+Instead: session cookie `Secure` derives from RESOLVED redirect base scheme.
+`resolveRedirectBase` in `auth/auth.ts`.
+Operator-stated config.
+No request header can influence.
+
+Prerequisite if anyone ever wants `trustProxy`:
+Move BOTH bypass points to `request.socket.remoteAddress` FIRST.
+Only safe together.
+Only the first change looks harmless.
+
+Regression test: `packages/server/src/__tests__/forwarded-ip-trust.test.ts`.
 
 ### Settings Panel
 The web client includes a Settings panel (gear icon in sidebar header → `/settings` route) that lets users view and edit all dashboard configuration. The panel:
@@ -1170,14 +2338,128 @@ The web client includes a Settings panel (gear icon in sidebar header → `/sett
 
 ### Reconnection Flow
 1. Browser reconnects with `subscribe` message including `lastSeq`
-2. Server replays missed events from in-memory buffer in async batches of 50 with backpressure handling
+2. Server compacts the in-memory window via `compactEventsForReplay`, then replays missed events in async batches of 200 (`REPLAY_BATCH_SIZE`) with backpressure handling
 3. Browser's event reducer processes replay, rebuilding state
 
-### Bridge Reconnection (State Reset)
+**Replay compaction** (change: `compact-warm-replay-stream`, issue #399): warm (in-memory) replay ships the raw live stream. Every assistant `message_update` carries a full content snapshot, not a delta. Reopening a large session replayed ~20k events; cold (on-disk) path `packages/shared/src/state-replay.ts` synthesizes ~1k. `sendEventBatches` (`packages/server/src/browser-handlers/subscription-handler.ts`) composes pure `compactEventsForReplay` (`packages/server/src/session/replay-compaction.ts`) with existing `truncateToolResultForReplay` map. REPLAY ONLY — store keeps full stream for live path, "Show full output", status extraction. Sibling precedent: `packages/server/src/session/replay-truncate.ts`.
 
-`packages/extension/src/session-sync.ts::handleSessionChange` sends old-session `session_unregister` with `reason: "session_change"` before `/resume`, `/new`, or `/fork` registers the replacement session. `packages/extension/src/bridge.ts` sends `reason: "quit"` on terminal `session_shutdown`. Legacy unregister messages without `reason` remain terminal.
+Drop rule:
+- Drop every `message_update` before LAST `message_end` in window.
+- Two exemptions.
 
-`packages/server/src/pi/pi-gateway.ts` tracks each session owner as `{ws, generation}`. Owner guard rejects stale `session_register` and every stale non-unregister session message. Stale socket unregister, close, and heartbeat callbacks cannot unregister or delete the current owner for the same `sessionId`. `ownerGenerations` is deleted with owner cleanup. Current-owner quit or terminal unregister ends the session. Current-owner automation close finalizes immediately. Other current-owner close events keep reconnect-grace behavior. `closeSession()` closes the socket only; the owner close handler performs disconnect and automation finalization.
+Exemption — thinking updates:
+- `data.assistantMessageEvent.type` starts with `thinking` (`thinking_start|thinking_delta|thinking_end`).
+- Client builds `role:"thinking"` rows from them, carrying `startedAt` + `duration`.
+- `message_end` reconstruction path (`reconstruct-reasoning-on-replay`) rebuilds without them.
+- Dropping NOT state-equivalent.
+
+Exemption — last text update before tool start:
+- Last text `message_update` before each `tool_execution_start`.
+- At `tool_execution_start` reducer flushes `streamingText` into permanent row keyed `flush-<toolCallId>`.
+- No preceding update → `streamingText` empty → no flush → row lands at `message_end` with different id and position.
+- Snapshots cumulative; keeping only last reproduces `streamingText` exactly.
+
+Invariants:
+- Everything after last `message_end` = still-streaming tail, kept verbatim.
+- Non-`message_update` events always pass through.
+- Seq values NEVER rewritten.
+- Client `getEvents` tolerates gaps; monotonicity preserved.
+- `sendEventBatches` returns PRE-compaction highest seq.
+- `clearReplaying` cannot re-send already-delivered events as catch-up.
+
+Correctness = CLIENT reducer:
+- Acceptance gate `packages/server/src/__tests__/replay-compaction-equivalence.test.ts` imports `packages/client/src/lib/chat/event-reducer.ts`.
+- Asserts `deepEqual(reduceAll(raw), reduceAll(compacted))` across fixtures.
+- COUPLING: any change to how reducer consumes `streamingText` or thinking events invalidates rule.
+
+Measured (synthetic #399-shaped window, 140 messages × ~150 snapshot updates):
+- Events 21420 → 420 (98.0%).
+- Wire bytes 6.26 MB → 0.10 MB (98.4%).
+- Batches 429 → 3 (99.3%).
+- Compaction wall time 2.2 ms, single O(n) pass.
+- Real persisted session: cold path emits 1428 events; compaction verified NO-OP (1428 → 1428).
+- Pass safe to apply uniformly to both replay paths.
+
+See change: `compact-warm-replay-stream`.
+
+**Replay windowing + gap backfill** (changes: `lazy-load-session-history`, `fix-lazy-history-backfill-ux`, `add-tail-only-replay-window`): full-stream replay can exceed the browser budget. `memoryLimits.maxReplayEvents` (default `2000`; explicit `0` = unlimited) caps it. Above `0`, `sendEventBatches` ships head + tail windows, then browser backfills the middle on demand. Second shape via `memoryLimits.replayWindowMode` (see Memory Limits): `"tail-only"` ships NO head — replay opens at the tail, browser walks down to the store floor.
+
+#### Windowing (`packages/server/src/browser-handlers/subscription-handler.ts`)
+- `sendEventBatches(ws, sessionId, stored, sendTo, windowLimit?, mode = "head-tail")`.
+- Window applied AFTER `compactEventsForReplay`, never before. Compaction ~20:1.
+- Returned high-water seq stays the PRE-compaction max of the full input array. Windowing never lowers it. `clearReplaying` catch-up depends on this.
+- Keyed on CONTENT not call site: `lastSeq === 0 || lastSeq > maxSeq` = full stream → window. Genuine delta (`lastSeq > 0`) never windowed, never emits `history_window`.
+- `computeReplayWindow(compacted, windowLimit, mode)` returns `{headEnd, tailStart}` or `null`.
+- Tail-only → `headEnd: 0`. `HEAD_RATIO` / `HEAD_MIN` / `HEAD_CAP` never consulted.
+- `headMaxSeq` special-cased to `0` when `headEnd === 0`: `full[headEnd - 1]` would index `full[-1]` and throw. `0` = "nothing above the gap", NOT "no window".
+- `MIN_REPLAY_WINDOW` clamp mode-independent: tail-only limit below 100 still clamps up to 100.
+- Short-circuit: `compacted.length <= windowLimit` → no window, `gapCount` 0.
+- `HEAD_RATIO` 0.1, `HEAD_MIN` 20, `HEAD_CAP` 200. `head = clamp(floor(limit*0.1), 20, 200)`, `tail = limit - head`.
+- Default geometry at 2000: head 200 (at `HEAD_CAP`, protected chat head maximal), tail 1800. `compacted.length <= windowLimit` short-circuit → sessions compacting under the limit take the pre-change path exactly.
+- Tail leading edge snaps FORWARD to next `message_start`/`turn_start`. Head trailing edge snaps BACKWARD to a `message_end`. Both bounded by `SNAP_LOOKUP` 200. Both SHRINK the window, so budget stays a hard cap.
+- `session_state_reset` emitted INSIDE `sendEventBatches`, keyed on `replayWindow !== null`, immediately before `history_window`. Ordering: reset → `history_window` → `event_replay`. Call-site guards removed (change: `add-tail-only-replay-window`).
+- Fixes latent cold-hydration bug: the fan-out had no guard and relied on the reducer's `firstSeq === 1` rule. Tail-only breaks it — tail replay opens at `tailMinSeq > 1`, so prior client state would get the tail APPENDED onto stale rows.
+- Old call-site guard keyed on UNCOMPACTED `events.length` while the window is computed on the COMPACTED array — could reset a stream that then fit. Gone.
+- Stale-`lastSeq` reset (`lastSeq > maxSeq`) KEPT, NOT window-gated. Windowed → frame from `sendEventBatches`, exactly once. Unwindowed stale case → NO frame; batch starts at seq 1, `firstSeq === 1` rule wipes transcript on arrival.
+
+#### Window protocol (`packages/shared/src/browser-protocol.ts`)
+- Server→browser `history_window { sessionId, headMaxSeq, tailMinSeq, gapCount, oldestGapSeq, windowShape? }`. Sent once per subscriber, before first `event_replay`, full-stream paths only.
+- `windowShape` OPTIONAL additive field: `"head-tail"` | `"tail-only"`. Absent → `head-tail` (backward compatible).
+- `headMaxSeq` invariant widened `>= 1` → `>= 0`. Exactly `0` in tail-only = nothing above the gap. Clients READ `windowShape`, NEVER infer from `headMaxSeq === 0`.
+- `gapCount` = gap events the store HOLDS. Never the seq distance. Middle-trimmed store reports fewer.
+- Browser→server `history_backfill { sessionId, fromSeq, toSeq }` (both inclusive).
+- Server→browser `history_backfill_result { sessionId, events, servedFrom, servedTo, remainingGapCount, error? }`. `error` ∈ `not_subscribed | in_flight | out_of_range | stale_generation`.
+- Exactly ONE result per request on every path, refusals included.
+
+#### Backfill server (`handleHistoryBackfill`)
+- Serves in-memory store only. Never reads the session file.
+- `EventStore.getEventsRange(sessionId, minSeq, maxSeq)` — binary search both bounds + one slice, O(log n + k). `getRangeProbe()` is test-only instrumentation.
+- Span clamped to `BACKFILL_MAX_SPAN` 500 events. Range clamped into the disclosed gap.
+- Span clamp moves the NON-abutting bound: raises `from` on a tail-adjacent request, lowers `to` on a head-adjacent one. Oversized tail-adjacent slice keeps its tail adjacency (lowering `to` would break crediting and invert the next request → failure loop).
+- Single-flight per (socket, session) → second concurrent request refused `in_flight`.
+- Subscription generation bumped on every subscribe; completion at a stale generation replies `stale_generation`, never dropped.
+- Response compacted with `compactEventsForReplay(slice, slice.length)` — explicit supersession boundary, because the boundary is array-relative and a gap slice's `message_end` lives outside it.
+- Gap is SYMMETRIC: `tailMinSeq` mutable like `headMaxSeq`. Served range credited to whichever edge it abuts — tail-adjacent → `tailMinSeq = servedFrom`; head-adjacent → `headMaxSeq = servedTo`; a both-adjacent final request credits the TAIL (exclusive). `remainingGapCount` store read over both edges terminates the loop.
+- `GapState.hasHead` gates the head credit (change: `add-tail-only-replay-window`). Derived from the MODE that produced the window, never from the bound. Without it, `from === 1` against `headMaxSeq === 0` satisfies `from === headMaxSeq + 1` → credits a head that does not exist → sets `headMaxSeq = to` → poisons every later `remainingGapCount`.
+- Termination driven by whichever bound the served range abuts. Backfill tail-anchored → normally `tailMinSeq` RETREATING. `headMaxSeq` advances only in `head-tail`; in `tail-only` it never moves.
+- Slice snaps its GAP-FACING edge: lower for a tail-anchored request, upper for a head-anchored one, chosen by request ORIENTATION so a legacy head-first client stays correct. Snap only shrinks, never empties (empty `events` array = client termination signal). Credit edge from POST-SNAP served bounds.
+
+#### Client gap UI
+- `packages/client/src/lib/chat/history-gap.ts` — `HistoryGapState`, `HISTORY_GAP_ROW_ID`, `nextBackfillRange`. `nextBackfillRange` walks DOWN from `tailMinSeq` (tail-anchored), so "Load earlier" delivers the events immediately preceding what the user reads. `HistoryGapState.tailMinSeq` mutable, updated from `servedFrom`; `headMaxSeq = servedTo` update dropped (two-edge move double-shrinks a gap credited once).
+- Head-free floor: `nextBackfillRange` floors at `oldestGapSeq` instead of `headMaxSeq + 1` (`isHeadFree(gap) ? gap.oldestGapSeq : gap.headMaxSeq + 1`).
+- `HistoryGapState.atFloor` = walk reached `oldestGapSeq`, nothing further to request. SUCCESS terminus, distinct from `unservable` (store cannot serve; walk continues).
+- `historyGapTerminus(gap)`: `null` for a two-sided gap (divider spliced out), `"session-start"` when `oldestGapSeq <= 1`, else `"not-retained"`. Wording names neither retention nor compaction — the floor answers "is anything below", never "why is it gone".
+- Synthetic `ChatMessage` role `historyGap`, spliced at the head→tail boundary during the `event_replay` fold. Never produced by `reduceEvent`.
+- `packages/client/src/components/chat/HistoryGapDivider.tsx` — click-to-load interstitial. States: idle / loading / refused / unavailable / removed-when-filled.
+- Backfill splice touches `messages[]` only: no `maxSeqMapRef` move, no `publishSessionEvents`, no `replayPersister` write.
+- Backfill segment stamped before merge: every still-running tool row → `elided` (`ChatMessage.toolStatus`, `ToolCall.status`). Terminal status, "result not loadable"; renders neutral "result not loaded", never spinner, never error styling. Also finalizes assistant rows the segment left `isStreaming`. Backfill segments ONLY, never the initial windowed replay (a live mid-tool run must stay on the supersede-heal path).
+- A windowed replay is NOT written to the client replay cache. Prevents caching a sparse array as contiguous, which would make the next reload a cache hit that delta-subscribes and hides the gap permanently.
+- Backfill armed only after the initial replay terminates (`isLast: true`).
+- Gap state cleared on `session_state_reset` and on re-subscribe.
+
+#### Tail-only auto-load (change: `add-tail-only-replay-window`)
+- Pure `shouldAutoLoadHistory(t)` in `packages/client/src/lib/chat/history-gap.ts`; `SETTLE_MS = 120`. Tail-only only.
+- Keyed on INTENT, not position: `scrollTop` clamps at 0 so a delta rule stalls; a splice smaller than the proximity band yields no new rising edge.
+- ONE `programmaticScrollUntil` stamp (`Date.now() + SETTLE_MS`) shared by all nine `ChatView` scroll writers.
+- `handleScroll` only RECORDS; evaluation happens at settle-timer expiry — a momentum stream evaluates once.
+- Suppressed evaluation DEFERRED, not consumed: re-evaluated at expiry.
+- No `touchend` latch: WebKit fires `touchend` BEFORE inertia begins; a latch would evaluate mid-momentum.
+- A11y announcement lives in `ChatView`, OUTSIDE the virtualized list (`aria-live="polite"`, `data-testid="history-gap-live-region"`). `HistoryGapDivider` is a virtualized row the virtualizer unmounts after a splice — a live region there is not in the DOM when its text changes. Scoped to AUTOMATIC loads in tail-only.
+
+Measured (docker harness, 4825-event session, median of 5): full-replay completion 715ms → 341ms (2.10x), wire bytes 1958KB → 834KB (-57%), delivered events 4825 → 1996. Time-to-first-rendered-row unchanged (340ms → 349ms): replay ships in `REPLAY_BATCH_SIZE` 200-event batches, so the first batch lands identically regardless of what follows.
+
+#### Client replay publication and render budget
+
+`useMessageHandler` queues `event_replay` batches per session and publishes at most once per animation frame (`setTimeout(0)` while the document is hidden). Live events flush before replay or reset boundaries; replay reset preserves `pendingPrompt`. Per-session queues prevent one large transcript from blocking another session or every composer keystroke. Loading ends only after the terminal replay marker, including empty-session markers.
+
+Bridge `message_update` handling uses a session-scoped `MessageUpdateCoalescer` (`packages/extension/src/message-update-coalescer.ts`). Text snapshots use a fixed 50 ms window, last snapshot wins, and the window never debounces indefinitely. Thinking, tool, and unknown update types flush pending text before forwarding. Every non-update boundary flushes before `message_end`, `message_start`, or pass-through events. Message generation plus `role:timestamp` key drops stale updates after message end, session switch, reconnect, or shutdown.
+
+User image rows derive `imageCount` and retained images from user message blocks; retained or fitted images render as thumbnails/lightbox content. Completed-message replay compaction remains replay-only and preserves sequence cursors, streaming tails, thinking updates, and reducer output. The newer `compactEventsForReplay` contract supersedes any older one-pass implementation details. Both replay limits remain active: initial subscribe sends `historyWindow:{messages:200}` and terminal replay carries `HistoryWindowMetadata`; `App` stores it and `ChatView` offers `Load full history` via unwindowed `lastSeq:0` subscribe. Separately, `maxReplayEvents`/`replayWindowMode` creates event-count gaps handled by `history_backfill`.
+
+#### Compact workspace sidebar
+
+`useSidebarState` stores the compact flag in browser-local state. `SessionList` keeps folder actions and session cards while reducing folder padding, auxiliary sections, and gaps. Compact mode preserves the final folder basename with `shrink-0 whitespace-nowrap`; parent path may truncate. Settings exposes the toggle in both settings route and overlay. Disabling compact mode remounts hidden folder surfaces.
+
 
 When a bridge extension reconnects (e.g., after `pnpm run reload` or network recovery):
 1. Bridge sends `session_register` with `eventCount` to re-register the session
@@ -1196,6 +2478,46 @@ Without the `session_state_reset` message (full replay path), replayed events wo
 
 **Agent streaming state recovery**: The bridge tracks `isAgentStreaming` in process-level `BridgeState` (survives reload). Set `true` on `agent_start`, `false` on `agent_end`/`session_shutdown`. Since the replay doesn't include `agent_start`/`agent_end` events, the session status would otherwise stay "active" (displayed as "Waiting for input") when the agent is mid-turn during reconnect.
 
+### ask_user Tool-State Restoration (bridge reconnect)
+
+Change: `restore-ask-user-tool-state-on-reconnect`. `ask_user` `tool_execution_start` is NOT a transcript entry, so never replayed. Bridge reconnect ends with synthetic `agent_start` that cleared `currentTool`. Prompt-blocked session rendered "Thinking…" forever. Two registries + derived-field fold fix it.
+
+#### Two prompt registries (NOT the same map)
+- `pendingUiRequests` — extension UI RPC prompts. Written by `trackUiRequest`; read by `hasPendingUiRequest()`.
+- `pendingPromptRequests` — PromptBus prompts. Written by `trackPromptRequest`; read by `hasPendingPromptRequests()`.
+- Both live in `packages/server/src/pairing/browser-gateway.ts`. Accessors return ids / booleans, never prompt payloads.
+- `onUnregister` clears BOTH via `clearPendingRequestsForSession(sessionId)`.
+- Leak ⇒ permanent `hasPendingAsk: true` ⇒ session never reapable.
+- Notify log separate (change: `split-notify-from-prompt-request`): `ctx.ui.notify` moved off PromptBus onto dedicated `notify` message. Never writes `pendingPromptRequests`, never feeds `hasPendingAsk` union or `currentTool` fold. NOT cleared by `clearPendingRequestsForSession` — ended session keeps rows; reapability by exclusion, not deletion. See Notify Flow.
+
+#### `currentTool` derived-field contract
+- `DashboardSession.currentTool` derived from live pi events by `extractSessionUpdates()` in `packages/server/src/session/event-status-extraction.ts`.
+- `tool_execution_start` → toolName. `tool_execution_end` → null. `agent_start` → null + streaming. `agent_end` → null + idle.
+- Two code paths → two mechanisms:
+  - M1 fold — `extractSessionUpdates(event, hasPendingPrompt)`. Event-derived update would leave `currentTool` empty + prompt pending ⇒ writes `"ask_user"`. LIVE events only, never replay. Function stays pure.
+  - M2 direct writes — `prompt_request` / `prompt_dismiss` / `prompt_cancel` branches in `packages/server/src/event-wiring.ts` sit OUTSIDE the `event_forward` block; never reach extractor. Write for themselves.
+- Precedence: live tool always wins. `tool_execution_start{bash}` → `bash`; registry not consulted.
+- `hasPendingPrompt: false` output byte-identical to pre-change.
+- `prompt_request` branch trigger-complete: evaluates unread trigger + `questionFirst` reorder itself. Correctness independent of race vs `tool_execution_start`.
+- New legal field pair: `status: "idle"` + `currentTool: "ask_user"` (agent_end while prompt pending).
+
+#### Replay exit reconcile
+- Both exits — `replay_complete` and 5s safety timeout — run reconcile → recompute → drain, fixed order.
+- `reconcilePromptRequests(sessionId, promptIds)` treats bridge re-sent `prompt_request` burst as authoritative snapshot; drops tracked entries absent. Recovers `prompt_dismiss` lost across socket drop.
+- Recompute one-directional: registry non-empty ⇒ `"ask_user"`; registry empty ⇒ leave event-derived value untouched.
+- Drain applies to ephemeral per-replay set (`replayPromptIds`), NEVER durable registry. Durable one backs browser-refresh dialog replay.
+- `replay_complete` guarded by `if (replayingSessions.delete(sessionId))` — only FIRST exit acts. OpenSpec-state cleanup OUTSIDE guard (idempotent); replay slower than 5s does not lose it.
+
+#### Reaper pending-ask union
+- `embed-lifecycle-controller.ts` wires `hasPendingAsk: (id) => hasPendingUiRequest(id) || hasPendingPromptRequests(id)`.
+- Explicit, not `currentTool` accident: `currentTool` vetoes only idle gear; `streamingGearVerdict` reads `hasPendingAsk`, never `currentTool`.
+
+#### Restart preserves gateway port
+- `packages/server/src/spawn-process/restart-helper.ts` propagates `--pi-port` alongside `--port`.
+- Without it: restarted server re-resolves `piPort` from file config (usually absent) ⇒ fallback 9999. Live pi bridges still dial old port; fail to re-register. Sessions vanish after restart.
+
+See change: `restore-ask-user-tool-state-on-reconnect`.
+
 ### Session File Deduplication
 When pi continues a session via `--session <file>`, it reuses the same JSONL file but may create a new session ID. The server detects this: when a new session registers with a `sessionFile` already associated with another session, the old session's `sessionFile` is cleared. This prevents the Resume button from loading the wrong conversation.
 
@@ -1204,16 +2526,180 @@ When the bridge extension is loaded multiple times (e.g., local project + global
 - **Pi gateway**: When a `session_register` changes the connection's session ID, the old session is cleaned up if it has `source: "unknown"` or no `sessionFile`
 - **Event wiring**: When `session_register` arrives, any active sessions in the same cwd that have no sessionFile, no events, aren't connected, and were created within 30s are removed as ghosts
 
+### Bridge Connection Contention (one live bridge per session id)
+
+Change: `fix-duplicate-bridge-registration`. Two live bridges once claimed one
+`sessionId`; gateway map resolved last-writer-wins. Newcomer silently displaced
+incumbent. Every server→extension message — prompts included — delivered to the
+displaced socket. Session looked healthy everywhere; prompts vanished. Fix:
+gateway now enforces **one live bridge per session id** as an invariant.
+
+Decision logic in `packages/server/src/pi/bridge-contention.ts`. Kept out of
+`pi-gateway.ts` so the two-factor rule tests against synthetic sockets — the
+decisive "OPEN but not writable" state is not constructible from a real client
+socket. See change: `fix-duplicate-bridge-registration` (D1, D2, D4, D6).
+
+#### Claim point (D0)
+
+Real claim is the first-message identity block in `pi-gateway.ts` — NOT the
+`session_register` dispatch. `session_register` is itself that first message.
+`session_register` branch keeps `connections.set` as a no-op re-assert for the
+socket that already owns the id, and as the id-change path claim.
+
+Contention decision runs BEFORE every register side effect: watchdog clear,
+placeholder cleanup, `resetHeartbeat`, callbacks, `onEvent`. Refused newcomer
+reaching any would strip the incumbent's `sessionFile`, consume its spawn token,
+or reset its reconnect-grace timer. Refusal path short-circuits before all.
+
+Ownership gate after register. `session_heartbeat` and `model_update` name
+`msg.sessionId`. Without a gate, in-flight frames from a refused socket reset
+the incumbent's heartbeat or overwrite its `processMetrics`. Gate drops every
+message whose named id is not held by that socket (`connections.get(id) !==
+ws`).
+
+Id-change contention decision hoisted above the watchdog clear. `clearByCwd`
+would disarm a pending spawn watchdog before the register is refused.
+
+#### Two-factor contention rule (D1)
+
+On `session_register` for an id whose entry holds a different `OPEN` socket, the
+gateway probes the incumbent (WebSocket ping) and waits a bounded window
+(`CONTENTION_PROBE_WINDOW` = 5 s). Same two-factor rule the ping reaper already
+encodes:
+
+- **pong** → alive and serving → incumbent keeps; newcomer refused.
+- **no pong but TCP socket writable** → busy, not dead → incumbent keeps;
+  newcomer refused.
+- **neither** → dead → gateway terminates incumbent, clears entry, accepts
+  newcomer.
+
+Pong-only rule would be wrong. Pongs processed on same event loop the bridge
+blocks while running a tool; a busy bridge does not answer. Pong-only rule
+terminates the live working incumbent. Both factors demanded, not observed —
+rule deterministic, testable.
+
+**Same-pid reconnect exemption**: registering socket reporting same pid gateway
+recorded for incumbent = same pi reconnecting (previous close frame lost or in
+flight), not a duplicate. Gateway replaces the entry, never refuses. Self-reported
+pid used ONLY to AVOID a permanent refusal, never to justify one.
+
+**Placeholder incumbent** (`source: "unknown"`) never carries a recorded pid, so
+never satisfies same-pid exemption. Never a protected incumbent: a real register
+always displaces one. Closes the window.
+
+**Accepted residual — half-open incumbent undetectable.** Peer dead without a FIN
+leaves socket `OPEN` and writable, reads identical to busy, keeps the id.
+Neither reaper clears it (ping reaper keeps on `socketAlive`; heartbeat
+reschedules while `OPEN`). Id stranded until OS TCP timeout. Recovery: kill the
+losing keeper by verified pid, let survivor re-register. TCP keepalive on bridge
+sockets is the named follow-up. Known cost of never sacrificing a
+busy-but-live session, chosen deliberately.
+
+#### Terminal refusal (D2)
+
+Closing a refused socket is not enough. Bridge treats any close as transient and
+reconnects with backoff. No rejection message existed. Refused duplicate would
+loop forever, pi process alive writing into the same `.jsonl` as incumbent.
+
+New server→extension message `register_rejected` in
+`packages/shared/src/protocol.ts`. Sent BEFORE the close. Bridge stops retrying
+for that session id on receipt; surfaces the reason instead of dying silently.
+
+Refused register leaves the spawn-register watchdog armed. Watchdog reclaims the
+refused duplicate's pi by server-minted spawn token (`findPidsBySpawnToken`) —
+only processes this server spawned. Stops refused duplicate's pi writing into
+incumbent's `.jsonl`. `armSpawnWatchdog` arms EVERY spawn entry point (REST
+resume, WebSocket drag-to-resume, zombie reopen, headless reload), not just the
+WebSocket one. Browser transport optional — absent browser must not block the
+reclaim.
+
+Killing the refused newcomer by the pid it reports on the register message is
+rejected: server executing a kill on the word of an untrusted socket message.
+
+#### Identity-scoped teardown (D3)
+
+Every id-keyed cleanup fired by a closing socket — map delete, `onDisconnect`,
+`sessionManager.unregister`, automation finalize, `heartbeatTimers`/
+`heartbeatMeta` deletes — first confirms `connections.get(id) === ws`. Displaced
+or refused socket closing cannot raise a spurious disconnect on a live session,
+clear the incumbent's reconnect-grace timer, or finalize an automation run
+another socket serves.
+
+`stop()` terminates `wss.clients`, NOT `connections.values()`. `wss.close()` does
+not terminate clients; a socket outside the map would survive teardown and
+re-register against the fresh server. This is the half that made the incident
+survive two restarts.
+
+#### Prompt reporting (D4)
+
+With D0/D1 the map cannot hold a usurper; at prompt time exactly one owner, send
+is honest. "Contended" is a recorded event, not a live routing state. Record
+has explicit lifecycle, cleared by whichever comes first: refused spawn
+reclaimed, TTL expiry, incumbent disconnect, or session end. Incumbent alone
+insufficient trigger — healthy, may never disconnect, and D3 makes the refused
+socket's close a no-op for that id.
+
+`POST /api/session/:id/prompt` SHALL NOT return plain success while a contention
+record is live. Annotates the reason, distinguishable from the existing "no
+bridge" failure. Reports `delivered: true` — contended-but-delivered is the
+normal case. Annotates, does not fail.
+
+`sendToSession` returns `true` only for the socket the map holds for that id.
+
+#### Resume session-file guard (D5)
+
+Existing 409 (`session-api.ts`) keyed on session id only; did not prevent the
+incident — second keeper resumed the same session *file* under a different id.
+
+Both guard sites refuse a `continue` whose target `sessionFile` a live bridge
+already serves under ANY session id:
+- `packages/server/src/session/session-api.ts` (REST)
+- `packages/server/src/browser-handlers/session-action-handler.ts` (WebSocket
+drag-to-resume)
+
+Third site: `handleSendPrompt`'s zombie-reopen branch in
+`session-action-handler.ts` also spawns `mode:"continue"`, so it carries the
+same guard.
+
+All three call `piGateway.findLiveSessionBySessionFile`. Liveness is D1's
+two-factor definition (`isSocketAlive`), NOT raw `readyState`: a socket the
+gateway has not yet reaped, but whose transport is gone, does not block a
+resume. A TRUE half-open incumbent (`readyState OPEN`, transport still
+writable) reads as alive and DOES block the resume — the same accepted residual
+as D1, recovered by killing the losing keeper by pid.
+
+Fork exempt. Sessions with no `sessionFile` never match (placeholders store
+`undefined`). Lookup runs before the register-time `sessionFile` mutation
+(`event-wiring.ts`), which would already have nulled the key.
+
+#### Observability (D6)
+
+`/api/health` exposes:
+- `bridgeContentionCount` — cumulative, process lifetime; never reset by expiry.
+- `contendedSessionIds` — record lifecycle: reclaim / 60 s expiry / incumbent
+disconnect / session end.
+- `piGatewayPort`.
+
+Refusal log line `[gateway] contention refused: <id> incumbentPid=…
+newcomerPid=…`. Distinct from `[gateway] session registered:` so it is greppable
+as its own signal. Unknown pid renders `unknown`, never omitted.
+
+Refusal log line + health entry rate-limited to 1 per session id per 5 s
+(`CONTENTION_RATE_LIMIT`). Older bridge that ignores `register_rejected` keeps
+reconnecting; rate limit stops either surface flooding.
+
+Constants: probe window 5 s (`CONTENTION_PROBE_WINDOW`), contention record
+expiry 60 s (`CONTENTION_RECORD_TTL`), refusal rate limit 1/id/5 s
+(`CONTENTION_RATE_LIMIT`).
+
 ### On-Demand Session Loading (Server-Side)
 When a browser subscribes to a session whose events have been evicted from memory:
 1. Server sends empty `event_replay` with `isLast: false` to indicate loading
 2. Server's DirectoryService loads the session file directly via `SessionManager.open(sessionFile).getBranch()`
 3. Entries are converted via `replayEntriesAsEvents()` and stored in the event buffer (truncated, capped at 5000/session)
-4. Server sends `event_replay` in async batches with backpressure to all waiting browsers
+4. Server sends `event_replay` via `sendEventBatches` in async batches with backpressure to all waiting browsers (compaction applied; verified no-op on this path — see Reconnection Flow)
 5. If the session file is missing or corrupt, server sends `dataUnavailable: true`
 6. Concurrent loads for the same session are deduplicated
-
-**`forceRefresh` replay:** `subscription-handler.ts` bypasses memory only when `sessionFile` exists. Memory-only sessions replay from memory. Disk hydration captures the base sequence first and preserves events inserted after that sequence; post-base live events are not lost while hydration is pending.
 
 ### Flows Refresh Deduplication
 When a session sends `flows_list`, the server notifies other sessions in the same cwd to rediscover flows. To prevent infinite loops (A→refresh B→B sends flows→refresh A→...), a per-session 5-second cooldown (`recentFlowsRefresh` set) suppresses duplicate refresh requests.
@@ -1240,10 +2726,13 @@ The per-message ⤘ Fork button needs each chat bubble to carry the entry id of 
 | Events | In-memory Map | LRU eviction, max 100 sessions. Pinned if active bridge or browser subscribers. |
 | Sessions | In-memory Map + `.meta.json` | In-memory registry. Each session's state cached in per-session `.meta.json` sidecar next to `.jsonl`. On startup, `session-scanner.ts` scans `~/.pi/agent/sessions/*/` to restore all sessions from cached meta. |
 | Session meta | `~/.pi/agent/sessions/…/<id>.meta.json` | Per-session sidecar: dashboard-owned state (name, attachedProposal, hidden, source) + cached stats (tokens, cost, model, status). Debounced per-session writes (max 1/sec). Stale cache detected via `cachedAt` vs `.jsonl` mtime. |
+| Namer stop state | `~/.pi/agent/sessions/…/<id>.meta.json` (`autoNamerState`) | Auto-naming permanent stop + counters (attemptsUsed, starvedCount, waitingCount, stoppedModelRef, stopCause). Survives process restart; restored via `auto_name_state_restore` at register. Cleared on naming re-resolution or blocking-cause resolution. See change: fix-auto-naming-reasoning-model. |
+| Notify log | `~/.pi/agent/sessions/…/<id>.meta.json` (`SessionMeta.notifyLog`) | Bounded per-session notify history (cap 50, oldest-first). Not a `DashboardEvent` — `event_replay` cannot restore. Mirrored by `sessionToMeta` (full-overwrite save), restored by `sessionFromMeta` cold start, carried across bridge reattach by `memory-session-manager.register()`. See Notify Flow. |
 | Pinned directories | `~/.pi/dashboard/preferences.json` | Ordered array of cwd paths. Pinned dirs always visible in sidebar. |
 | Session order | `~/.pi/dashboard/preferences.json` | Per-cwd ordering managed by `session-order-manager.ts`. |
 | Server PID | `~/.pi/dashboard/server.pid` | Tracks running server process for daemon management. |
 | Headless PIDs | `~/.pi/dashboard/headless-pids.json` | Maps spawned headless processes to sessions. Unix: `tail -f /dev/null \| pi --mode rpc` (uses tail instead of sleep to avoid stdin pipeline bug). Windows: `pi.cmd --mode rpc` with `shell: true` and quoted paths for spaces in usernames. |
+| Custom event groups | `~/.pi/dashboard/custom-event-groups.json` | Group definitions: `customType` regex → named toggleable chat groups. Shipped defaults written on first boot. User-editable; restart-to-apply. See change: add-custom-event-group-filters. |
 | Bridge extension | `~/.pi/agent/settings.json` | On bundled installs (Electron DEB/DMG), the server auto-registers the bridge extension path in pi's global settings so all spawned pi sessions discover and load it. No-op in dev mode. |
 | Session files | `~/.pi/agent/sessions/` (pi's own) | Source of truth. Bridge loads on demand. |
 
@@ -1267,6 +2756,38 @@ Precedence: CLI flags → environment variables → config file (`~/.pi/dashboar
 | `tunnel.tailscale` | — | `{authKey}`. tailscale sub-config |
 | `tunnel.zerotier` | — | `{networkId}`. zerotier sub-config |
 | `tunnel.reservedToken` | _(auto)_ | Legacy bare zrok token. Read-time shim resolves to `{provider:"zrok", mode:"public", zrok:{reservedToken}}` in loadConfig. No disk rewrite until next save. Explicit `provider` wins on conflict |
+| `auth.redirectBaseUrl` | — | Optional OAuth redirect base for reverse-proxy deployments (`https://host[/prefix]`). Overrides tunnel/localhost base in `buildRedirectUri`. No default; absent = previous behaviour |
+| `publicBaseUrls` | — | Top-level reachable base URLs. Pairing QR + `GET /api/tunnel/endpoints` surfaces. `resolvePublicBaseUrls` reads top-level first, legacy `pairing.publicBaseUrls` fallback, else `[]`. No default; absent = legacy. Not an OAuth tier (D7) |
+| `memoryLimits.maxReplayEvents` | 2000 | Max events in full-stream replay window. Default `2000`; explicit `0` = unlimited (rollback lever). Absent/negative/non-numeric → `2000`; explicit `0` → `0`. Requires server restart. UI: Settings → Server → Memory Limits |
+| `memoryLimits.replayWindowMode` | `head-tail` | Replay window shape: `"head-tail"` default or `"tail-only"`. Unknown value coerced to default, never throws. Requires server restart. UI: Settings → Server → Memory Limits |
+
+### Memory Limits
+
+`memoryLimits.maxReplayEvents` bounds full-stream replay. Default `2000`. Explicit `0` = unlimited, the documented rollback lever.
+
+Parsing (`parseMaxReplayEvents`, `packages/shared/src/config.ts`):
+- Absent / non-numeric / negative / NaN / Infinity → default `2000`.
+- Explicit `0` → `0` (presence detected; never clamped).
+- Positive below `MIN_REPLAY_WINDOW` (100) clamps up to 100.
+- Fractional floored.
+
+`memoryLimits.replayWindowMode` picks the window shape. `"head-tail"` (default) ships head + tail, gap backfilled between. `"tail-only"` ships tail only, browser walks to the store floor. Server-scoped: one mode reshapes the transcript for EVERY client of that server. Inert when `maxReplayEvents: 0` — no window forms, mode irrelevant.
+
+Parsing (`parseReplayWindowMode`, `packages/shared/src/config.ts`):
+- Accepts exactly `"tail-only"` and `"head-tail"`.
+- Anything else → default `"head-tail"`. COERCES, never throws.
+
+Defaults + types live in `packages/shared/src/memory-limits.ts`, a BROWSER-SAFE module re-exported by `config.ts`. Reason: `config.ts` imports `node:fs`/`node:os`/`node:path` at module scope, so a VALUE import from `packages/client` ships node built-ins to the browser and the SPA dies at boot with `uv.homedir is not a function` (blank page; tsc/vitest/build all stay green). `import type` is safe. Guarded by `packages/client/src/__tests__/no-node-only-shared-imports.test.ts`.
+
+Requires server restart. Surfaced in Settings → Server → Memory Limits.
+
+Threading:
+- `cli.ts` → `server.ts` (`ServerConfig.maxReplayEvents`)
+- → `createBrowserGateway(..., maxReplayEvents)` → `BrowserHandlerContext.maxReplayEvents`.
+- `cli.ts` → `server.ts` (`ServerConfig.replayWindowMode`) → `createBrowserGateway(..., replayWindowMode)` → `BrowserHandlerContext.replayWindowMode`.
+- Programmatic server falls back to shared DEFAULT, not `0`; stays unlimited only when threaded explicitly.
+
+See change: `lazy-load-session-history`, `fix-lazy-history-backfill-ux`, `add-tail-only-replay-window`.
 
 ### Tunnel Lifecycle
 
@@ -1299,9 +2820,9 @@ Idempotent control commands against long-lived daemon (`tailscaled` / `zerotier-
 
 #### Endpoints
 
-`GET /api/tunnel/endpoints` returns tagged `{kind, url, tls}`, kind ∈ `public`|`mesh`|`magicdns`|`lan`|`local`. Multi-sourced: active provider endpoints + manual `pairing.publicBaseUrls` + LAN/local. "Accessible at" UI surface.
+`GET /api/tunnel/endpoints` returns tagged `{kind, url, tls}`, kind ∈ `public`|`mesh`|`magicdns`|`lan`|`local`. Multi-sourced: active provider endpoints + top-level `publicBaseUrls` (legacy `pairing.publicBaseUrls` fallback) + LAN/local. "Accessible at" UI surface.
 
-Manual HTTPS entry: UI "Add HTTPS URL" appends to `pairing.publicBaseUrls` via auth-gated `PUT /api/config` (no new route; `pairing` shallow-overwritten, client PUTs full pairing object). https/wss gate authoritative server-side at read time in `reachableUrls()`; plain-http dropped before advertisement.
+Manual HTTPS entry: UI "Add HTTPS URL" appends to top-level `publicBaseUrls` via `appendPublicBaseUrl` (auth-gated `PUT /api/config`; no new route). Legacy `pairing.publicBaseUrls` seeded into top-level on first write. https/wss gate authoritative server-side at read time in `reachableUrls()`; plain-http dropped before advertisement.
 
 #### Trusted-network block events
 
@@ -1425,6 +2946,34 @@ See change: `harden-external-link-handling`.
 
 | `devBuildOnReload` | false | Rebuild Vite client + restart server on `/reload` |
 
+### Custom Event Groups
+
+Custom (non-pi) extension chat rows grouped by `customType`. Definitions live in `~/.pi/dashboard/custom-event-groups.json` — maps `customType` regex patterns to named, toggleable chat groups. Created with shipped defaults on first boot. User-editable. Restart-to-apply like `config.json`; no file watcher, edits ignored until next server start.
+
+```json
+{
+  "version": 1,
+  "groups": [
+    { "id": "memory", "label": "Memory telemetry", "pattern": "^om\\.", "default": false },
+    { "id": "search", "label": "Web search results", "pattern": "^web-search-results$", "default": true },
+    { "id": "subagents", "label": "Subagents", "pattern": "^subagents:|^subagent-notification$", "default": true },
+    { "id": "flows", "label": "Flows help", "pattern": "^pi-flows-help$", "default": true },
+    { "id": "goals", "label": "Goals", "pattern": "^pi-goal-hermes:", "default": true }
+  ],
+  "seenShippedIds": ["memory", "search", "subagents", "flows", "goals"]
+}
+```
+
+- Shipped groups default visible except `memory` (`^om\.`, default hidden).
+- Reserved catch-all group `other` always exists — label "Other extension entries". Unmatched `customType` lands there. Not removable via file.
+- `id` = identity, pref key, merge key. `pattern` + `label` freely editable; `id` not.
+- `seenShippedIds` gates upgrade-merge. Deleted shipped group never resurrected by later default-group upgrades.
+- Malformed file → shipped defaults used; file left untouched; failure logged. Invalid individual entry (missing `id`, duplicate `id`, uncompilable pattern) → that entry skipped, others retained.
+- Matching runs server-side in a long-lived `worker_threads` worker, one pattern per message, per-match timeout. Pathological pattern → group quarantined for process lifetime; logged.
+- Read-only `GET /api/custom-event-groups` → `{ groups: [{ id, label, default }] }`. Patterns never transmitted — server-side concern.
+
+See change: `add-custom-event-group-filters`.
+
 ## Shared Config
 
 Both the server CLI and bridge extension read from `~/.pi/dashboard/config.json` via a shared module (`src/shared/config.ts`). On first access, the config file is auto-created with defaults.
@@ -1470,19 +3019,40 @@ Both server-launch call sites (`packages/server/src/cli.ts` and `packages/extens
 
 Every server-spawn call site injects `--require <preload-fastify.cjs>` BEFORE `--import <jiti-loader>` in the child's argv, as long as the resolver `resolvePreloadFastifyPath()` in `packages/shared/src/platform/preload-fastify.ts` finds the preload file. The order matters: Node processes `--require` before `--import`, so the preload runs through Node's **legacy synchronous CJS loader** (which predates and bypasses the ESM→CJS translator). The preload synchronously `require()`s `@fastify/ajv-compiler/standalone`, `@fastify/ajv-compiler`, and `fastify` — populating `require.cache` with those modules in `kEvaluated` state.
 
-When jiti's ESM hook later resolves an `import "fastify"`, Node's translator finds the modules already cached and short-circuits — it never enters the recursive require chain that triggers the `Unexpected module status 3` assertion on Node <22.18 / 24.1–24.2.
+When jiti's ESM hook later resolves an `import "fastify"`, Node's translator finds the modules already cached and short-circuits — it never enters the recursive require chain that triggers the `Unexpected module status 3` assertion on Node 22.0.0–22.18.x / 24.1.0–24.2.x.
 
 This is a **race-independent fix**: it doesn't try to close the timing window, it removes the racy code path from the execution trace. All four spawn sites (CLI daemon, bridge auto-start, Electron, restart orchestrator) share the resolver and the same injection pattern. See change: `preload-fastify-cjs`.
 
 #### Node-version preflight
 
-`packages/shared/src/platform/node-version-check.ts` exports `isKnownBadNode(version)` — a pure predicate flagging Node builds affected by [nodejs/node#58515](https://github.com/nodejs/node/issues/58515) (ESM loader assertion when Fastify's `@fastify/ajv-compiler` requires CJS modules). Affected ranges: `>=22.0.0 <22.18.0` and `>=24.1.0 <24.3.0`. Three consumers share the predicate:
+Single source of truth: `packages/shared/src/node-version.ts`. Exports `MIN_SUPPORTED_NODE` (`"22.19.0"`), `meetsFloor(version, floor)`, `isAffectedNode(version)`, `isOutOfEnginesRange(version)`, `isUsableNodeVersion(version)`, `isAtOrAboveEnginesCap(version)`. Version predicates live solely here — single module, no platform-split checker.
 
-- **CLI** (`cmdStart`) — emits a warning to stderr and appends it to `server.log` before spawning. Advisory only; CLI still proceeds.
-- **Bridge auto-start** (`server-launcher.ts`) — `buildReadyTimeoutMessage()` includes an issue-#58515 upgrade hint in the failure notification when `waitForReady` times out on an affected Node.
-- **Electron doctor** (`doctor.ts`) — "Node runtime compatibility" row shows `warning` with upgrade guidance.
+Floor `22.19.0`. Affected ranges: `22.0.0–22.18.x` + `24.1.0–24.2.x` ([nodejs/node#58515](https://github.com/nodejs/node/issues/58515) — ESM loader assertion when Fastify's `@fastify/ajv-compiler` requires CJS modules). Engines cap `<27` bounds the dashboard's tested range; cap excess accepted, flagged.
 
-`packages/server/package.json` declares `"engines": { "node": ">=22.18.0 <23 || >=24.3.0" }` as an npm-level advisory.
+Startup guard refuses bad Node: `packages/server/src/auth/node-guard.ts` `assertNodeVersionSupported()` runs pre-boot; exits(1) when `isAffectedNode` or `isOutOfEnginesRange` — server never starts (since change `bump-pi-compat-to-0-75`).
+
+Consumers: startup guard; Electron `lib/dependency-detector.ts` `isUsableNodeVersion` filter on detected system Node; spawn-runtime gate `evaluateVersionGate` (pi floor + affected-range check per candidate, cap excess passes with `capExceeded`).
+
+Root `package.json` declares `"engines": { "node": ">=22.19.0 <27" }`; `packages/server/package.json` `"node": ">=22.19.0"` as npm-level advisories.
+
+#### Spawn runtime resolution
+
+Resolves ONE pi spawn runtime — the Node binary every spawned pi session runs on. See change: `unify-pi-runtime-identity`. Ladder in `packages/shared/src/platform/spawn-runtime.ts::resolveSpawnRuntime`.
+
+Four rungs, first hit wins:
+
+1. `runtime.override` in `~/.pi/dashboard/config.json`.
+2. `node` entry in tool-overrides.json — shadowed by override, named skip in trail.
+3. User Node — login-shell first on Electron arm, PATH first on terminal arms (`npm`/`docker`); then version-manager fs probe (`~/.nvm/alias/default`), no shell.
+4. Managed `<managedDir>/node`; else bundled; else `process.execPath` — terminal rung, never fails.
+
+Gate (`evaluateVersionGate`): pass pi engines floor + not nodejs/node#58515-affected; cap excess (`isAtOrAboveEnginesCap`, `<27`) accepted, flagged `capExceeded`. Floor read from spawned pi copy engines; fallback `MIN_SUPPORTED_NODE`.
+
+Publication: `runtime.resolved` written to `~/.pi/dashboard/config.json` every server start (`packages/server/src/runtime-publication.ts::publishResolvedRuntime`). Diagnostic-only; override never written. `pi-dashboard runtime` CLI subcommand prints resolved runtime.
+
+Spawn-time re-validation (`packages/server/src/runtime-resolution.ts`): boot-time resolution cached process-lifetime; re-validated per spawn — stat signature (size/mtime/realpath) + probe for shim-shaped paths.
+
+Doctor rows: resolved runtime (+ rung/via), ABI mismatch, legacy `~/.pi-dashboard/` dir orphan test. Home split: `~/.pi/dashboard/` = user config + published runtime state; `~/.pi-dashboard/` = machine-managed runtime, managed node_modules, logs.
 
 #### AppImage CLI self-recursion guard (Linux power-user mode)
 
@@ -1615,32 +3185,27 @@ Both `pi-dashboard start` (CLI) and the bridge extension's `launchServer` write 
 
 When `autoStart` is `true` (default), the bridge extension automatically starts the dashboard server:
 
-```
-pi session_start
-       │
-       ▼
-  ensureConfig() → create ~/.pi/dashboard/config.json if missing
-  loadConfig()   → read piPort, port, autoStart
-       │
-       ▼
-  TCP probe localhost:{piPort}
-       │
-  ┌────┴────┐
-  │ open    │ closed & autoStart=true
-  │         │
-  ▼         ▼
-connect   spawn server (detached)
-silently  pass --port & --pi-port
-               │
-               ▼
-          notify user:
-          "🌐 Dashboard started at http://localhost:{port}"
-               │
-               ▼
-            connect
+```mermaid
+flowchart TD
+    Start["pi session_start"] --> Config["ensureConfig() → create ~/.pi/dashboard/config.json if missing"]
+    Config --> Load["loadConfig() → read piPort, port, autoStart"]
+    Load --> Probe['TCP probe localhost:{piPort}']
+    Probe --> Open{port open?}
+    Open -->|"open"| Connect["connect (silently)"]
+    Open -->|"closed & autoStart=true"| Spawn["spawn server (detached), pass --port & --pi-port"]
+    Spawn --> Notify['notify user: "🌐 Dashboard started at http://localhost:{port}"']
+    Notify --> Connect2["connect"]
 ```
 
 The server is spawned detached (`child_process.spawn` with `detached: true`, stdout/stderr redirected to `~/.pi/dashboard/server.log`), so it outlives the pi session. If multiple pi sessions start simultaneously, duplicate spawn attempts fail harmlessly with EADDRINUSE. After a failed launch, the bridge re-probes the port — if another agent started the server concurrently, the warning is suppressed. The auto-start logic is extracted into `server-auto-start.ts` for testability.
+
+#### Auto-start precedence: resolved port first (change: fix-autostart-discovery-precedence)
+
+`autoStartServer` (`packages/extension/src/server-auto-start.ts`) probes the resolved port BEFORE discovery, in BOTH branches (pre-launch and post-launch `spawnAndAttach`). Probe opts `RESOLVED_PORT_PROBE_OPTS`: 8000 ms timeout, 2 retries, 500 ms delay. Bootstrap-aware — retries ONLY on `AbortError` (previous instance mid-jiti-bootstrap, event loop blocked 5–15 s). `ECONNREFUSED` = definitive "nothing listens" → launch immediately, no retry delay (F7).
+
+- **Pre-launch gate (D1).** Resolved port serves → return it. Discovery NOT consulted. No mismatch record, no banner (D4). Discovery runs ONLY when resolved port silent or foreign.
+- **Warning only on silent path (D4).** `warning` toast + durable log (both ports named) fires ONLY after: resolved port probed + found silent + verified candidate discovered. Serving resolved port emits nothing.
+- **Post-launch branch (D-post).** `spawnAndAttach` re-probes resolved port after `launchServer`, same bootstrap-aware opts. Serves → return it; discovery not consulted — a stray advertiser never displaces the just-launched server. Still silent → discovery resolves ONLY our server's non-localhost address; candidates on other ports never considered; adoption health-verified, shared D3 order. Never raises "resolved port silent" warning on this path.
 
 ## mDNS Server Discovery
 
@@ -1652,6 +3217,7 @@ The dashboard uses mDNS (via `bonjour-service`) for zero-config server discovery
 3. **Auto-start** — if no server found and `autoStart` is enabled, spawn detached server
 
 ### Server Advertisement
+- **Advertisement honesty** — `advertiseDashboard(port, piPort, {bindHost})` (`packages/shared/src/mdns-discovery.ts`). Gate: `shouldAdvertise(bindHost)`. Bind loopback (`127.x`/`::1`/`localhost`) → publish NOTHING. Unset/`0.0.0.0`/`::`/LAN → advertise. Server passes `{bindHost: config.host}` at advertise time (`packages/server/src/server.ts`). Reason: loopback-bound server advertising LAN hostname = unreachable poison record.
 - On startup, the server publishes a `_pi-dashboard._tcp` mDNS service with TXT record: `{ version, pid, piPort }`
 - On shutdown, the service is unpublished
 - A continuous mDNS browser discovers peer servers and broadcasts updates to connected browsers via `servers_discovered`/`servers_updated` WebSocket messages
@@ -1660,6 +3226,11 @@ The dashboard uses mDNS (via `bonjour-service`) for zero-config server discovery
 - Bridge extensions use the mDNS discovery chain instead of bare TCP port probes
 - `isDashboardRunning(port)` replaces `isPortOpen(port)` for identity-verified detection
 - After auto-starting, the bridge waits up to 10s for the server's mDNS advertisement
+- **Resolved port outranks discovery** (change: fix-autostart-discovery-precedence) — resolved-port probe runs first, bootstrap-aware (see Auto-Start Flow above). Serves → returned, discovery not consulted. Discovery consulted only when resolved port silent or foreign.
+- **Candidates health-gated (D2)** — `firstVerifiedLocal` adopts a candidate only after `GET /api/health` succeeds at its ADVERTISED host + port (`isDashboardRunning(port, host)` — the `AutoStartDeps` seam widened from `(port: number)` to carry host). Rejection durably logged with endpoint + reason (`candidate rejected: <host>:<port> — not a dashboard (port conflict) | health probe did not answer`). Unverifiable candidate never suppresses launch.
+- **Deterministic selection (D3)** — `selectLocalCandidate`, shared by both branches: resolved-port match → lowest port → host-string tiebreak (plain codepoint compare). Total order; never advertisement arrival order. Scope: over the candidate set `discoverDashboard` returns; multicast collection window unchanged.
+- **`portConflict` falls through to discovery (D2b)** — foreign service on resolved port does NOT short-circuit; discovery still runs (a real dashboard may have relocated because a foreign service took the default port). "Port occupied" refusal (`notify` warning + log, no launch) applies only after discovery yields no verified candidate.
+- **Migration guard** (change: fix-bridge-mdns-migration-hijack) — `ConnectionManager.retargetTo(url, {trigger, verify?})` (`packages/extension/src/connection.ts`) replaces `updateUrl`. Gates, in order: cooldown (60s, `MIGRATION_COOLDOWN_MS`) → established+registered protection → candidate health probe `GET /api/health` `{ok:true}` BEFORE dropping incumbent (`verify`, wired to `probeEndpointReachability`, `packages/extension/src/instance-verification.ts`) → localhost preference (remote candidate never displaces established loopback connection; pure/lexical classification: `isLoopbackEndpoint`, `packages/extension/src/endpoint-resolution.ts`). Reversibility: 4 failed opens (`MIGRATION_MAX_FAILED_OPENS`) against migrated endpoint → return to `lastRegisteredUrl`, reset backoff, cooldown rejected endpoint. `noteRegistered()` marks last registered endpoint (bridge calls at initial `session_register` + `sendStateSync`). Every accepted/refused decision emits `onMigrationEvent` → `bridge_diagnostic` events `retarget_accepted` / `retarget_refused` (protocol `BridgeDiagnosticEvent`) — server-visible under default `keeperLog.capturePiOutput=false`.
 
 ### Known Servers
 - Users can persist remote servers in `config.json` via `knownServers: KnownServer[]`
@@ -1692,6 +3263,141 @@ An `inFlightSwitchKey` ref guards against duplicate clicks; the clicked dropdown
 - **Network Discovery section**: "Scan network" triggers `POST /api/discover-servers`, shows results with "Add" button that prompts for a label
 - Already-known servers show "Already added" badge in discovery results
 - Electron loading page shows known servers as fallback when primary server is unreachable
+
+## Bridge↔Server Connection — transport & identity (designed)
+
+> **Status:** designed, not implemented — openspec change `add-pi-gateway-transport-identity`. Source of truth: `openspec/changes/add-pi-gateway-transport-identity/design.md`. Prior research: `docs/research/bridge-transport-and-identity.md`.
+
+> Forward-looking. Sections above describe today's TCP + mDNS path (`pi-gateway.ts`, `mdns-discovery.ts`) and stay authoritative. This section documents the planned model only; today's content untouched.
+
+### A. Endpoint resolution ladder (planned)
+
+Explicit beats discovered. Always. Precedence, highest first:
+
+1. `PI_DASHBOARD_SOCKET` — explicit local socket path — **PINNED**
+2. `PI_DASHBOARD_URL` — explicit remote endpoint — **PINNED**
+3. config: pinned instance identity — **PINNED**
+4. HOME-derived rendezvous record (default local)
+5. paired remote dashboards (remote-join)
+6. mDNS — MAY SUGGEST, MAY NEVER OVERRIDE 1–5
+
+PINNED = explicit human choice. Nothing automatic replaces it. Pinned + unreachable = visible retrying failure, not silent migration. This inverts the hijack: today explicit `PI_DASHBOARD_URL` can be silently overridden; only defence is remembering `PI_DASHBOARD_NO_MDNS`.
+
+Absent rendezvous record ⇒ report no local dashboard. Does NOT fall through to discovery. Deletes the stale-advertisement failure class: today a stale mDNS answer resolves to a real, live, wrong server.
+
+**Rendezvous record** = `home-lock.ts` metadata sidecar, HOME-derived path. `LockMetadata { httpPort, piPort, identity, pid, ppid, startedAt, version, url, hostname }`. `piPort` = where to dial. `identity` = who it must be.
+
+No selection algorithm. Selector exists: `home-lock.ts` asserts one dashboard instance per `<canonicalHomedir>/.pi/`; a pi process inherits HOME. Coexisting instances use distinct HOMEs (isolated-verification precedent: temp HOME, non-8000 ports, `PI_DASHBOARD_NO_MDNS=1`).
+
+```mermaid
+flowchart TD
+    A["1 · PI_DASHBOARD_SOCKET"] -->|"PINNED"| D["dial"]
+    B["2 · PI_DASHBOARD_URL"] -->|"PINNED"| D
+    C["3 · config pinned instance identity"] -->|"PINNED"| D
+    R["4 · HOME-derived rendezvous record<br/>(default local)"] --> D
+    P["5 · paired remote dashboard<br/>(remote-join)"] --> D
+    M["6 · mDNS / discovery"] -.->|"MAY SUGGEST<br/>MAY NEVER OVERRIDE 1–5"| H["suggests to a human"]
+    D --> V{"identity verifies?"}
+    V -->|"✓"| REG["register"]
+    V -->|"✗"| REF["refuse"]
+```
+
+### B. Per-platform dial table (planned)
+
+| | POSIX | Windows | Remote |
+|---|---|---|---|
+| address | `ws+unix:///<HOME>/.pi/dashboard/gateway.sock:/` | `ws://127.0.0.1:<piPort>` | `wss://host/…` |
+| address source | HOME path | HOME sidecar → `piPort` | pairing record |
+| who may connect | socket mode `0600` (kernel) | `X-Pi-Local-Token` (`auth/local-token.ts`) | ws-ticket from device bearer |
+| server proves self | own socket | `identity` from sidecar | Ed25519 fingerprint challenge |
+| network-reachable | impossible, nothing listens | no, loopback-pinned | yes, by design |
+| protocol above | identical WebSocket | identical | identical |
+
+Protocol identical on all three. `session_register`, `ping`/`pong`, contention, send ring, every `ExtensionToServerMessage` — unchanged. Only dial destination differs. The change is an address, not a protocol.
+
+Verified experimentally before adopting: `ws+unix://` preserves `ping`/`pong`, `terminate()`, `wss.clients`, `readyState`. `bridge-contention.ts` uses WebSocket ping/pong frames as its liveness oracle for the duplicate-registration probe — survives unmodified. A ping-less transport (QUIC, raw stream) would force re-founding that subsystem.
+
+- **POSIX auth** = socket ownership. Mode `0600` in `0700` directory. Kernel enforces. No token to mint, leak, rotate, replay. Matches `0600` convention of `paired-devices.json` + `identity.key`. `--host 0.0.0.0` exposure becomes unrepresentable — nothing listens.
+- **Windows auth** = `local-token.ts`. 32-byte secret at `~/.pi/dashboard/local/token`, header `X-Pi-Local-Token`, verify `crypto.timingSafeEqual`. Loopback bind pinned to `127.0.0.1` regardless of `--host`. Known pre-existing gap: `chmod` is a no-op on Windows; owner-only property rests on inherited NTFS ACLs. Must be verified on a real Windows host, not reasoned about.
+- **Remote auth** = paired device. Reuses `pairing/pairing.ts` (one-time code, 8-digit confirm), `paired-devices.ts` (hash-only bearer registry, revocable, `0600`), `bearer-auth.ts`, `ws-ticket.ts` (single-use, ~15s, scoped upgrade ticket — durable bearer never rides the WebSocket). New `bridge` value in `WsRouteScope` (today `"browser" | "terminal" | "live"`, `packages/server/src/auth/ws-ticket.ts:22`). Remote bridge pins server Ed25519 fingerprint at pairing; refuses any endpoint that cannot answer the nonce challenge. Makes the hijack class unrepresentable, not merely guarded.
+
+Stale sockets fail closed. Bind unlinks pre-existing socket file. Client dialing a leftover path gets `ENOENT`/`ECONNREFUSED` immediately, definitively.
+
+Server may listen on both transports. `WebSocketServer({ noServer: true })`, one upgrade handler shared by a UDS listener + optional TCP listener. Transport = per-bridge property, not per-server mode. TCP listener does not bind by default.
+
+### C. Stickiness (planned)
+
+Three separate pieces of state. Separateness matters:
+
+- `pinned` — endpoint was explicit human choice; nothing automatic may replace it
+- `boundTo` — `identity` actually registered with; reconnect always targets this
+- `verify` — candidate must prove that identity before becoming `boundTo`
+
+Today none exist. `connection.ts:334` `updateUrl(newUrl)` mutates `this.url` ambiently. That ambient mutation IS the hijack — see `openspec/changes/fix-bridge-mdns-migration-hijack`.
+
+Re-target requires ALL of: current endpoint unpinned, current endpoint failed, candidate identity verifies. Otherwise bridge keeps retrying `X` and surfaces the failure.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Resolving
+    Resolving --> Connecting
+    Connecting --> Registered
+    Registered --> Dropped
+    Dropped --> Connecting: same instance always
+    Registered --> Registered: discovered candidate, REFUSED + logged
+    Dropped --> Evaluating: unpinned AND repeated failure
+    Evaluating --> Connecting: verify ✓ → rebind
+    Evaluating --> Registered: verify ✗ → keep current
+    Registered --> Moving: explicit move command
+    Moving --> Registered: pinned = true
+```
+
+### D. Explicit session move (planned)
+
+Commands:
+- `/dashboard connect <instance>` — instance = socket path | port | identity | `default`
+- `/dashboard connect --list` — rendezvous records visible under this HOME
+- `/dashboard where` — current endpoint, identity, pinned?
+
+Stickiness (C) makes automatic re-targeting hard. Move command is the escape valve — the only manual recovery for a bridge attached to the wrong instance (the 23-hour hijack has none today).
+
+Order matters: register with target BEFORE closing origin. Session never orphaned mid-move. Then `session_moved` to origin — the ONLY new protocol message — origin card reads *moved*, not *crashed*. Move sets `pinned = true`; explicit choice must survive the next reconnect.
+
+Primitives exist, no parallel path:
+- `ConnectionManager.updateUrl()` (`connection.ts:334`) — re-target
+- `pi.registerCommand("__dashboard_reload", …)` (`bridge.ts:1367`) — command template
+
+```mermaid
+sequenceDiagram
+    participant U as user
+    participant B as bridge
+    participant T as target instance
+    participant O as origin instance
+    U->>B: /dashboard connect <target>
+    B->>T: session_register
+    T-->>B: registered
+    B->>O: session_moved
+    O-->>B: ack
+    B->>B: pinned = true
+```
+
+### E. Two session sources — scope limit (planned)
+
+Dashboard learns about a session from two places:
+
+| Source | Mechanism | Travels with a move? |
+|---|---|---|
+| LIVE | bridge WebSocket events | yes |
+| HISTORY / card metadata / resume | `session/session-scanner.ts` reads `~/.pi/agent/sessions/**/*.jsonl` via `resolvePiSessionsDir()` — LOCAL filesystem | only within one HOME |
+
+Consequence table:
+
+| Move | live | history | outcome |
+|---|---|---|---|
+| same-HOME (worktree ↔ main, isolated ↔ live) | follows | follows — both scan same files | complete |
+| cross-host / remote-join | follows | does NOT — remote cannot read local `.jsonl`; `/api/session/:id/resume` cannot respawn a pi on another machine | live-only |
+
+Bounds the remote-join feature. OPEN QUESTION, not solved by this change. Directions — stream history over the bridge at register, proxy from origin dashboard, accept live-only remote sessions — differ enough in cost to need their own change.
 
 ## Provider Authentication
 
@@ -1751,14 +3457,25 @@ The dashboard includes a browser-based terminal emulator for direct shell access
 
 ### Architecture
 
-```
-Browser                              Server
-┌────────────────┐            ┌──────────────────┐
-│  xterm.js      │            │ TerminalManager   │
-│  (per terminal)│◄──binary──►│  ├─ node-pty      │
-│  FitAddon      │    WS      │  ├─ RingBuffer    │
-│  AttachAddon   │            │  └─ clients Set   │
-└────────────────┘            └──────────────────┘
+```mermaid
+flowchart LR
+    subgraph Browser["Browser"]
+        X["xterm.js (per terminal)"]
+        Fit["FitAddon"]
+        Att["AttachAddon"]
+    end
+    subgraph ServerSide["Server"]
+        TM["TerminalManager"]
+        PTY["node-pty"]
+        RB["RingBuffer"]
+        CS["clients Set"]
+    end
+    X --- Fit
+    X --- Att
+    TM --- PTY
+    TM --- RB
+    TM --- CS
+    X <-->|"binary WS"| TM
 ```
 
 ### WebSocket Protocol
@@ -1784,6 +3501,19 @@ This is separate from the main JSON dashboard WebSocket (`/ws`).
 ### Package management (install / remove / update / move)
 
 Package operations all flow through `package-manager-wrapper.ts`'s single-flight `busy` lock. The route layer (`/api/packages/install` / `/remove` / `/update` / `/move`) returns `202 { operationId | moveId }` synchronously and progress streams over the existing `package_progress` + `package_operation_complete` WebSocket channels.
+
+**Client-side single-flight queue** (added in change `unify-pi-core-into-package-queue`):
+
+Client mirrors server busy lock with FIFO singleton `packageQueue` (`packages/client/src/lib/package/package-queue.ts`). Single-flight across ALL op kinds — second enqueue returns `queued` status, not 409. `kind: "extension" | "pi-core"` discriminates dispatch path; `EnqueueRequest.kind` optional, defaults `"extension"`.
+
+- `kind: "extension"` → POST `/api/packages/{install,remove,update}` → 202 + `operationId`. Completion arrives via `package_operation_complete` WS frame.
+- `kind: "pi-core"` → POST `/api/pi-core/update` with single-name batch `{packages:[name]}`. Blocks server-side until npm finishes. Completion read from response body `body.data.results[0]`.
+
+Pi-core source key convention: `pi-core:<scoped-npm-name>` via exported `piCoreSource(name)` — convention only, `kind` is dispatch key, not prefix. Queue subscribes both window channels: `pi-package-event` + `pi-core-event`. `pi_core_update_progress` updates `running.message`. `pi_core_update_complete` deliberate NO-OP for queue — `packages/server/src/routes/pi-core-routes.ts` calls `onUpdateComplete(out)` BEFORE returning HTTP response, so WS frame reaches client FIRST; acting on it would complete early.
+
+409 retry-once (500 ms backoff) applies to both arms via shared `scheduleRetry`. Queue browser-module singleton — survives component unmount, does NOT survive page reload, not shared across clients (two tabs still 409 each other). `moveTracker` (`move` + `reset-to-npm`) stays OUTSIDE queue — `moveId`-keyed identity, partial-success semantics. `packageQueue.isAnyRunning()` exists for future cross-domain UI lock; no consumer yet.
+
+See change: `unify-pi-core-into-package-queue`.
 
 **Move semantics** (added in change `unify-package-management-ui`):
 
@@ -1985,13 +3715,106 @@ Guarded by the same network guard as `/api/config`.
 
 ### Settings UI
 
-Settings → General → **Tools** renders one row per registered tool: status badge, source, truncated path, expand-to-trail, override input, per-row rescan. The header has **Rescan all**, **Reset overrides**, **Export diagnostics**.
+Settings → Developer → **Tools** renders one row per registered tool: status badge, source, truncated path, expand-to-trail, override input, per-row rescan. The header has **Rescan all**, **Reset overrides**, **Export diagnostics**.
 
 ### Migration path
 
 `ToolResolver` remains the low-level PATH search primitive. The registry calls `ToolResolver.which()` from its `where` strategy. Unregistered binary names (e.g., ad-hoc `ripgrep` detection) still flow through `ToolResolver` directly. This keeps `ToolResolver` useful for one-off lookups and lets the registry focus on tools the dashboard formally depends on.
 
 See change: `consolidate-tool-resolution`.
+
+### Node runtime family selection
+
+`node`, `npm`, `npx` treated as ONE Node distribution — a single selected installation drives all three override keys. See change: `add-node-runtime-family-selection`.
+
+#### Enumeration
+
+`enumerateNodeCandidates()` in `packages/shared/src/node-installs/candidates.ts` lists every pickable installation. Roots mirror the strategy chains — bundled `<resourcesPath>/node`, managed `<managedDir>/node`, PATH — plus additive version-manager roots (nvm, fnm, volta, asdf) from `vm-roots.ts` (single root definition; consumers import-only, set cannot drift).
+
+Entries are per-member FILES: `nodeEntry` / `npmEntry` / `npxEntry`. Partial families legal (distro nodejs without npm) — absent entry, never fabricated path.
+
+Enumeration filesystem-only. Version from dir name (vm roots) or absent. Never spawns `node --version`.
+
+#### Selection
+
+`select.ts`: `planSelection` (pure) + `applySelection`. `applySelection` validates every entry (existing file inside the root), then ONE `registry.setOverrides()` write — all-or-nothing. Absent member key CLEARED unless hand-set. Hand-set member reported pre-write, preserved unless explicitly discarded.
+
+#### Coherence
+
+`coherence.ts` `assessFamilyCoherence` — ownership by containment. Mismatch names each deviating member + its root. Absent member alone ≠ mismatch.
+
+#### REST + UI
+
+`GET /api/node/installs` + `POST /api/node/installs/select` in `packages/server/src/routes/node-runtime-routes.ts`. UI: `packages/client/src/components/settings/NodeRuntimeSection.tsx` — Settings → Developer, next to the pi runtime picker.
+
+#### Child PATH
+
+`node-installs/child-path.ts` `prependSelectedNodeToPath` — dashboard-tooling spawns follow the selection. No selection → byte-identical legacy managed prepend. pi-session spawns governed by the spawn-runtime ladder (selection = gated step-1 candidate via `readToolOverrideNode`). Managed-tree mutations (pi-core-updater) keep managed-first.
+
+#### Win32 npm anchoring
+
+`npmCliBesideNodeStrategy` anchors on peer-resolved `node` via `StrategyDeps.resolvePeer` — bound at `getDefaultRegistry` via `bindPeerResolution`, in-flight re-entrancy guard at the binding; falls back to `deps.execPath`. Behaviour change: win32 npm now follows node's override.
+
+#### Cache
+
+`invalidateNodeCandidatesCache()` wired into `ToolRegistry.rescan()`.
+
+## Skill tool provisioning
+
+Skill packages can declare the external tools they need through a `pi.tools` manifest in their package.json. The registry ingests these at server bootstrap, so a skill tool IS a registry tool — same `list()` / `/api/tools` / Settings → Developer → Tools surface, same override + diagnostic trail. Two faces: library `ensureTools` and CLI `pi-dashboard-ensure`. Distinct from the build-time `pi-dashboard-resolve-tool.cjs` wrapper (path-only, untouched).
+
+See change: `add-skill-tool-provisioning`.
+
+### `pi.tools` manifest
+
+- Array in the skill package's package.json under `pi`, sibling to `pi.skills`.
+- Entry = `{ id, probe, optional? }` only. No shell strings — install recipes stay first-party in the registry's `installHints` for that id.
+- Id charset `^[A-Za-z0-9_][A-Za-z0-9._-]*$` — the set of legal env-var names.
+- Parser `parseSkillTools` validates strictly (exact key set, charset, known probe kinds) and names every rejected entry.
+- Ingestor `ingestSkillTools` (both in `packages/shared/src/tool-registry/pi-tools.ts`) is idempotent: unknown id → synthesized probe-kind def; known id → referenced, never clobbered.
+- Default `probe` = `resolve`.
+
+### Probe kinds → strategies (`strategies.ts`)
+
+| probe | strategy | semantics |
+|---|---|---|
+| `env` | `envProbeStrategy` | boolean presence; value never read — logs stay free of secrets |
+| `docker-image` | `dockerImageProbeStrategy` | `docker image inspect`; never assumes docker exists |
+| `pw-browser` | `pwBrowserProbeStrategy` | `PLAYWRIGHT_BROWSERS_PATH` or per-OS cache dir under homedir |
+| `resolve` | `whereStrategy` | existing PATH chain |
+| `static-npm` (new) | `staticNpmStrategy` | binary path read from package export — bare string (`ffmpeg-static`) or `{ path }` (`@ffprobe-installer/ffprobe`) |
+
+New `Source` values: `static-npm`, `probe`. `Resolution.path` nullable when `ok` for non-path kinds (`env`).
+
+### Media tool definitions (`definitions.ts`)
+
+| Tool | Kind | Chain | Hint |
+|---|---|---|---|
+| `ffmpeg` | binary | override → static-npm(`ffmpeg-static`) → where | per-OS package manager |
+| `ffprobe` | binary | override → static-npm(`@ffprobe-installer/ffprobe`) → where | per-OS package manager |
+| `imagemagick` | binary | override → where (`convert`) | per-OS package manager |
+| `chromium` | probe | override → pw-browser | `npx playwright install chromium` (requiresConfirm) |
+| `agent-browser` | binary | override → where | `pi install npm:pi-agent-browser` |
+| `pi-doc-engine` | probe | override → docker-image | `npm run build:image` (requiresConfirm) |
+
+All registered on every platform — the strategies themselves are cross-platform.
+
+### Consent
+
+- Default stance: recommend-only. A missing tool never installs anything.
+- Opt-in auto-run — `ensureTools(..., { autoInstall: true })` or CLI `--install` — executes ONLY resolved first-party `installHints.commands[pkgmgr]` values. A skill manifest can never contribute an executable string.
+- `PlatformInstallHint.requiresConfirm` gates network+exec hints (playwright download, image build). Confirmation per invocation; no TTY → auto-deny.
+- Report matrix: `present` / `recommended` / `installed` / `degraded` / `blocked`. `ok: false` ⇔ a required tool not present/installed. Optional tools degrade, never block.
+
+### Two faces
+
+- Library: `ensureTools` (`ensure.ts`) — returns an `EnsureReport`; never throws for missing tools.
+- CLI: `pi-dashboard-ensure` (`packages/shared/bin/pi-dashboard-ensure.mjs` → `ensure-cli.ts`). Reads a package's `pi.tools`, ingests, ensures, prints the report. tsx launcher — the probe strategies are TypeScript registry code. Flags `--install`, `--json`; exit 0 when every required tool present/installed.
+- Distinct from build-time `pi-dashboard-resolve-tool.cjs` (path-only, no-transpiler, untouched).
+
+### Surfacing
+
+`ingestInstalledSkillTools` runs at server bootstrap (`packages/server/src/cli.ts`). Scans `<root>/node_modules/@blackbelt-technology/<pkg>/package.json` + `<root>/packages/<pkg>/package.json` manifests, ingests into the registry, surfaces through the existing `list()` / `GET /api/tools` / Settings → Developer → Tools rows. No new reporting path. Invalid manifests skipped — a doc bug never breaks startup.
 
 ## Path Handling (`platform/paths.ts`)
 
@@ -2048,27 +3871,14 @@ MSYS exists for legitimate reasons (porting GCC, Autotools, git itself — softw
 
 ### The four-cell failure-mode matrix
 
-```
-                          HOST OS
-                       ┌─────────────┬─────────────────┐
-                       │  POSIX      │  Windows        │
-        ───────────────┼─────────────┼─────────────────┤
-        argv-position  │  works      │  works          │
-        path           │             │  (MSYS converts)│
-        ───────────────┼─────────────┼─────────────────┤
-        EMBEDDED       │  works      │  ❌ broken      │
-        in JS source   │             │  MSYS can't     │
-        passed via     │             │  see inside     │
-        node -e "..."  │             │  string         │
-        ───────────────┼─────────────┼─────────────────┤
-        --import URL   │  works      │  ❌ broken      │
-        as raw path    │             │  Node parses B: │
-        (no file://)   │             │  as URL scheme  │
-        ───────────────┼─────────────┼─────────────────┤
-        inside .mjs    │  works      │  works          │
-        path.resolve   │             │                 │
-        ───────────────┴─────────────┴─────────────────┘
-```
+Host OS across, path form down.
+
+| Path form | POSIX | Windows |
+|---|---|---|
+| argv-position path | works | works (MSYS converts) |
+| EMBEDDED in JS source, passed via `node -e "..."` | works | ❌ broken — MSYS can't see inside string |
+| `--import` URL as raw path (no `file://`) | works | ❌ broken — Node parses `B:` as URL scheme |
+| inside `.mjs`, `path.resolve` | works | works |
 
 The two broken cells map to existing repo invariants:
 
@@ -2090,6 +3900,28 @@ The two broken cells map to existing repo invariants:
 `packages/shared/src/__tests__/no-bash-on-windows.test.ts` parses every workflow YAML, computes per-step Windows reachability from each step's `if:` filter (small grammar: `matrix.platform == 'X'`, `matrix.platform != 'X'`, `&&`, `||`, `!(...)`, parens), and fails when any `shell: bash` step is reachable on a Windows runner. Failure messages cite this change name + the offending file:line + step name. Unrecognised `if:` expressions fail closed.
 
 See change: `eliminate-bash-on-windows-runners`.
+
+## OpenSpec main-spec integrity
+
+Main specs live at `openspec/specs/<capability>/spec.md`.
+
+Parse contract: needs h2 `## Purpose` + h2 `## Requirements`. `MarkdownParser.parseSpec` throws otherwise.
+
+`findSection` matches title exactly, case-insensitive. `## ADDED Requirements` != `## Requirements`.
+
+Delta headers (`## ADDED|MODIFIED|REMOVED|RENAMED Requirements`) valid ONLY in `openspec/changes/<name>/specs/<cap>/spec.md`. Never in main specs.
+
+Archive path once copied delta specs to main verbatim. Result: 80 of 546 specs unparseable, 384 requirement blocks invisible to validate/list/show/archive.
+
+Fix tool: `node scripts/repair-main-specs.mjs` (`--dry-run`, `--specs-dir <path>`). Idempotent. Refuses `## REMOVED Requirements` — retired requirements never promote; handle manually (delete, tombstone, or restore).
+
+Gate: `npm run spec:validate` = `openspec validate --specs --no-interactive`. Runs as step "Validate OpenSpec main specs" in `ci` job in `.github/workflows/ci.yml`. Exit non-zero on any invalid spec.
+
+Before pushing an archive: run `npm run spec:validate` locally. Corrupt archive blocks `develop` otherwise.
+
+Retired capability with zero current requirements: tombstone (keep spec, one requirement naming successor) when it carries an authored `**DEPRECATED**` pointer, else delete. Zero-requirement spec does NOT validate.
+
+See change: repair-corrupted-main-specs.
 
 ## Electron Server Lifecycle
 
@@ -2213,23 +4045,18 @@ History source is **derived**, not stored: `extractUserPromptHistory(state.messa
 
 Inside `CommandInput`, history navigation uses a small state machine:
 
-```
-historyIndex: number | null    — null = not in history mode
-savedDraftRef: useRef<string>  — in-progress draft captured when history mode is first entered
+`historyIndex: number | null` — `null` = not in history mode.
+`savedDraftRef: useRef<string>` — in-progress draft captured when history mode first entered.
 
-  ArrowUp  (caret on first line, no dropdown, no pending, history.length > 0)
-    null  ─────────────────────────────────────────▶  0         (save current text first)
-    k     ─────────────────────────────────────────▶  min(k+1, len-1)
-  ArrowDown (caret on last line, no dropdown, historyIndex != null)
-    k > 0 ─────────────────────────────────────────▶  k - 1
-    0     ─────────────────────────────────────────▶  null      (restore savedDraftRef)
-  Escape  (historyIndex != null)
-    k     ─────────────────────────────────────────▶  null      (restore savedDraftRef)
-  any text edit while historyIndex != null
-    k     ─────────────────────────────────────────▶  null      (user now editing; no restore)
-  sessionId change
-                                                      null, savedDraftRef = ""
-```
+| Event (guard) | From | To | Note |
+|---|---|---|---|
+| ArrowUp (caret on first line, no dropdown, no pending, `history.length > 0`) | `null` | `0` | save current text first |
+| ArrowUp (same guard) | `k` | `min(k+1, len-1)` | |
+| ArrowDown (caret on last line, no dropdown, `historyIndex != null`) | `k > 0` | `k - 1` | |
+| ArrowDown (same guard) | `0` | `null` | restore `savedDraftRef` |
+| Escape (`historyIndex != null`) | `k` | `null` | restore `savedDraftRef` |
+| any text edit while `historyIndex != null` | `k` | `null` | user now editing; no restore |
+| sessionId change | any | `null` | `savedDraftRef = ""` |
 
 **Bash-style caret gating** is critical: `ArrowUp` only triggers history when `selectionStart` is at or before the first `\n` (the textarea's native "ArrowUp" would have nowhere to go); `ArrowDown` only when `selectionStart` is at or after the last `\n`. Non-empty selections are excluded. This guarantees multiline editing (moving between rows with arrow keys) is never broken.
 
@@ -2591,3 +4418,178 @@ Caps (caps.ts): `maxActiveEmbedSessionsPerVisitor` + `maxActiveEmbedSessionsGlob
 `createEmbedLifecycleController` (embed-lifecycle-controller.ts) constructed in server.ts. Reaper `start()`/`stop()` tied to server lifecycle. Dormant when `enabled: false`.
 
 See change: add-embed-session-lifecycle.
+
+## Knowledge Base (KB)
+
+Markdown knowledge base backed by a single FTS5 table (`chunks`) over `node:sqlite`. Zero network, zero LLM — all ranking is mechanical. Backend `SqliteFtsStore` (`packages/kb/src/sqlite-store.ts`). Config layered project → global → defaults (`packages/kb/src/config.ts`).
+
+### KB retrieval pipeline
+
+`store.search()` post-processes one FTS5 BM25 pass with a staged pipeline. Stage order:
+
+1. **Body-hash collapse** (exact-content dedup) — byte-identical chunks collapse to one `KbHit`; alternate locations become `akaPaths`. Runs FIRST so `akaPaths` computes against the full candidate set.
+2. **Source dedup** — one hit per `(root, path)`; representative = best (lowest) BM25 score; suppressed remainder counted in `KbHit.suppressedSections`.
+3. **MMR** (`diversity`, lexical over bodies, config-gated, default on).
+4. **Coverage rerank** — opt-in, default off.
+5. **Lane interleave** — `agents` lane blended into the page.
+6. **Limit slice**.
+7. **Parent expand** (`expandParent`, default on) — attaches parent `headingPath` to each hit.
+
+Source dedup differs from body-hash dedup: body-hash answers "same content, two places"; source dedup answers "already showed this file". A file vendored under two roots collapses across roots first, then dedups by source.
+
+#### `limit` = distinct sources (BREAKING)
+
+`limit` bounds **distinct sources**, not chunks. Contract change for `kb_search`, `kb search`, `store.search()`. `store.search()` still returns `KbHit[]`; only cardinality semantics change.
+
+Source dedup shrinks one source to one slot, so a pool sized at `limit` starves the page. Fetch depth = `limit × 6` when source dedup on (`limit × 4` body-hash only), capped at 4000.
+
+#### Lane quota (`ranking.laneQuota`)
+
+`agents` chunks are 3.2% of the index and ~3× longer than `doc`, so BM25 length normalisation buries the per-file record layer ~30:1. Fix is engine-side: second FTS pass restricted to `doc_type='agents'` with a shallow pool, interleaved at `ranking.laneQuota` (default 0.5). Explicit `docType` bypasses the quota. Starved lane yields its slots to the other; a source taken by one lane is never repeated (when source dedup on).
+
+Swept over bundled fixtures; 0.5 = largest reserved share with no markdown-intent regression. See `measurements.md` sweep table.
+
+#### Coverage rerank + PRF — off by default
+
+Coverage rerank (`ranking.coverageRerank`) + RM3-style PRF (`queryExpansion.mode: "prf"`) implemented, tested, config-gated, **default off**. Measured a net regression on bundled fixtures (markdown-intent R@10 0.630 → 0.491; combined 0.566 → 0.524; latency ~4×). PRF applies only with coverage rerank on; expanding an OR-query deepens the dilution the rerank exists to cure. Do not present as active. See `measurements.md` D4.
+
+#### Condensed render
+
+Result render emits leaf heading, not breadcrumb, plus `(+N more sections)`. Full `headingPath` retained in `KbHit` and the JSON format, so `kb_get(path, section)` still addresses a section.
+
+#### `kb_get` path-only fetch
+
+Path-only fetch (`getChunk` without `headingPath`) returns first chunk plus `suppressedSections` count. Never a silent 1-of-N slice.
+
+#### Measured outcome (31,121-chunk index, K=10)
+
+| metric | baseline | shipped |
+|---|---|---|
+| combined R@10 | 0.363 | 0.566 (+56%) |
+| duplicate-slot share | 0.48 | 0.00 |
+| distinct sources/page | 5.2 | 10.0 |
+| render tokens/page | — | −32.8% |
+
+Reproduce + full variant table: `packages/kb/eval/` (`run-fixtures.ts`, `measure-render.ts`).
+
+#### Latency — budget met at median, not p95
+
+| config | median | p95 |
+|---|---|---|
+| baseline | 20.6 ms | 34.8 ms |
+| + source dedup | 25.5 ms | 38.2 ms |
+| + lane quota 0.5 | 53.2 ms | 84.8 ms |
+
+Lane quota is the cost: its `agents` lane is a second FTS query, and `doc_type` is an UNINDEXED FTS5 column — cannot be answered by an index, scans the full match set. Scaled 31,121 → ~22,000 chunks: ≈38 ms median (passes 50 ms budget), ≈60 ms p95 (fails).
+
+See change: fix-kb-search-retrieval-quality.
+
+## Pi Gateway Transport & Identity
+
+Bridge↔server gateway transport + identity. Ground truth: `openspec/changes/add-pi-gateway-transport-identity/design.md` (decisions D0–D16), `packages/extension/src/endpoint-resolution.ts`, `packages/server/src/pi/gateway-transport-policy.ts`, `gateway-socket-bind.ts`, `bridge-upgrade-auth.ts`, `provisional-registration.ts`.
+
+See change: add-pi-gateway-transport-identity.
+
+### Transport: unix socket default, TCP by opt-in
+
+- Default listener = unix socket `<dashboardConfigDir>/gateway-<piPort>.sock` (`~/.pi/dashboard/gateway-<piPort>.sock`).
+- Socket mode `0600`, directory `0700`. Kernel enforces ownership; no token to mint, leak, rotate, replay (D5).
+- Socket path per instance, keyed by `piPort`. Same-HOME instances collide structurally never (D2).
+- Bridge dials `ws+unix://<path>:/`. Same WS protocol over the socket (D1) — `ws.ping()`/`pong` liveness oracle intact.
+- `ConnectionManager` constructed with `ws` package as `WebSocketImpl`. Global WebSocket rejects `ws+unix://` and cannot set upgrade headers.
+- TCP = opt-in only. `PI_GATEWAY_TCP` truthy (`1`/`true`/`yes`/`on`) binds listener; absent → no TCP listener (`decideGatewayListeners`, `packages/server/src/pi/gateway-transport-policy.ts`).
+- Opt-in TCP widens to configured bind host. No-socket fallback listener pins `127.0.0.1` regardless of `--host`.
+- Docker container sets `PI_GATEWAY_TCP: "${PI_GATEWAY_TCP:-1}"` (`docker/compose.yml`) — external pi sessions cannot reach the in-container socket; TCP kept with bridge auth mandatory (D10b).
+- Windows = always loopback. No unix socket. `ws://127.0.0.1:<piPort>`, authorised by `X-Pi-Local-Token` (D6).
+- sun_path fallback: path length checked at construction, never at `bind`. `SUN_PATH_MAX` = 104 macOS/BSD, 108 Linux. Over limit → loopback + local token, reason in log (D15).
+- Stale-socket fail-closed (D9, defect B3): probe/unlink/bind serialized under exclusive companion lock `gateway-<piPort>.sock.lock` (`proper-lockfile`). Probe `live` → `GatewaySocketConflictError`, never unlink. Reclaim only on `ENOENT`, or `refused` + `<socketPath>.pid` records a provably dead owner (`isProcessAlive`). Timeout fails closed — saturated live backlog looks exactly like it.
+- On unbind: socket path + `.pid` + `.lock` sentinels removed. Idempotent (task 2.5).
+
+### Endpoint resolution: precedence ladder (D3)
+
+`resolveEndpoint` (`packages/extension/src/endpoint-resolution.ts`) — pure decision table. Every input passed in; the ladder is enumerable, not emergent from I/O order. Highest first:
+
+| # | source | input | class |
+|---|---|---|---|
+| 1 | `PI_DASHBOARD_SOCKET` | explicit local socket path | **PINNED** |
+| 2 | `PI_DASHBOARD_URL` | explicit endpoint | **PINNED** |
+| 3 | pinned instance | operator config | **PINNED** |
+| 4 | rendezvous record | `~/.pi/dashboard/server.lock.meta.json` (HOME-derived) | default |
+| 5 | paired remote | remote-join feature | — |
+| 6 | mDNS / discovery | suggestion only | **never overrides** |
+
+- mDNS never wins. Discovered candidate surfaces as `suggestion` only, informational, for deliberate operator action.
+- Absence = unavailable, never discovery (D0). Resolution `available:false` + reason. No silent substitute.
+- Rendezvous record written by the lock holder only (D2). Truncated / partially-written record = absent, never partially trusted (D15).
+- Stickiness (D4): once registered with instance X, bridge reconnects only to X. Re-target requires all of: current endpoint unpinned, current endpoint failed, candidate identity verified (`decideRetarget`).
+- Pinned endpoint unreachable → visible, retrying failure — never silent migration to something else.
+
+```mermaid
+flowchart TD
+  A["bridge starts"] --> B["resolveEndpoint"]
+  B --> C1{"PI_DASHBOARD_SOCKET set?"}
+  C1 -- "yes" --> P1["dial socket — pinned"]
+  C1 -- "no" --> C2{"PI_DASHBOARD_URL set?"}
+  C2 -- "yes" --> P2["dial endpoint — pinned"]
+  C2 -- "no" --> C3{"pinned instance configured?"}
+  C3 -- "yes" --> P3["dial pinned instance — pinned"]
+  C3 -- "no" --> C4{"rendezvous record?"}
+  C4 -- "yes" --> P4["dial record endpoint — not pinned"]
+  C4 -- "no" --> C5{"paired remote?"}
+  C5 -- "yes" --> P5["dial paired remote — not pinned"]
+  C5 -- "no" --> U["unavailable + reason; mDNS = suggestion only"]
+  P1 --> D["dial, verify instance id, register"]
+  P2 --> D
+  P3 --> D
+  P4 --> D
+  P5 --> D
+  D --> R{"current endpoint failed?"}
+  R -- "no" --> SERVE["serve"]
+  R -- "yes" --> G["decideRetarget"]
+  G -- "pinned / not failed / identity unverified" --> STAY["keep retrying current endpoint"]
+  G -- "unpinned + failed + identity verified" --> B
+```
+
+### Auth model
+
+`decideBridgeUpgrade` (`packages/server/src/pi/bridge-upgrade-auth.ts`) — pure per-transport gate. Asymmetry is the point:
+
+| transport | credential | mechanism |
+|---|---|---|
+| unix socket | none | kernel via `0600` socket in `0700` dir (D5) |
+| loopback TCP | `X-Pi-Local-Token` | 32-byte secret `~/.pi/dashboard/local/token`, verified with `crypto.timingSafeEqual` (D6) |
+| remote TCP | single-use bridge-scoped ws ticket | minted from paired-device bearer or genuinely-local caller; rides upgrade only |
+
+- Loopback = `127.0.0.1`/`::1` AND absence of proxy-forwarding headers (`hasProxyForwardingHeaders`). `ssh -L`, zrok, host nginx present as loopback → not genuinely local.
+- Ticket scope `bridge` added to `WsRouteScope` (`packages/server/src/auth/ws-ticket.ts`). Single-use, ~15 s TTL, path `/ws/bridge`. Carried in `?ticket=` query or `sec-websocket-protocol` `pi-ticket.` entry. Durable bearer never rides the WebSocket.
+- Remote TCP requires a valid ticket always. No grace, ever.
+- Tokenless loopback accepted during deprecation window, logged `deprecated: true`; refused after horizon (1.0.0).
+- Refusal causes distinct — no-credential ≠ bad-credential: `local-token-missing`, `local-token-invalid`, `no-ticket`.
+- Server identity = Ed25519 fingerprint (`auth/identity.ts` → `~/.pi/dashboard/identity.key`), per-HOME, stable across restarts. Stored at pairing; verified by nonce challenge before registering (D8). Stale or hostile server cannot impersonate a pinned identity.
+- Rendezvous instance id = separate concept (D14, defect B1): `<dashboardConfigDir>/instances/<piPort>.id`, `0600`, per-instance, stable across restarts. Identifier, never a capability — `/api/health` publishes it unauthenticated. Answers "which instance answered"; never proof of entitlement.
+- Local token (or socket ownership) proves entitlement; instance id only names the instance (D14).
+
+### Move command (D11)
+
+- `/dashboard-connect <target>` — move the live session to another dashboard. Target: exact `instanceId` | port | unambiguous id prefix (git-short-sha style) | explicit socket path / `ws://` URL | `default` (D11b).
+- Ambiguous id prefix refused, never resolved — silently choosing moves the session wrong and still looks like it worked.
+- `/dashboard-list` — every gateway instance under this HOME, default first (display-only scan, `packages/shared/src/instance-directory.ts`). Never auto-picks an endpoint.
+- `/dashboard-where` — current endpoint, identity, pinned? for this session.
+- Sequence: connect target → provisional registration → verify instance id → commit. Origin keeps serving until commit succeeds (D11).
+- Provisional registration (`provisional-registration.ts`) claims NO routing entry, no contention slot, no heartbeat. Returns target `instanceId` + token. TTL 30 s (`PROVISIONAL_TTL`). Refusal = `provisional_rejected`, cause never on the wire — no session-enumeration oracle.
+- Routing transfers only on `session_move_commit`. Send-ring ownership: exactly one owner at every instant; origin owns until target acknowledges, then single swap instant.
+- `session_moved` → server sets `movedTo` + `status: "ended"` + `endedAt` (`packages/server/src/event-wiring.ts`). Card reads *moved*, never *crashed*.
+- Every failure — refusal, identity mismatch, timeout (30 s), transport error — drops the target and keeps the origin. Move that cannot complete = no-op, never an outage.
+- Move pin in-memory, process-lifetime only (D11a). Nothing on disk. Restarted pi re-resolves through the D3 ladder. Feeds existing `decideRetarget({ pinned })` stickiness gate.
+- Cross-host target: transcript stays on origin host — history and resume do not follow (`assessTranscriptFollow`, locality decided from endpoint, never path sent on wire). Warning surfaced before move.
+
+### Remote transcripts + read-only boundary (D12, D13)
+
+- Sessions addressed by id ONLY. `decideTranscriptRequest` (`packages/extension/src/transcript-request-guard.ts`) refuses any path-bearing field: `path`, `file`, `filePath`, `filepath`, `sessionFile`, `sessionDir`, `dir`, `cwd`. Refusal on field presence, never value validation — validating values is a traversal-parsing contest.
+- Shape checked before subject: two refusals cannot be differenced into an existence check. Foreign `sessionId` refused — bridge serves only its own session.
+- Backfill: lazy, interruptible, background after registration. Live events forward eagerly. Cursor = offset + length + hash of last consumed line; mismatch → re-read from start, never resume (append-only is measured, not provable over time).
+- Retention: `<dashboardConfigDir>/remote-transcripts/<sessionId>.jsonl` (`~/.pi/dashboard/remote-transcripts/`). File `0600`, dir `0700`. `sessionId` validated `^[A-Za-z0-9_-]{1,64}$` — rejected, never sanitised (write-anywhere guard).
+- Restarted read REPLACES, never appends — duplicated second pass corrupts the retained copy. `.complete` sidecar marker; transcript byte-identical to origin.
+- Origin derived from the authenticated bridge credential, never bridge-claimed (`attributeOrigin`, `packages/server/src/session/session-origin.ts`). unix / loopback → local. Remote + `deviceId` → remote. Unattributable remote → remote, fail closed. Claimed fields (`claimedDeviceId`, `claimedLocal`, …) ignored.
+- Remote-origin sessions refuse local file reads (`mayReadLocalSessionFile`: `remote-origin` | `no-session-file`) — same-username path collision would serve an unrelated host's transcript.
+- Remote-origin sessions refuse resume (`decideResume`: `remote-origin-ended` | `remote-origin-live`) — local resume would attach a writer to another host's transcript. Read-only after bridge ends (D13).

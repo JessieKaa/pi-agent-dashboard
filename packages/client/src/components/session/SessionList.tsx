@@ -1,17 +1,21 @@
-import { SidebarFolderSectionSlot } from "@blackbelt-technology/dashboard-plugin-runtime";
+import { SidebarFolderSectionSlot, useFolderMenuRefreshRunner } from "@blackbelt-technology/dashboard-plugin-runtime";
+import { Confirm } from "@blackbelt-technology/pi-dashboard-client-utils/Confirm";
 import type { CommandInfo, DashboardSession, ImageContent, OpenSpecData, OpenSpecGroup } from "@blackbelt-technology/pi-dashboard-shared/types.js";
-import { DndContext, type DragEndEvent, type DragStartEvent, PointerSensor, TouchSensor, useSensor, useSensors } from "@dnd-kit/core";
+import { DndContext, type DragEndEvent, type DragOverEvent, type DragStartEvent, MeasuringStrategy, PointerSensor, TouchSensor, useSensor, useSensors } from "@dnd-kit/core";
 import { arrayMove, SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
-import { mdiChevronDown, mdiChevronRight, mdiChevronUp, mdiClose, mdiCog, mdiConsoleLine, mdiFolder, mdiFolderOpen, mdiOpenInNew, mdiPin, mdiPlus, mdiPuzzleOutline, mdiSortVariant } from "@mdi/js";
+import { mdiArchiveOutline, mdiBroom, mdiChevronDown, mdiChevronRight, mdiChevronUp, mdiClipboardCheckOutline, mdiClose, mdiCog, mdiConsoleLine, mdiFileDocumentOutline, mdiFolder, mdiFolderOpen, mdiPin, mdiPlus, mdiPuzzleOutline, mdiRefresh, mdiSortVariant, mdiSourceBranch, mdiTextBoxCheckOutline, mdiViewGridPlus } from "@mdi/js";
 import { Icon } from "@mdi/react";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "wouter";
 import { useFolderUrgencySort } from "../../hooks/useFolderUrgencySort.js";
+import { useInitStatus } from "../../hooks/useInitStatus.js";
 import { useInstallPrompt } from "../../hooks/useInstallPrompt.js";
 import { maybeAutoInitWorktreeOnSpawn } from "../../lib/git/auto-init-worktree.js";
+import type { WorktreeInitStatus } from "../../lib/git/git-api.js";
 import { t as i18nT, useI18n } from "../../lib/i18n/i18n.js";
-import { resolveWorkspaceFolderReorder, resolveWorkspaceReorder, sameTypeClosestCenter } from "../../lib/layout/sidebar-dnd.js";
+import { compatibleClosestCenter, resolveFolderMove, resolveWorkspaceFolderReorder, resolveWorkspaceReorder, SPRING_LOAD_DWELL_MS } from "../../lib/layout/sidebar-dnd.js";
 import { buildFolderHomeUrl } from "../../lib/nav/route-builders.js";
+import { removeOpenSpecOptOut } from "../../lib/openspec/openspec-config-api.js";
 // TerminalCard removed — terminals now in TerminalsView
 import {
   getCollapsedGroups,
@@ -34,10 +38,11 @@ import { floatAskUserFirst } from "../../lib/session/session-status-visuals.js";
 import { encodeFolderPath } from "../../lib/util/folder-encoding.js";
 import { truncatePathMiddle } from "../../lib/util/truncate-path.js";
 import { TunnelButton } from "../connectivity/TunnelButton.js";
-import { FolderActionBar } from "../folder/FolderActionBar.js";
-import { FolderNeedsYouPill } from "../folder/FolderNeedsYouPill.js";
+import { FolderActionBanner } from "../folder/FolderActionBanner.js";
+import { FolderActionsMenu, type FolderMenuItem } from "../folder/FolderActionsMenu.js";
 import { FolderSpawnButtons } from "../folder/FolderSpawnButtons.js";
-import { FolderStatusRollup } from "../folder/FolderStatusRollup.js";
+import { FolderStatusCapsule } from "../folder/FolderStatusCapsule.js";
+import { projectSetupLabel } from "../folder/folder-menu-labels.js";
 import { FolderOpenSpecSection } from "../openspec/FolderOpenSpecSection.js";
 import { InstallButton } from "../packages/InstallButton.js";
 import { PiLogo } from "../primitives/PiLogo.js";
@@ -47,13 +52,15 @@ import { ThemeToggle } from "../settings/ThemeToggle.js";
 import { allTagsInUse } from "../tags/all-tags.js";
 import { TagDeleteConfirmDialog } from "../tags/TagDeleteConfirmDialog.js";
 import { TagFilterGroup } from "../tags/TagFilterGroup.js";
+import { AddFoldersDialog } from "../workspace/AddFoldersDialog.js";
 import { AddToWorkspaceMenu } from "../workspace/AddToWorkspaceMenu.js";
 import { NewWorkspaceDialog } from "../workspace/NewWorkspaceDialog.js";
-import { PinDirectoryDialog } from "../workspace/PinDirectoryDialog.js";
+import { PinnedTierDropZone } from "../workspace/PinnedTierDropZone.js";
 import { SortableWorkspace } from "../workspace/SortableWorkspace.js";
 import { SortableWorkspaceFolder } from "../workspace/SortableWorkspaceFolder.js";
 import { WorkspaceHeader } from "../workspace/WorkspaceHeader.js";
 import { BranchSwitchDialog } from "../worktree/BranchSwitchDialog.js";
+import { ManageWorktreesDialog } from "../worktree/ManageWorktreesDialog.js";
 import { WorktreeSpawnDialog } from "../worktree/WorktreeSpawnDialog.js";
 import { DashboardSpawnButtons } from "./DashboardSpawnButtons.js";
 import { PlaceholderSessionCard } from "./PlaceholderSessionCard.js";
@@ -61,6 +68,12 @@ import { branchCache, GroupGitInfo, SessionCard } from "./SessionCard.js";
 import { SortablePinnedGroup, useFolderDragHandle } from "./SortablePinnedGroup.js";
 import { SortableSessionCard } from "./SortableSessionCard.js";
 import { SpawnErrorBanner } from "./SpawnErrorBanner.js";
+
+/** Community invite surfaced in the app header. */
+const DISCORD_INVITE_URL = "https://discord.gg/DrNebZ3pF5";
+/** Discord brand glyph — @mdi/js 7.x ships no brand icons, so the path is inlined. */
+const mdiDiscordPath =
+  "M20.317 4.369A19.79 19.79 0 0 0 15.446 3c-.21.375-.455.88-.624 1.28a18.27 18.27 0 0 0-5.644 0A12.6 12.6 0 0 0 8.548 3a19.74 19.74 0 0 0-4.874 1.372C.605 8.98-.232 13.475.186 17.905a19.9 19.9 0 0 0 6.026 3.05c.485-.66.917-1.362 1.29-2.1a12.9 12.9 0 0 1-2.03-.978c.17-.125.337-.256.498-.39a14.2 14.2 0 0 0 12.06 0c.163.135.33.266.5.39-.647.383-1.33.71-2.033.98a15.8 15.8 0 0 0 1.29 2.099 19.86 19.86 0 0 0 6.03-3.05c.49-5.138-.838-9.593-3.5-13.537ZM8.02 15.21c-1.182 0-2.152-1.086-2.152-2.42 0-1.332.95-2.42 2.152-2.42 1.21 0 2.18 1.096 2.16 2.42 0 1.334-.95 2.42-2.16 2.42Zm7.96 0c-1.183 0-2.152-1.086-2.152-2.42 0-1.332.95-2.42 2.152-2.42 1.21 0 2.18 1.096 2.16 2.42 0 1.334-.95 2.42-2.16 2.42Z";
 
 
 export interface ContextUsageInfo {
@@ -72,6 +85,11 @@ export interface ContextUsageInfo {
 }
 
 /** Escape a session id for a `[data-session-id="…"]` selector. */
+/** Draggable types that can change workspace membership. See change: drag-folders-across-workspaces. */
+function isFolderLike(t: unknown): boolean {
+  return t === "workspace-folder" || t === "pinned-group";
+}
+
 function cssEscapeId(id: string): string {
   return (typeof window !== "undefined" && typeof window.CSS?.escape === "function")
     ? window.CSS.escape(id)
@@ -92,6 +110,16 @@ interface Props {
   onSeekToCard?: (sessionId: string) => void;
   contextUsageMap?: Map<string, ContextUsageInfo>;
   openspecMap?: Map<string, OpenSpecData>;
+  /** Fleet-level ABSENT-offer switch from dashboard config
+   *  (`openspec.offerInitialization`, default `true`). Suppresses the folder
+   *  section's Initialize offer everywhere; BROKEN/STALE/READY keep rendering.
+   *  See change: add-openspec-init-affordances (D3). */
+  openspecOfferInitialization?: boolean;
+  /** `openspec.enabled` from dashboard config (default `true`). Gates the
+   *  folder menu's re-enable item — removing a per-directory opt-out cannot
+   *  make OpenSpec available when the feature is globally off.
+   *  See change: add-openspec-init-affordances (folder-actions-menu spec). */
+  openspecEnabled?: boolean;
   /**
    * Folder-HEAD branch map (`cwd → branch | null`), synced via `git_head_update`.
    * Outranks child-session branches in `GroupGitInfo`. See change:
@@ -107,7 +135,11 @@ interface Props {
   onAttachProposal?: (sessionId: string, changeName: string) => void;
   onBulkArchive?: (cwd: string) => void;
   onReadArtifact?: (cwd: string, changeName: string, artifactId: string) => void;
-  onOpenPiResources?: (cwd: string) => void;
+  /** Opens the directory's settings page. Renamed from `onOpenPiResources`:
+   *  the control's label and route have said "Directory Settings" since change
+   *  `directory-settings-page-and-scoped-md-editing`; only the prop name lagged.
+   *  See change: add-folder-actions-menu (D12). */
+  onOpenDirectorySettings?: (cwd: string) => void;
   onDetachProposal?: (sessionId: string) => void;
   /** Accept/dismiss a suggested proposal replacement.
    *  See change: replace-proposal-dialog-with-race-handling. */
@@ -148,6 +180,8 @@ interface Props {
   onReorderWorkspaces?: (ids: string[]) => void;
   /** Reorder folders within one workspace. Sends `reorder_workspace_folders`. */
   onReorderWorkspaceFolders?: (id: string, paths: string[]) => void;
+  /** Move a folder into a workspace, or eject it (`toWorkspaceId: null`). See change: drag-folders-across-workspaces. */
+  onMoveFolderToWorkspace?: (path: string, toWorkspaceId: string | null, index?: number) => void;
   workspaces?: import("@blackbelt-technology/pi-dashboard-shared/browser-protocol.js").Workspace[];
   onCreateWorkspace?: (name: string) => void;
   onRenameWorkspace?: (id: string, name: string) => void;
@@ -192,8 +226,12 @@ interface Props {
   headerExtra?: React.ReactNode;
   /** Set of session IDs that have an active error */
   errorSessionIds?: Set<string>;
-  /** Set of session IDs currently in a synthesized provider-retry phase (no terminal error). */
+  /** Set of session IDs currently in a synthesized provider-retry phase. */
   retrySessionIds?: Set<string>;
+  /** Per-session retry attempt number, for the card's activity label. Parallel to
+   *  `retrySessionIds` so the membership question stays a plain Set.
+   *  See change: unify-retry-visibility. */
+  retryAttemptMap?: Map<string, number>;
   /** Set of session IDs whose last turn was only reasoning (non-error notice).
    *  See change: fix-gemini-subagent-silent-tool-schema-failure. */
   noticeSessionIds?: Set<string>;
@@ -218,6 +256,26 @@ interface Props {
 // Re-export for backwards compatibility
 export { type DirectoryGroup, filterSessions, groupSessionsByDirectory } from "../../lib/session/session-grouping.js";
 
+/**
+ * Whether a folder group should be treated as a git repository for menu
+ * gating. Session-INDEPENDENT by construction: a folder with zero sessions
+ * has no negative evidence, so it stays eligible. Only a positive
+ * `isGitRepo === false` excludes it — the same rule the worktree spawn button
+ * already uses.
+ *
+ * See change: manage-worktrees-filter-cleanup.
+ */
+/**
+ * Initial prompt that spawns the interactive project-init scaffolder. Single
+ * source for the two call sites (tier-0 banner action + `Project setup…` menu
+ * item) so they cannot drift. See change: add-folder-action-banner.
+ */
+const PROJECT_INIT_PROMPT = "/skill:project-init";
+
+export function folderIsGitRepo(group: { sessions: Array<{ isGitRepo?: boolean }> }): boolean {
+  return !group.sessions.some((s) => s.isGitRepo === false);
+}
+
 function ToggleButton({
   active,
   onClick,
@@ -241,7 +299,7 @@ function ToggleButton({
   );
 }
 
-export function SessionList({ sessions, selectedId, onSelect, revealRequest, onSeekToCard, contextUsageMap, openspecMap, folderGitMap, openspecGroupsMap, sessionOrderMap, onReorderSessions, onSendPrompt, onOpenSpecRefresh, onAttachProposal, onDetachProposal, onReplaceProposal, onBulkArchive, onReadArtifact, onOpenPiResources, onRename, onShutdown, onResume, onResumeKeepPosition, onHideSession, onUnhideSession, onSpawnSession, spawningCwds, addSpawningCwd, clearSpawningCwd, spawnResult, onSpawnResultSeen, pinnedDirectories, onPinDirectory, onOpenPinDialog, onUnpinDirectory, onReorderPinnedDirs, onReorderWorkspaces, onReorderWorkspaceFolders, workspaces, onCreateWorkspace, onRenameWorkspace, onDeleteWorkspace, onSetWorkspaceCollapsed, onAddFolderToWorkspace, onRemoveFolderFromWorkspace, onKillTerminal, onRenameTerminal, onCollapseSidebar, commandsMap, onKillProcess, onSetProcessDrawer, onRemoveTagGlobally, inflightBashMap, onAbortTool, onOpenSpecs, onOpenArchive, onOpenBoard, headerExtra, errorSessionIds, retrySessionIds, noticeSessionIds, spawnErrors, onDismissSpawnError, resumeErrors, onDismissResumeError, compactSidebar = false, gitWorktreeEnabled: gitWorktreeEnabledProp }: Props) {
+export function SessionList({ sessions, selectedId, onSelect, revealRequest, onSeekToCard, contextUsageMap, openspecMap, openspecOfferInitialization, openspecEnabled, folderGitMap, openspecGroupsMap, sessionOrderMap, onReorderSessions, onSendPrompt, onOpenSpecRefresh, onAttachProposal, onDetachProposal, onReplaceProposal, onBulkArchive, onReadArtifact, onOpenDirectorySettings, onRename, onShutdown, onResume, onResumeKeepPosition, onHideSession, onUnhideSession, onSpawnSession, spawningCwds, addSpawningCwd, clearSpawningCwd, spawnResult, onSpawnResultSeen, pinnedDirectories, onPinDirectory, onOpenPinDialog, onUnpinDirectory, onReorderPinnedDirs, onReorderWorkspaces, onReorderWorkspaceFolders, onMoveFolderToWorkspace, workspaces, onCreateWorkspace, onRenameWorkspace, onDeleteWorkspace, onSetWorkspaceCollapsed, onAddFolderToWorkspace, onRemoveFolderFromWorkspace, onKillTerminal, onRenameTerminal, onCollapseSidebar, commandsMap, onKillProcess, onSetProcessDrawer, onRemoveTagGlobally, inflightBashMap, onAbortTool, onOpenSpecs, onOpenArchive, onOpenBoard, headerExtra, errorSessionIds, retrySessionIds, retryAttemptMap, noticeSessionIds, spawnErrors, onDismissSpawnError, resumeErrors, onDismissResumeError, compactSidebar = false, gitWorktreeEnabled: gitWorktreeEnabledProp }: Props) {
   const { t } = useI18n();
   // UI preference flag, default-on. Gates folder `+Worktree` and per-change
   // `⥂2+` buttons. See change: openspec-worktree-spawn-button.
@@ -315,6 +373,8 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
   // Worktree spawn dialog: when set, render the modal scoped to this cwd.
   // See change: add-worktree-spawn-dialog.
   const [worktreeDialogCwd, setWorktreeDialogCwd] = useState<string | null>(null);
+  // Manage-worktrees surface (change: manage-worktrees-filter-cleanup).
+  const [manageWorktreesCwd, setManageWorktreesCwd] = useState<string | null>(null);
   // Per-change worktree spawn state. When set, render the dialog prefilled
   // with `os/<changeName>` + `attachProposal=<changeName>`. Reuses the
   // existing `WorktreeSpawnDialog` component to avoid duplicate state.
@@ -352,6 +412,9 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
   // Per-folder opt-in urgency sort (default off). See change:
   // improve-dashboard-attention-routing.
   const urgencySort = useFolderUrgencySort();
+  // Fan-out over the refreshers each folder's slot sections registered; the
+  // single MAINTENANCE refresh item calls it. See change: move-slot-actions-to-menu.
+  const runFolderRefreshers = useFolderMenuRefreshRunner();
   const toggleEndedExpanded = useCallback((cwd: string) => {
     setEndedExpanded((prev) => {
       const next = new Set(prev);
@@ -452,6 +515,13 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
   // Inline state for AddToWorkspace popover and NewWorkspace dialog.
   // See change: folder-workspaces.
   const [addToWsMenuFor, setAddToWsMenuFor] = React.useState<string | null>(null);
+  // Folder actions menu open flag, keyed by folder SCOPE (`folder:<cwd>`) the
+  // same way `addToWsMenuFor` is — a cwd key would co-open a folder row and a
+  // same-cwd card. See change: add-folder-actions-menu.
+  const [folderMenuFor, setFolderMenuFor] = React.useState<string | null>(null);
+  // Broken-session cleanup confirm (moved off the deleted FolderActionBar into
+  // the folder actions menu). See change: add-folder-action-banner.
+  const [cleanupCwd, setCleanupCwd] = React.useState<string | null>(null);
   const [newWsOpen, setNewWsOpen] = React.useState<{ pendingFolder: string | null } | null>(null);
   // Workspace id awaiting a path-picker selection. When set, a
   // PinDirectoryDialog is open; on confirm the picked folder is added to
@@ -488,28 +558,86 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
   // See change: workspace-directory-drag-reorder.
   const [forceCollapsed, setForceCollapsed] = useState<Set<string>>(() => new Set());
 
+  // Spring-load (folder drags, local-only, visual). Hovering a collapsed
+  // workspace's header for SPRING_LOAD_DWELL_MS reveals its folders so the
+  // user can drop positionally. Like forceCollapsed this NEVER emits
+  // `set_workspace_collapsed`. The two pieces of state have deliberately
+  // different lifetimes: the dwell timer is keyed on the resolved WORKSPACE
+  // id (closestCenter jitters `over.id` at Voronoi boundaries, which would
+  // otherwise re-arm a timer that never completes) and is cleared when that
+  // workspace changes; `springOpen` is add-only for the whole drag, because
+  // clearing it on `over` change would re-collapse the instant the cursor
+  // entered the just-revealed children — a flicker loop.
+  // See design D6 / change: drag-folders-across-workspaces.
+  const [springOpen, setSpringOpen] = useState<Set<string>>(() => new Set());
+  /** Active draggable's `type` for the duration of a drag; gates the empty-tier eject zone. */
+  const [activeDragType, setActiveDragType] = useState<string | null>(null);
+  const springTimerRef = useRef<{ wsId: string; timer: ReturnType<typeof setTimeout> } | null>(null);
+
+  const clearSpringTimer = useCallback(() => {
+    if (springTimerRef.current) {
+      clearTimeout(springTimerRef.current.timer);
+      springTimerRef.current = null;
+    }
+  }, []);
+
   const handleDragStart = useCallback((event: DragStartEvent) => {
+    setActiveDragType((event.active.data.current?.type as string | undefined) ?? null);
     if (event.active.data.current?.type === "workspace") {
       setForceCollapsed(new Set([event.active.id as string]));
     }
   }, []);
 
+  const handleDragOver = useCallback((event: DragOverEvent) => {
+    const { active, over } = event;
+    if (!isFolderLike(active.data.current?.type)) return;
+    const overType = over?.data.current?.type;
+    const wsId = overType === "workspace-header" ? (over?.data.current?.wsId as string | undefined) : undefined;
+    const ws = wsId ? (workspaces ?? []).find((w) => w.id === wsId) : undefined;
+    // Only a COLLAPSED workspace's header arms the timer.
+    if (!wsId || !ws || !ws.collapsed || springOpen.has(wsId)) {
+      clearSpringTimer();
+      return;
+    }
+    // Jitter within the same workspace's targets must not re-arm.
+    if (springTimerRef.current?.wsId === wsId) return;
+    clearSpringTimer();
+    springTimerRef.current = {
+      wsId,
+      timer: setTimeout(() => {
+        springTimerRef.current = null;
+        setSpringOpen((prev) => (prev.has(wsId) ? prev : new Set(prev).add(wsId)));
+      }, SPRING_LOAD_DWELL_MS),
+    };
+  }, [workspaces, springOpen, clearSpringTimer]);
+
   const handleDragCancel = useCallback(() => {
+    clearSpringTimer();
+    setActiveDragType(null);
     setForceCollapsed((prev) => (prev.size === 0 ? prev : new Set()));
-  }, []);
+    setSpringOpen((prev) => (prev.size === 0 ? prev : new Set()));
+  }, [clearSpringTimer]);
+
+  // Unmount safety: a pending dwell timer must not fire after teardown.
+  useEffect(() => clearSpringTimer, [clearSpringTimer]);
 
   const handleDragEnd = useCallback((event: DragEndEvent) => {
     const { active, over } = event;
+    clearSpringTimer();
+    setActiveDragType(null);
     setForceCollapsed((prev) => (prev.size === 0 ? prev : new Set()));
+    setSpringOpen((prev) => (prev.size === 0 ? prev : new Set()));
     if (!over || active.id === over.id) return;
 
     const activeType = active.data.current?.type;
     const overType = over.data.current?.type;
 
-    // Cross-type drag is a no-op
-    if (activeType !== overType) return;
-
+    // Per-active-type dispatch. The shipped `session` / `workspace` gestures
+    // keep their same-type wall as a per-branch guard; folder-like actives
+    // route through `resolveFolderMove`, which is keyed on the (active, over)
+    // PAIR. See design D5 / change: drag-folders-across-workspaces.
     if (activeType === "session") {
+      if (overType !== "session") return;
       for (const group of allGroups) {
         // Session IDs only (terminals moved to TerminalsView)
         const sessionIds = group.sessions.map((s) => s.id);
@@ -548,32 +676,46 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
           break;
         }
       }
-    } else if (activeType === "pinned-group") {
-      const ids = pinnedGroups.map((g) => g.cwd);
-      const oldIndex = ids.indexOf(active.id as string);
-      const newIndex = ids.indexOf(over.id as string);
-      if (oldIndex !== -1 && newIndex !== -1) {
-        const newOrder = arrayMove(ids, oldIndex, newIndex);
-        onReorderPinnedDirs?.(newOrder);
-      }
     } else if (activeType === "workspace") {
+      if (overType !== "workspace") return;
       const ids = (workspaces ?? []).map((w) => w.id);
       const newOrder = resolveWorkspaceReorder(ids, active.id as string, over.id as string);
       if (newOrder) onReorderWorkspaces?.(newOrder);
-    } else if (activeType === "workspace-folder") {
-      const wsId = active.data.current?.wsId as string | undefined;
-      const ws = (workspaces ?? []).find((w) => w.id === wsId);
-      if (!ws) return;
-      const newOrder = resolveWorkspaceFolderReorder(
-        ws.folders,
-        active.id as string,
-        over.id as string,
-        wsId,
-        over.data.current?.wsId as string | undefined,
-      );
-      if (newOrder) onReorderWorkspaceFolders?.(wsId!, newOrder);
+    } else if (activeType === "pinned-group" || activeType === "workspace-folder") {
+      const activeWsId = active.data.current?.wsId as string | undefined;
+      const move = resolveFolderMove({
+        activeId: active.id as string,
+        activeType,
+        activeWsId,
+        overId: over.id as string,
+        overType,
+        overWsId: over.data.current?.wsId as string | undefined,
+        workspaces: workspaces ?? [],
+      });
+      if (!move) return;
+      if (move.kind === "reorder-pinned") {
+        const ids = pinnedGroups.map((g) => g.cwd);
+        const oldIndex = ids.indexOf(active.id as string);
+        const newIndex = ids.indexOf(over.id as string);
+        if (oldIndex !== -1 && newIndex !== -1) {
+          onReorderPinnedDirs?.(arrayMove(ids, oldIndex, newIndex));
+        }
+      } else if (move.kind === "reorder-folders") {
+        const ws = (workspaces ?? []).find((w) => w.id === move.wsId);
+        if (!ws) return;
+        const newOrder = resolveWorkspaceFolderReorder(
+          ws.folders,
+          active.id as string,
+          over.id as string,
+          activeWsId,
+          over.data.current?.wsId as string | undefined,
+        );
+        if (newOrder) onReorderWorkspaceFolders?.(move.wsId, newOrder);
+      } else {
+        onMoveFolderToWorkspace?.(active.id as string, move.toWorkspaceId, move.index);
+      }
     }
-  }, [allGroups, pinnedGroups, workspaces, onReorderSessions, onReorderPinnedDirs, onReorderWorkspaces, onReorderWorkspaceFolders, onResume, onResumeKeepPosition]);
+  }, [allGroups, pinnedGroups, workspaces, onReorderSessions, onReorderPinnedDirs, onReorderWorkspaces, onReorderWorkspaceFolders, onMoveFolderToWorkspace, onResume, onResumeKeepPosition, clearSpringTimer]);
 
   // Tag/phase axes derived flags + the per-session predicate. OR-within each
   // axis; AND-across. Empty axis = inert. See change: add-session-tags.
@@ -833,57 +975,322 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
   // Cancel any pending frame/timer on unmount.
   useEffect(() => clearPendingReveal, [clearPendingReveal]);
 
+  // ── Seek to a folder's OpenSpec section ─────────────────────────────────
+  // Remediation target of a disabled OPENSPEC subcard (BROKEN / STALE ·
+  // missing-skills — D7 routing table): guarded-expand the folder (and its
+  // workspace ancestor, which may land asynchronously via the `workspaces`
+  // echo), then scroll the folder header into view and move focus to the
+  // OpenSpec section. Opens NO dialog — the session card reports readiness;
+  // the folder card acts (Repair / Update live there).
+  // See change: add-openspec-init-affordances (task 4.5).
+  const seekToFolderOpenSpec = useCallback(
+    (cwd: string) => {
+      const wsId = folderWorkspaceMap.get(cwd);
+      if (wsId) {
+        const ws = (workspaces ?? []).find((w) => w.id === wsId);
+        if (ws?.collapsed) onSetWorkspaceCollapsed?.(wsId, false);
+      }
+      if (collapsedGroups.has(cwd)) handleToggleCollapse(cwd);
+
+      // The section mounts only after the (possibly async) expand commits —
+      // retry briefly instead of a single frame that races the echo.
+      let attempts = 0;
+      const tryFocus = () => {
+        attempts += 1;
+        const el = listRef.current?.querySelector(
+          `[data-folder-openspec-section="${cssEscapeId(cwd)}"]`,
+        ) as HTMLElement | null;
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          el.focus({ preventScroll: true });
+          return;
+        }
+        if (attempts < 20) window.setTimeout(tryFocus, 100);
+      };
+      window.setTimeout(tryFocus, 0);
+    },
+    [folderWorkspaceMap, workspaces, onSetWorkspaceCollapsed, collapsedGroups, handleToggleCollapse],
+  );
+
+  // Settings → OpenSpec Workflow Profile is the remediation surface for
+  // STALE · profile-stale (D7): the profile + Update-all controls live there.
+  const openOpenSpecSettings = useCallback(() => navigate("/settings/openspec"), [navigate]);
+
   /**
-   * folder-workspaces: same as renderGroup but injects an "Add to
-   * workspace" affordance inside the header. Used for top-level groups
-   * only. Workspace-tier folders use the plain renderGroup since their
-   * membership is already established.
+   * folder-workspaces: same as renderGroup but with the "Add to workspace"
+   * affordance switched on. Used for top-level groups only — workspace-tier
+   * folders use the plain renderGroup since their membership is already
+   * established.
+   *
+   * The affordance used to be a `+ws` text token, then a button in the header
+   * cluster. It now lands in the folder actions menu's WORKSPACE group;
+   * renderGroup decides where the node goes, so the gating here (and therefore
+   * `add-to-workspace-affordance`'s contract) is untouched.
+   * See change: redesign-folder-workspace-add-flow, add-folder-actions-menu.
    */
   function renderGroupWithWorkspaceMenu(group: DirectoryGroup, isPinned: boolean) {
-    const owningWsId = folderWorkspaceMap.get(group.cwd) ?? null;
-    const menuOpen = addToWsMenuFor === group.cwd;
+    const workspaceAction =
+      onCreateWorkspace || (workspaces && workspaces.length > 0)
+        ? renderAddToWorkspaceButton(
+            group.cwd,
+            t("sessionList.addToWorkspace", undefined, "Add to workspace"),
+            `folder:${group.cwd}`,
+            `add-to-workspace-btn-${group.cwd}`,
+            "",
+            true,
+          )
+        : null;
+    return renderGroup(group, isPinned, false, undefined, workspaceAction);
+  }
+
+  /**
+   * Add-to-workspace affordance: an `mdiViewGridPlus` + "Workspace" pill.
+   * PRESENTATION is add-to-workspace-affordance's labelled pill (a bare icon
+   * or the old `+ws` token did not read as "add to a workspace"). BEHAVIOUR is
+   * ours: the popover flag is keyed by SCOPE, and `aria-label`/`title` carry
+   * the full verb while `aria-expanded` tracks the popover.
+   * See change: redesign-folder-workspace-add-flow.
+   */
+  function renderAddToWorkspaceButton(cwd: string, label: string, scopeKey: string, testId: string, wrapperClass = "", asMenuItem = false) {
+    const owningWsId = folderWorkspaceMap.get(cwd) ?? null;
+    // Keyed by SCOPE, not by cwd: a session card and its folder row share a cwd,
+    // so a cwd-keyed flag would pop both menus at once.
+    const menuOpen = addToWsMenuFor === scopeKey;
     return (
-      <div className="relative">
-        {renderGroup(group, isPinned)}
-        {(onCreateWorkspace || (workspaces && workspaces.length > 0)) && (
-          <div className="absolute top-1 right-7">
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                setAddToWsMenuFor(menuOpen ? null : group.cwd);
-              }}
-              className="text-[10px] px-1 py-0.5 rounded text-[var(--text-tertiary)] hover:text-[var(--accent-blue)]"
-              title={t("sessionList.addToWorkspace", undefined, "Add to workspace")}
-              data-testid={`add-to-workspace-btn-${group.cwd}`}
-            >
-              +ws
-            </button>
-            {menuOpen && (
-              <AddToWorkspaceMenu
-                workspaces={workspaces ?? []}
-                currentWorkspaceId={owningWsId}
-                onPick={(wsId) => {
-                  onAddFolderToWorkspace?.(wsId, group.cwd);
-                  setAddToWsMenuFor(null);
-                }}
-                onNewWorkspace={() => {
-                  setNewWsOpen({ pendingFolder: group.cwd });
-                  setAddToWsMenuFor(null);
-                }}
-                onRemoveFromWorkspace={() => {
-                  if (owningWsId) onRemoveFolderFromWorkspace?.(owningWsId, group.cwd);
-                  setAddToWsMenuFor(null);
-                }}
-                onClose={() => setAddToWsMenuFor(null)}
-              />
-            )}
-          </div>
+      <span className={`relative inline-flex ${wrapperClass}`}>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setAddToWsMenuFor(menuOpen ? null : scopeKey);
+          }}
+          className="focus-ring text-xs px-2 py-1 min-h-[44px] md:min-h-0 rounded border inline-flex items-center gap-0.5 text-blue-500 border-blue-500/40 bg-blue-500/5 hover:text-blue-400 hover:border-blue-500/70"
+          title={label}
+          aria-label={label}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          // When hosted inside FolderActionsMenu this button IS the menu item.
+          role={asMenuItem ? "menuitem" : undefined}
+          data-testid={testId}
+        >
+          <Icon path={mdiViewGridPlus} size={0.55} /> {t("sessionList.workspace", undefined, "Workspace")}
+        </button>
+        {menuOpen && (
+          <AddToWorkspaceMenu
+            workspaces={workspaces ?? []}
+            currentWorkspaceId={owningWsId}
+            // Each terminal action also closes the hosting folder actions menu
+            // — otherwise picking a workspace leaves the outer menu open behind
+            // the dismissed popover. See change: add-folder-actions-menu.
+            onPick={(wsId) => {
+              onAddFolderToWorkspace?.(wsId, cwd);
+              setAddToWsMenuFor(null);
+              setFolderMenuFor(null);
+            }}
+            onNewWorkspace={() => {
+              setNewWsOpen({ pendingFolder: cwd });
+              setAddToWsMenuFor(null);
+              setFolderMenuFor(null);
+            }}
+            onRemoveFromWorkspace={() => {
+              if (owningWsId) onRemoveFolderFromWorkspace?.(owningWsId, cwd);
+              setAddToWsMenuFor(null);
+              setFolderMenuFor(null);
+            }}
+            onClose={() => setAddToWsMenuFor(null)}
+          />
         )}
-      </div>
+      </span>
     );
   }
 
-  function renderGroup(group: DirectoryGroup, isPinned: boolean, inWorkspace: boolean = false, workspaceId?: string) {
+  /**
+   * Builds the folder actions menu's items for one folder row.
+   *
+   * Placement gating is PRESERVED, not widened: add-to-workspace only where the
+   * affordance rendered before (its node is supplied by
+   * `renderGroupWithWorkspaceMenu`, i.e. top-level rows gated on
+   * `onCreateWorkspace || workspaces.length`), remove-from-workspace only on
+   * workspace-owned rows, pin only outside a workspace container.
+   * Directory-group order is pin · urgency sort · directory settings.
+   * See change: add-folder-actions-menu.
+   */
+  /**
+   * OpenSpec's `OPEN`-group items. Contributed HOST-side rather than through the
+   * plugin contribution registry because `onOpenArchive` / `onOpenSpecs` are
+   * already props on this component — routing them through a registry would be
+   * indirection for symmetry's sake. Labels are slot-qualified because a verb
+   * group no longer says which slot an item came from.
+   * See change: move-slot-actions-to-menu.
+   */
+  function openspecMenuItems(cwd: string): FolderMenuItem[] {
+    if (!openspecMap?.get(cwd)?.initialized) return [];
+    const items: FolderMenuItem[] = [];
+    if (onOpenArchive) {
+      items.push({
+        id: "openspec-archive",
+        group: "open",
+        label: t("openspec.folderMenuArchive", undefined, "OpenSpec archive"),
+        icon: mdiArchiveOutline,
+        onSelect: () => onOpenArchive(cwd),
+      });
+    }
+    if (onOpenSpecs) {
+      items.push({
+        id: "openspec-specs",
+        group: "open",
+        label: t("openspec.folderMenuSpecs", undefined, "OpenSpec specs"),
+        icon: mdiFileDocumentOutline,
+        onSelect: () => onOpenSpecs(cwd),
+      });
+    }
+    return items;
+  }
+
+  function folderMenuItems({ group, isPinned, inWorkspace, workspaceId, headerAction, initStatus }: {
+    group: DirectoryGroup;
+    isPinned: boolean;
+    inWorkspace: boolean;
+    workspaceId?: string;
+    headerAction?: React.ReactNode;
+    initStatus: WorktreeInitStatus | null;
+  }): FolderMenuItem[] {
+    const items: FolderMenuItem[] = [];
+
+    if (headerAction) {
+      items.push({
+        id: "add-to-workspace",
+        group: "workspace",
+        label: t("sessionList.addToWorkspace", undefined, "Add to workspace"),
+        icon: mdiViewGridPlus,
+        onSelect: () => {},
+        node: headerAction,
+      });
+    }
+    if (inWorkspace && workspaceId && onRemoveFolderFromWorkspace) {
+      items.push({
+        id: "remove-from-workspace",
+        group: "workspace",
+        label: t("sessionList.removeFromWorkspace", undefined, "Remove from workspace"),
+        icon: mdiClose,
+        onSelect: () => onRemoveFolderFromWorkspace(workspaceId, group.cwd),
+      });
+    }
+    if (!inWorkspace && (isPinned || onPinDirectory)) {
+      items.push({
+        id: "pin",
+        group: "directory",
+        label: isPinned
+          ? t("sessionList.unpinDirectory", undefined, "Unpin directory")
+          : t("sessionList.pinDirectory", undefined, "Pin directory"),
+        icon: mdiPin,
+        onSelect: () => {
+          if (isPinned) onUnpinDirectory?.(group.cwd);
+          else onPinDirectory?.(group.cwd);
+        },
+      });
+    }
+    items.push({
+      id: "urgency-sort",
+      group: "directory",
+      label: t("sessionList.urgencySort", undefined, "Float blocked sessions to top"),
+      icon: mdiSortVariant,
+      pressed: urgencySort.isOn(group.cwd),
+      onSelect: () => urgencySort.toggle(group.cwd),
+    });
+    // Manage worktrees: gated on the folder being a git repository, and
+    // deliberately INDEPENDENT of live sessions — the surface exists to clean
+    // up worktrees that have none. Absent only on positive evidence that the
+    // folder is not a repo; unknown keeps the item (same rule as the worktree
+    // spawn button). See change: manage-worktrees-filter-cleanup.
+    if (gitWorktreeEnabled && folderIsGitRepo(group)) {
+      items.push({
+        id: "manage-worktrees",
+        group: "directory",
+        label: t("worktree.manageWorktrees", undefined, "Manage worktrees"),
+        icon: mdiSourceBranch,
+        onSelect: () => setManageWorktreesCwd(group.cwd),
+      });
+    }
+    // Re-enable an opted-out OpenSpec directory (readiness OPTED_OUT — i.e.
+    // cwd listed in openspec.optOutDirectories while the feature is on).
+    // Absent for a merely-ABSENT cwd (the folder section already offers
+    // Initialize — a second entry point for the same decision is redundant)
+    // and when OpenSpec is globally disabled (removing an opt-out cannot make
+    // the feature available there).
+    // See change: add-openspec-init-affordances (folder-actions-menu spec).
+    if (
+      openspecMap?.get(group.cwd)?.readiness?.state === "OPTED_OUT" &&
+      openspecEnabled !== false
+    ) {
+      items.push({
+        id: "openspec-reenable",
+        group: "directory",
+        label: t("openspec.folderMenuReenable", undefined, "Enable OpenSpec for this folder"),
+        icon: mdiClipboardCheckOutline,
+        onSelect: () => {
+          removeOpenSpecOptOut(group.cwd).catch((err) => {
+            showToast(String(err?.message ?? err), "error");
+          });
+        },
+      });
+    }
+    // "Directory Settings" IS the Pi Resources entry point after the
+    // `directory-settings-page` re-label. It stays the folder's ONLY route to
+    // that surface — no `OPEN` duplicate, which would mandate one destination
+    // from two groups. See change: move-slot-actions-to-menu.
+    items.push({
+      id: "directory-settings",
+      group: "directory",
+      label: t("folders.directorySettings", undefined, "Directory Settings"),
+      icon: mdiCog,
+      onSelect: () => onOpenDirectorySettings?.(group.cwd),
+    });
+    // Permanent Project setup item: the banner carries urgency, the menu carries
+    // availability. Tally `n/N` from the checklist (5 artifacts); `● update`
+    // badge when the payload reports template drift. Absent checklist (fail-open)
+    // shows the bare label. Deliberately in the DIRECTORY group, not the newer
+    // MAINTENANCE group. See change: add-folder-action-banner.
+    items.push({
+      id: "project-setup",
+      group: "directory",
+      label: projectSetupLabel(initStatus, t("folders.projectSetup", undefined, "Project setup…"), `● ${t("common.update", undefined, "update")}`),
+      icon: mdiTextBoxCheckOutline,
+      onSelect: () => onSpawnSession?.(group.cwd, undefined, { initialPrompt: PROJECT_INIT_PROMPT }),
+    });
+    // Broken-session cleanup — housekeeping, NOT a tier-0 banner. Hidden at zero.
+    // In the DIRECTORY group by spec (does not depend on the MAINTENANCE group).
+    const brokenCount = group.sessions.filter((s) => s.cwdMissing === true && s.status === "ended" && !s.hidden).length;
+    if (brokenCount > 0 && onHideSession) {
+      items.push({
+        id: "cleanup-broken",
+        group: "directory",
+        label: `${t("common.cleanUpBroken", undefined, "Clean up broken (")}${brokenCount})`,
+        icon: mdiBroom,
+        onSelect: () => setCleanupCwd(group.cwd),
+      });
+    }
+
+    items.push(...openspecMenuItems(group.cwd));
+
+    // The ONE plain refresh: three per-slot refresh buttons collapsed into a
+    // fan-out over every refresher the folder's sections registered, PLUS the
+    // host-owned OpenSpec refresher. Defining it as "registered refreshers"
+    // alone would silently drop OpenSpec from the item that replaced its button.
+    items.push({
+      id: "refresh-folder",
+      group: "maintenance",
+      label: t("folders.refreshFolder", undefined, "Refresh folder"),
+      icon: mdiRefresh,
+      onSelect: () => {
+        runFolderRefreshers(group.cwd);
+        onOpenSpecRefresh?.(group.cwd);
+      },
+    });
+    return items;
+  }
+
+  function renderGroup(group: DirectoryGroup, isPinned: boolean, inWorkspace: boolean = false, workspaceId?: string, headerAction?: React.ReactNode) {
     const displayPath = truncatePathMiddle(group.cwd, 45);
     const lastSlash = displayPath.lastIndexOf('/');
     const parentPath = lastSlash >= 0 ? displayPath.slice(0, lastSlash + 1) : '';
@@ -912,7 +1319,11 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
         />
         )}
         <div
-          className={`relative overflow-hidden bg-[var(--bg-primary)] border border-[var(--border-subtle)] ${compactSidebar ? "p-1" : "p-1.5"} ${isCollapsed ? "rounded-[14px] shadow-[inset_0_1px_0_var(--elevation-rim),0_2px_4px_var(--shadow-card)]" : "rounded-t-[14px] border-b-0 shadow-[inset_0_1px_0_var(--elevation-rim)]"}`}
+          // NO `overflow-hidden`: the folder actions menu is an absolutely
+          // positioned popover inside this card and would be clipped to the
+          // card bounds. Nothing inside needs clipping (the tab nub is a
+          // sibling, not a child).
+          className={`relative bg-[var(--bg-primary)] border border-[var(--border-subtle)] ${compactSidebar ? "p-1" : "p-1.5"} ${isCollapsed ? "rounded-[14px] shadow-[inset_0_1px_0_var(--elevation-rim),0_2px_4px_var(--shadow-card)]" : "pb-0 rounded-t-[14px] border-b-0 shadow-[inset_0_1px_0_var(--elevation-rim)]"}`}
           style={folderTint}
         >
         <div className="relative z-[1]">
@@ -923,123 +1334,122 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
             onToggle={() => handleToggleCollapse(group.cwd)}
           />
           <div className="flex-1 min-w-0">
+          {/* One shared init-status probe per row feeds BOTH the tier-0 banner
+              (below the git row) and the folder actions menu's Project setup
+              tally. A component owner keeps the hook out of this map callback.
+              See change: add-folder-action-banner. */}
+          <FolderInitScope cwd={group.cwd}>{({ status: initStatus, refetch: refetchInit }) => (<>
           {/* Whole header row is clickable to open the directory home page —
               same affordance as clicking a session card selects its session.
-              Collapse/expand now lives solely on the chevron in the drag
-              gutter (folder-toggle-btn). The small mdiOpenInNew icon below is
-              kept as a redundant explicit affordance. Child buttons/pills
-              stopPropagation so they don't trigger navigation.
-              See change: directory-card-clickable-select. */}
+              Collapse/expand lives solely on the chevron in the drag gutter
+              (folder-toggle-btn). The redundant mdiOpenInNew icon is DELETED —
+              the row is the only open affordance and the leaf name underlines
+              on hover to say so. Child buttons/pills stopPropagation so they
+              don't trigger navigation.
+              See change: directory-card-clickable-select, add-folder-actions-menu (D3). */}
           <div
-            className="flex items-center gap-1.5 cursor-pointer"
+            className="group flex items-center gap-1.5 cursor-pointer"
             onClick={() => navigate(buildFolderHomeUrl(group.cwd))}
             title={t("sessionList.openFolderHome", undefined, "Open folder home")}
             data-testid={`folder-home-row-${group.cwd}`}
           >
-            <span className="text-xs font-medium text-[var(--text-secondary)] min-w-0 flex items-center gap-1">
+            {/* Name region absorbs ALL horizontal squeeze (`min-w-0`) so the
+                action cluster below never wraps. Truncation priority: the
+                parent path may collapse entirely, the leaf folder name keeps a
+                legible 6ch floor — the name is the payload, the path is only
+                context. See change: redesign-folder-workspace-add-flow.
+
+                It also carries the KEYBOARD route to the directory home. The
+                row's `onClick` serves pointers, but a bare `div` is not
+                focusable — and deleting `folder-open-home` removed the only
+                focusable open control, so keyboard users would otherwise have
+                lost the gesture entirely. Semantics live here rather than on
+                the row because the row also contains the menu trigger, and
+                nesting a button inside a `role="link"` is invalid.
+                See change: add-folder-actions-menu (D3). */}
+            <span
+              role="link"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                e.preventDefault();
+                e.stopPropagation();
+                navigate(buildFolderHomeUrl(group.cwd));
+              }}
+              className="focus-ring rounded text-xs font-medium text-[var(--text-secondary)] min-w-0 overflow-hidden flex items-center gap-1"
+              data-testid={`folder-header-name-${group.cwd}`}
+            >
               <Icon path={isCollapsed ? mdiFolder : mdiFolderOpen} size={0.5} className="shrink-0" />
-              <span className="truncate min-w-0">{parentPath}</span>
               <span
-                className={`font-bold text-base ${compactSidebar ? "shrink-0 whitespace-nowrap" : "truncate"}`}
-                data-testid={`folder-name-${group.cwd}`}
+                className="truncate flex-[0_1_auto] min-w-0"
+                data-testid={`folder-header-parent-${group.cwd}`}
+              >
+                {parentPath}
+              </span>
+              <span
+                className={`font-bold text-base flex-[0_1_auto] min-w-[6ch] ${compactSidebar ? "shrink-0 whitespace-nowrap" : "truncate"} group-hover:underline`}
+                data-testid={`folder-header-leaf-${group.cwd}`}
               >
                 {lastSegment}
               </span>
             </span>
-            <span className="text-[10px] text-[var(--text-muted)]">({group.sessions.length})</span>
-            {/* Needs-you rollup: count of chat-routed ask_user children.
-                Pill resolves the target id (widget-bar excluded) and passes it
-                up; we select + scroll it into view.
-                See change: improve-dashboard-attention-routing. */}
-            <FolderNeedsYouPill
+            {/* Pinned state is an INERT indicator, not a control — the pin/unpin
+                action lives in the folder actions menu. It sits in the name
+                region, not the cluster, so the cluster stays exactly one
+                control. See change: add-folder-actions-menu (3.12). */}
+            {isPinned && (
+              <span
+                aria-hidden="true"
+                data-testid={`folder-pinned-indicator-${group.cwd}`}
+                className="shrink-0 text-yellow-400"
+              >
+                <Icon path={mdiPin} size={0.5} />
+              </span>
+            )}
+            {/* The folder's ONE liveness surface: severity-ordered segment
+                counts, unconditional on collapse state. Replaces the raw (N)
+                count, the needs-you pill and the collapsed-only status rollup.
+                Activation routes through the EXISTING reveal machinery
+                (`onSeekToCard` -> `revealRequest`), which already owns guarded
+                ancestor expand, layout-settled detection, the give-up backstop
+                and the hidden/filtered degrade notices — a bespoke
+                expand-then-rAF would no-op against a body that has not mounted.
+                See change: unify-folder-status-capsule. */}
+            <FolderStatusCapsule
+              cwd={group.cwd}
               sessions={group.sessions}
+              errorSessionIds={errorSessionIds}
+              retrySessionIds={retrySessionIds}
+              noticeSessionIds={noticeSessionIds}
               onActivate={(sessionId) => {
                 if (!sessionId) return;
+                if (onSeekToCard) {
+                  onSeekToCard(sessionId);
+                  return;
+                }
+                // No reveal wiring (standalone render): fall back to the
+                // guarded expand + select the pill used.
                 if (isCollapsed) handleToggleCollapse(group.cwd);
                 onSelect(sessionId);
-                const escaped = cssEscapeId(sessionId);
-                requestAnimationFrame(() => {
-                  document
-                    .querySelector(`[data-session-id="${escaped}"]`)
-                    ?.scrollIntoView({ behavior: "smooth", block: "center" });
-                });
               }}
             />
-            {/* Collapsed status rollup (variant B): working/idle dot-counts so a
-                collapsed folder still shows liveness at a glance. Needs-you is
-                covered by the pill above. See change:
-                condense-collapsed-folder-header. */}
-            {isCollapsed && <FolderStatusRollup sessions={group.sessions} />}
-            {/* Opt-in per-folder urgency sort toggle (default off). Floats
-                blocked sessions to the top. See change:
-                improve-dashboard-attention-routing. */}
-            <button
-              onClick={(e) => { e.stopPropagation(); urgencySort.toggle(group.cwd); }}
-              className={`px-1 py-0.5 rounded ${urgencySort.isOn(group.cwd) ? "text-[var(--status-needs-you)]" : "text-[var(--text-tertiary)] hover:text-[var(--text-secondary)]"}`}
-              title={t("sessionList.urgencySort", undefined, "Float blocked sessions to top")}
-              aria-label={t("sessionList.urgencySort", undefined, "Float blocked sessions to top")}
-              aria-pressed={urgencySort.isOn(group.cwd)}
-              data-testid={`folder-urgency-sort-${group.cwd}`}
+            {/* Trailing action cluster — `flex-none` + `whitespace-nowrap` pins
+                it to the top-right at any sidebar width; it never wraps to a
+                second row and never leaves the card. It now holds EXACTLY ONE
+                control: the folder actions menu trigger. Urgency sort, pin,
+                add-to-workspace, remove-from-workspace and Directory Settings
+                are its items. See change: add-folder-actions-menu. */}
+            <span
+              className="ml-auto flex items-center gap-px flex-none whitespace-nowrap"
+              data-testid={`folder-header-cluster-${group.cwd}`}
             >
-              <Icon path={mdiSortVariant} size={0.5} />
-            </button>
-            {/* Pin/Unpin toggle. Hidden inside a workspace container — pin
-                is irrelevant for visibility/ordering there. The pin state
-                itself is preserved on the server (orthogonal to workspace
-                membership). See change: folder-workspaces. */}
-            {/* Open the directory home page. Distinct from the collapse toggle
-                (the name row) and the drag gutter (a sibling) — stopPropagation
-                keeps the click from toggling collapse or starting a reorder.
-                Pinned rows only. See change: add-directory-home-page (D3).
-                Also shown on workspace-folder rows: an unpinned workspace
-                folder has `folder.pinned === false`, so `isPinned` alone would
-                hide it (change: enable-workspace-folder-home-page, D2). */}
-            {(isPinned || inWorkspace) && (
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  navigate(buildFolderHomeUrl(group.cwd));
-                }}
-                className="ml-auto px-1 py-0.5 rounded text-[var(--text-tertiary)] hover:text-[var(--text-secondary)]"
-                title={t("sessionList.openFolderHome", undefined, "Open folder home")}
-                aria-label={t("sessionList.openFolderHome", undefined, "Open folder home")}
-                data-testid={`folder-open-home-${group.cwd}`}
-              >
-                <Icon path={mdiOpenInNew} size={0.5} />
-              </button>
-            )}
-            {!inWorkspace && (isPinned || onPinDirectory) && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (isPinned) onUnpinDirectory?.(group.cwd);
-                  else onPinDirectory?.(group.cwd);
-                }}
-                className={`ml-auto px-1 py-0.5 rounded ${isPinned ? "text-yellow-400 hover:text-yellow-300" : "text-[var(--text-tertiary)] hover:text-yellow-400"}`}
-                title={isPinned ? t("sessionList.unpinDirectory", undefined, "Unpin directory") : t("sessionList.pinDirectory", undefined, "Pin directory")}
-                data-testid={isPinned ? "unpin-dir-btn" : "pin-dir-btn"}
-              >
-                <Icon path={mdiPin} size={0.55} />
-              </button>
-            )}
-            {/* Remove-from-workspace — grouped inline after the open-home
-                icon (workspace folders only), not floated in the card corner. */}
-            {inWorkspace && workspaceId && onRemoveFolderFromWorkspace && (
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onRemoveFolderFromWorkspace(workspaceId, group.cwd);
-                }}
-                className="px-1 py-0.5 rounded text-[var(--text-tertiary)] hover:text-red-400 hover:bg-[var(--bg-hover)]"
-                title={t("sessionList.removeFromWorkspace", undefined, "Remove from workspace")}
-                aria-label={t("sessionList.removeFromWorkspace", undefined, "Remove from workspace")}
-                data-testid={`ws-remove-${workspaceId}-${group.cwd}`}
-              >
-                <Icon path={mdiClose} size={0.5} />
-              </button>
-            )}
+              <FolderActionsMenu
+                cwd={group.cwd}
+                open={folderMenuFor === `folder:${group.cwd}`}
+                onOpenChange={(next) => setFolderMenuFor(next ? `folder:${group.cwd}` : null)}
+                items={folderMenuItems({ group, isPinned, inWorkspace, workspaceId, headerAction, initStatus })}
+              />
+            </span>
           </div>
           {/* Collapsed density (variant B): when collapsed, the heavy slots
               (git · action bar · plugin sections · OpenSpec proposal state ·
@@ -1057,27 +1467,32 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
               running / failed `WorktreeInitChip`, min-w ~240px) wraps to its own
               line instead of overflowing and overlapping the git row.
               See change: compact-folder-header-actions. */}
-          <div className={`${compactSidebar ? "mt-0.5 gap-x-1.5 gap-y-0.5" : "mt-1 gap-x-2 gap-y-1"} flex flex-wrap items-center justify-between`}>
-            <div className="min-w-0">
-              <GroupGitInfo
-                sessions={group.sessions}
-                cwd={group.cwd}
-                folderBranch={folderGitMap?.has(group.cwd) ? folderGitMap.get(group.cwd) : undefined}
-                onBranchClick={() => setBranchDialogCwd(group.cwd)}
-              />
-            </div>
-            <FolderActionBar
+          {/* Git row — tier 2, FACTS ONLY (branch/dirty). Its former call-to-
+              action controls moved to the tier-0 banner below and the folder
+              actions menu. See change: add-folder-action-banner. */}
+          <div className={`${compactSidebar ? "mt-0.5" : "mt-1"} min-w-0`}>
+            <GroupGitInfo
+              sessions={group.sessions}
               cwd={group.cwd}
-              onOpenPiResources={() => onOpenPiResources?.(group.cwd)}
-              onInitializeProject={onSpawnSession ? (cwd) => onSpawnSession(cwd, undefined, { initialPrompt: "/skill:project-init" }) : undefined}
-              brokenSessionCount={group.sessions.filter((s) => s.cwdMissing === true && s.status === "ended" && !s.hidden).length}
-              onCleanUpBroken={onHideSession ? () => {
-                for (const s of group.sessions) {
-                  if (s.cwdMissing === true && s.status === "ended" && !s.hidden) onHideSession(s.id);
-                }
-              } : undefined}
+              folderBranch={folderGitMap?.has(group.cwd) ? folderGitMap.get(group.cwd) : undefined}
+              onBranchClick={() => setBranchDialogCwd(group.cwd)}
             />
           </div>
+          {/* Tier-0 call-to-action banner — renders only when the folder cannot
+              proceed (setup / init needed / re-trust / running / failure). */}
+          <FolderActionBanner
+            cwd={group.cwd}
+            status={initStatus}
+            // Project-root gate for the "not a pi project" banner: pinned,
+            // workspace-added, or POSITIVE git-root evidence. `folderIsGitRepo`
+            // is optimistic (unknown → true), so it is NOT sufficient on its
+            // own — an unpinned dir with an unknown git probe must not reach
+            // tier 0. See change: add-folder-action-banner (D-D2).
+            isProjectRoot={isPinned || inWorkspace || group.sessions.some((s) => s.isGitRepo === true) || !!folderGitMap?.get(group.cwd)}
+            onInitializeProject={onSpawnSession ? (c) => onSpawnSession(c, undefined, { initialPrompt: PROJECT_INIT_PROMPT }) : undefined}
+            onStatusChange={refetchInit}
+            sessions={group.sessions}
+          />
           {/* Slot-pill grid: the plugin slot sections (Automations / Goals /
               KB) + OpenSpec render as single-concern pills in a 2-col grid that
               collapses to 1-col at mobile width. A section that renders null
@@ -1086,22 +1501,28 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
           {!compactSidebar && (
           <div data-testid="folder-aux-sections" className="grid grid-cols-1 sm:grid-cols-2 gap-x-2 gap-y-3 mt-3">
             <SidebarFolderSectionSlot folder={{ cwd: group.cwd }} />
-            {/* Render for both initialized (full section) and pending (spinner).
-                See change: fix-cold-boot-openspec-protocol. */}
-            {(openspecMap?.get(group.cwd)?.initialized || openspecMap?.get(group.cwd)?.pending) && (
+            {/* Readiness-gated (inside the section): READY pill, PENDING
+                spinner, ABSENT offer (+dismiss), BROKEN/STALE recovery pill;
+                nothing for GLOBAL_OFF / OPTED_OUT / legacy not-initialized.
+                Rendered whenever the server has broadcast data for the cwd —
+                including pinned directories with no sessions.
+                See change: add-openspec-init-affordances. */}
+            {openspecMap?.get(group.cwd) && (
               <FolderOpenSpecSection
                 data={openspecMap.get(group.cwd)!}
                 cwd={group.cwd}
-                onRefresh={() => onOpenSpecRefresh?.(group.cwd)}
                 onOpenBoard={onOpenBoard}
-                onOpenSpecs={onOpenSpecs ? () => onOpenSpecs(group.cwd) : undefined}
-                onOpenArchive={onOpenArchive ? () => onOpenArchive(group.cwd) : undefined}
+                offerInitialization={openspecOfferInitialization}
+                onToast={(message, variant) =>
+                  showToast(message, variant === "error" ? "error" : "info")
+                }
               />
             )}
           </div>
           )}
           </>)}
-
+          </>)}{/* end FolderInitScope render-prop */}
+          </FolderInitScope>
           </div>{/* end content column */}
         </div>
         </div>{/* end content layer (relative z-1) */}
@@ -1109,17 +1530,16 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
         {/* Folder body — encloses the Create tray + sessions + ended row so the
             card reads as a folder holding its contents. Shares the header's
             --bg-primary surface with one continuous border (header is border-b-0
-            when expanded); an absolute fold-shadow child marks the header/body
-            seam. See change: folder-card-enclosure. */}
+            when expanded); no seam shading — the CREATE separator alone marks
+            the header/body junction. See change: folder-card-enclosure. */}
         {!isCollapsed && (
         <div
           className={`relative flow-root bg-[var(--bg-primary)] border border-[var(--border-subtle)] border-t-0 rounded-b-[14px] ${compactSidebar ? "px-1 pb-1" : "px-1.5 pb-1.5"} shadow-[0_2px_4px_var(--shadow-card)]`}
           style={folderTint}
           data-testid={`folder-body-${group.cwd}`}
         >
-          <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 h-2.5 shadow-[inset_0_6px_6px_-6px_var(--shadow-card)]" />
           {!compactSidebar && (<>
-            <div className="relative text-center text-[9.5px] font-semibold tracking-[.1em] uppercase text-[var(--text-muted)] my-2 before:content-[''] before:absolute before:top-1/2 before:left-0 before:w-[38%] before:h-px before:bg-[var(--border-subtle)] after:content-[''] after:absolute after:top-1/2 after:right-0 after:w-[38%] after:h-px after:bg-[var(--border-subtle)]">
+            <div className="relative text-center text-[9.5px] font-semibold tracking-[.1em] uppercase text-[var(--text-muted)] mt-0 mb-2 before:content-[''] before:absolute before:top-1/2 before:left-0 before:w-[38%] before:h-px before:bg-[var(--border-subtle)] after:content-[''] after:absolute after:top-1/2 after:right-0 after:w-[38%] after:h-px after:bg-[var(--border-subtle)]">
               {t("sessionList.create", undefined, "Create")}
             </div>
             <FolderSpawnButtons
@@ -1149,7 +1569,12 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
           </>)}
         {/* Session + terminal cards */}
         <div className="group-collapse expanded">
-        <div className={compactSidebar ? "space-y-1" : "space-y-1 pt-1"}>
+        {/* Directory rail: ONE 2px gray vertical line standing for the folder
+            that owns these sessions. Each card draws a 9px tick into it (see
+            SessionCard `before:`), and the 18px left inset is the band the
+            card's hover drag bead parks in. Replaces the per-card status
+            gutter. See change: session-card-directory-rail. */}
+        <div className="relative space-y-1 pt-1 pl-[18px] before:content-[''] before:absolute before:left-[7px] before:top-0.5 before:bottom-3.5 before:w-0.5 before:rounded-full before:bg-[var(--rail-directory)]">
           {/* Spawn error banner — see change: spawn-failure-diagnostics */}
           {spawnErrors?.get(group.cwd) && (
             <SpawnErrorBanner
@@ -1293,6 +1718,9 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
                         openspecInitialized={openspecMap?.get(session.cwd)?.initialized}
                         openspecPending={openspecMap?.get(session.cwd)?.pending}
                         openspecHasDir={openspecMap?.get(session.cwd)?.hasOpenspecDir}
+                        openspecReadiness={openspecMap?.get(session.cwd)?.readiness}
+                        onSeekToFolderOpenSpec={seekToFolderOpenSpec}
+                        onOpenOpenSpecSettings={openOpenSpecSettings}
                         openspecGroups={openspecGroupsMap?.get(session.cwd)?.groups}
                         openspecAssignments={openspecGroupsMap?.get(session.cwd)?.assignments}
                         onSendPrompt={onSendPrompt ? (text, images) => onSendPrompt(session.id, text, images) : undefined}
@@ -1319,6 +1747,7 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
                         onAbortTool={onAbortTool ? (toolCallId) => onAbortTool(session.id, toolCallId) : undefined}
                         hasError={errorSessionIds?.has(session.id)}
                         isRetrying={retrySessionIds?.has(session.id)}
+                        retryAttempt={retryAttemptMap?.get(session.id)}
                         hasNotice={noticeSessionIds?.has(session.id)}
                       />
                       {resumeErrors?.get(session.id) && (
@@ -1396,6 +1825,19 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
             <InstallButton canInstall={installPrompt.canInstall} isInstalled={installPrompt.isInstalled} prompt={installPrompt.prompt} />
             <TunnelButton showToast={showToast} />
             {headerExtra}
+            {/* Community entry point. MDI 7 dropped brand icons, so the Discord
+                glyph is an inline path constant. See change: add-discord-link. */}
+            <a
+              href={DISCORD_INVITE_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[var(--text-tertiary)] hover:text-[var(--text-secondary)]"
+              title={t("sessionList.discord", undefined, "Join our Discord")}
+              aria-label={t("sessionList.discord", undefined, "Join our Discord")}
+              data-testid="discord-btn"
+            >
+              <Icon path={mdiDiscordPath} size={0.6} />
+            </a>
             <button
               onClick={() => navigate("/settings")}
               className="text-[var(--text-tertiary)] hover:text-[var(--text-secondary)]"
@@ -1535,16 +1977,21 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
           </div>
         )}
       </div>
-      <div ref={listRef} className="flex-1 overflow-y-auto">
+      <div ref={listRef} data-testid="session-list-scroll" className="flex-1 overflow-y-auto">
       {filteredSessions.length === 0 && pinnedGroups.length === 0 && (workspaces?.length ?? 0) === 0 ? (
         <div className="p-4 text-sm text-[var(--text-tertiary)]">{t("sessionList.noActiveSessions", undefined, "No active sessions")}</div>
       ) : (
-        <DndContext sensors={sensors} collisionDetection={sameTypeClosestCenter} onDragStart={handleDragStart} onDragEnd={handleDragEnd} onDragCancel={handleDragCancel}>
+        // `measuring.droppable.strategy = Always`: spring-load mounts folder
+        // droppables MID-DRAG, and the default `Optimized` strategy does not
+        // remeasure newly-registered containers, so a drop inside a revealed
+        // body would resolve against stale rects.
+        // See change: drag-folders-across-workspaces.
+        <DndContext sensors={sensors} collisionDetection={compatibleClosestCenter} measuring={{ droppable: { strategy: MeasuringStrategy.Always } }} onDragStart={handleDragStart} onDragOver={handleDragOver} onDragEnd={handleDragEnd} onDragCancel={handleDragCancel}>
         <ul className={`flex flex-col ${compactSidebar ? "gap-1 p-1.5" : "gap-2 p-2"}`}>
           {/* Elevated dashboard-scope add buttons: rendered as the FIRST list
               item, above workspace tiers and pinned folder groups.
               See change: elevate-dashboard-add-buttons. */}
-          {onOpenPinDialog && (
+          {!compactSidebar && onOpenPinDialog && (
             <li>
               <DashboardSpawnButtons
                 onAddFolder={() => onOpenPinDialog?.()}
@@ -1559,7 +2006,12 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
               {workspaceTiers.workspaces.map((ws) => {
                 // Drag-collapse: dragged workspace renders collapsed locally
                 // (OR of forceCollapsed and the server value). Never persisted.
-                const displayCollapsed = forceCollapsed.has(ws.id) || ws.collapsed;
+                // Spring-load wins over both the local drag-collapse and the
+                // server value; stated as a total precedence rather than an
+                // accidentally-exclusive one. See design D6.
+                const displayCollapsed = springOpen.has(ws.id)
+                  ? false
+                  : (forceCollapsed.has(ws.id) || ws.collapsed);
                 return (
                 <li key={`ws-${ws.id}`}>
                   <SortableWorkspace id={ws.id}>
@@ -1617,6 +2069,13 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
               ))}
             </SortableContext>
           )}
+          {/* Eject affordance for the EMPTY pinned tier — mounted OUTSIDE the
+              gate above, which renders nothing exactly when it is needed.
+              Sole eject target in this case, so it never coexists with the
+              pinned groups. See design D4. */}
+          {visibleTopPinned.length === 0 && activeDragType === "workspace-folder" && (
+            <li><PinnedTierDropZone /></li>
+          )}
           {/* Gap between pinned and unpinned is handled by flex gap */}
           {/* Unpinned directory groups: rendered when the user is
               actively filtering folders, OR when the folder contains
@@ -1653,18 +2112,19 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
         />
       )}
       {pickFolderForWsId && (
-        <PinDirectoryDialog
+        // Workspace-scoped `+ Add Folder` — the same multi-select dialog with
+        // THIS workspace preselected as the destination (still retargetable).
+        // Pin is implicit and sent first, so removing the folder from the
+        // workspace later leaves it visible at root instead of vanishing.
+        // See change: redesign-folder-workspace-add-flow.
+        <AddFoldersDialog
+          workspaces={workspaces ?? []}
+          initialWorkspaceId={pickFolderForWsId}
+          sessionCwds={sessions.map((s) => s.cwd)}
           onCancel={() => setPickFolderForWsId(null)}
-          onPin={(path) => {
-            // Workspace-scoped pin: add to workspace (authoritative) AND
-            // silently pin (kept in pinnedDirectories so removal from the
-            // workspace later returns the folder to top-level pinned).
-            // Workspace folders don't display pin state, so the pin is
-            // invisible to the user inside the container.
-            onAddFolderToWorkspace?.(pickFolderForWsId, path);
-            onPinDirectory?.(path);
-            setPickFolderForWsId(null);
-          }}
+          onPin={(path) => onPinDirectory?.(path)}
+          onAddFolderToWorkspace={(wsId, path) => onAddFolderToWorkspace?.(wsId, path)}
+          onCreateWorkspace={onCreateWorkspace ? (name) => onCreateWorkspace(name) : undefined}
         />
       )}
       {hiddenCount > 0 && !showHidden && (
@@ -1672,6 +2132,28 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
           {t("sessionList.hiddenCount", { count: hiddenCount }, `${hiddenCount} hidden`)}
         </div>
       )}
+      {manageWorktreesCwd && (
+        <ManageWorktreesDialog
+          cwd={manageWorktreesCwd}
+          allSessions={sessions}
+          onShutdownSession={(id) => onShutdown?.(id)}
+          onClose={() => setManageWorktreesCwd(null)}
+        />
+      )}
+      {cleanupCwd && (() => {
+        const broken = sessions.filter((s) => s.cwd === cleanupCwd && s.cwdMissing === true && s.status === "ended" && !s.hidden);
+        return (
+          <Confirm
+            open
+            testId="cleanup-broken-confirm"
+            title={t("session.hideBrokenSessions", undefined, "Hide broken sessions?")}
+            message={`Hide ${broken.length} session${broken.length === 1 ? "" : "s"} whose cwd no longer exists?`}
+            confirmLabel={t("common.hide", undefined, "Hide")}
+            onConfirm={() => { for (const s of broken) onHideSession?.(s.id); setCleanupCwd(null); }}
+            onClose={() => setCleanupCwd(null)}
+          />
+        );
+      })()}
       {worktreeDialogCwd && (
         <WorktreeSpawnDialog
           cwd={worktreeDialogCwd}
@@ -1725,11 +2207,30 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
 
 /**
  * Folder header left gutter — chevron at top, drag-handle column extending
- * the full height of the header content. The chevron itself remains a
- * click-to-toggle button (pointer events stop propagation so the surrounding
- * drag listener doesn't compete on click). The empty space below the chevron
- * is the drag zone, mirroring the SessionCard gutter pattern.
+ * the full height of the header content. Both the chevron AND the column
+ * below it are drag handles: pointerdown bubbles to this div's dnd-kit
+ * listeners, and the PointerSensor's 5px activation distance means a plain
+ * click still toggles collapse while a drag (>5px) reorders — so collapsed
+ * folders stay reorderable via their always-visible chevron. Mirrors the
+ * SessionCard gutter pattern.
  */
+/**
+ * Per-row owner of the shared `GET /init-status` probe. A component (not a call
+ * inside `renderGroup`'s `.map`) so the hook obeys the rules of hooks, exposing
+ * `{ status, refetch }` to both the tier-0 banner and the menu's setup tally.
+ * See change: add-folder-action-banner.
+ */
+function FolderInitScope({
+  cwd,
+  children,
+}: {
+  cwd: string;
+  children: (s: { status: WorktreeInitStatus | null; refetch: () => void }) => React.ReactNode;
+}) {
+  const { status, refetch } = useInitStatus(cwd);
+  return <>{children({ status, refetch })}</>;
+}
+
 function FolderDragGutter({
   isCollapsed,
   onToggle,
@@ -1747,8 +2248,7 @@ function FolderDragGutter({
     >
       <button
         onClick={(e) => { e.stopPropagation(); onToggle(); }}
-        onPointerDown={(e) => e.stopPropagation()}
-        className="inline-flex items-center justify-center cursor-pointer hover:text-[var(--text-secondary)]"
+        className="inline-flex items-center justify-center cursor-grab active:cursor-grabbing hover:text-[var(--text-secondary)]"
         title={isCollapsed ? "Expand folder" : "Collapse folder"}
         data-testid="folder-toggle-btn"
       >

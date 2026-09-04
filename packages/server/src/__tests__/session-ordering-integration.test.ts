@@ -27,6 +27,7 @@ function createMockPreferencesStore(): PreferencesStore {
     setWorkspaceCollapsed: vi.fn(() => false),
     addFolderToWorkspace: vi.fn(() => false),
     removeFolderFromWorkspace: vi.fn(() => false),
+    moveFolderToWorkspace: vi.fn(() => false),
     reorderWorkspaceFolders: vi.fn(() => false),
     reorderWorkspaces: vi.fn(() => false),
     flush: vi.fn(),
@@ -68,7 +69,7 @@ describe("Session ordering integration", () => {
     orderMgr.insert("/project", "s2"); // s2 is at front: ["s2", "s1"]
 
     // User forks s1
-    forkRegistry.recordFork("/project", "s1");
+    forkRegistry.recordFork("/project", "s1", 95_000);
 
     // New session registers — simulate server checking fork registry
     const forkParent = forkRegistry.consumeFork("/project");

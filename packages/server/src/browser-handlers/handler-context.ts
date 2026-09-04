@@ -37,6 +37,29 @@ export interface BrowserHandlerContext {
    * See change: configurable-chat-display.
    */
   metaPersistence?: MetaPersistence;
+  /**
+   * Optional display-fit pool.
+   *
+   * Hydration strips inline image bytes to a bounded placeholder
+   * UNCONDITIONALLY — the bound must not depend on whether a fitter happens to
+   * be configured, or a replayed image-bearing event trips the per-event
+   * ceiling and its row vanishes. This pool only decides how the placeholder
+   * RESOLVES: with one, to the fitted derivative; without, every placeholder
+   * settles to an explicit failed state rather than spinning.
+   * See change: fit-attachments-for-display (test-plan #E9).
+   */
+  fitWorkerPool?: import("../attachments/fit-worker-pool.js").FitWorkerPool;
+  /**
+   * Max events replayed on a FULL-stream subscribe (0 / absent = unlimited).
+   * Never applied to a genuine delta.
+   * See change: lazy-load-session-history (D1).
+   */
+  maxReplayEvents?: number;
+  /**
+   * SHAPE of the replay window when one applies. Absent → `head-tail`.
+   * See change: add-tail-only-replay-window (D1).
+   */
+  replayWindowMode?: import("@blackbelt-technology/pi-dashboard-shared/memory-limits.js").ReplayWindowMode;
   directoryService?: DirectoryService;
   terminalManager?: TerminalManager;
   headlessPidRegistry: HeadlessPidRegistry;
@@ -87,6 +110,13 @@ export interface BrowserHandlerContext {
    * See change: fix-recovery-offer-bridge-liveness-gate.
    */
   isRecoveryLivenessPending?(sessionId: string): boolean;
+  /**
+   * Remember that THIS connection asked for a subagent resync, so the bridge's
+   * reply is delivered back to it instead of fanned out to every subscriber of
+   * the session. Absent → the reply falls back to the broadcast path.
+   * See change: reduce-subagent-details-payload (C5).
+   */
+  recordResyncRequester?(requestId: string, ws: WebSocket): void;
   /** Send message to a specific WebSocket */
   sendTo(ws: WebSocket, msg: ServerToBrowserMessage): void;
   /** Broadcast to all connected browsers */
@@ -104,6 +134,12 @@ export interface BrowserHandlerContext {
   trackUiRequest(sessionId: string, requestId: string, method: string, params: Record<string, unknown>): boolean | void;
   /** Replay pending UI requests to a browser */
   replayPendingUiRequests(ws: WebSocket, sessionId: string): void;
+  /**
+   * Replay the retained notify log to a browser. Sibling of
+   * `replayPendingUiRequests` — kept separate because a notify is transcript
+   * history, never a pending ask. See change: split-notify-from-prompt-request.
+   */
+  replayNotifyLog(ws: WebSocket, sessionId: string): void;
   /** Mark a session as mid-replay for a specific WebSocket (suppresses live events) */
   markReplaying(ws: WebSocket, sessionId: string): void;
   /** Clear replay flag and send catch-up events */

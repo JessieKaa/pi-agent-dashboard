@@ -39,7 +39,11 @@ const COVERED_SURFACES = [
   "session/ComposerSessionActions.tsx",
   "session/SessionList.tsx",
   "chat/CommandInput.tsx",
-  "folder/FolderActionBar.tsx",
+  // FolderActionBar.tsx was deleted; its tier-0 call to action is now the
+  // FolderActionBanner, whose action carries the focus-ring utility.
+  // See change: add-folder-action-banner.
+  "folder/FolderActionBanner.tsx",
+  "folder/FolderActionsMenu.tsx",
   "folder/FolderSpawnButtons.tsx",
 ];
 
@@ -119,7 +123,10 @@ describe("state-feedback adoption ratchet — covered surfaces", () => {
   it("covered focus surfaces adopt the .focus-ring utility", () => {
     // Every focus-target surface refactored by this change must carry the
     // shared focus-ring class so the ratchet trips if a regression drops it.
-    for (const name of ["chat/CommandInput.tsx", "session/SessionList.tsx", "folder/FolderActionBar.tsx", "folder/FolderSpawnButtons.tsx"]) {
+    // `folder/FolderActionBar.tsx` was deleted (change: add-folder-action-banner);
+    // its tier-0 call to action moved to `folder/FolderActionBanner.tsx`, whose
+    // setup action carries the focus-ring utility.
+    for (const name of ["chat/CommandInput.tsx", "session/SessionList.tsx", "folder/FolderActionBanner.tsx", "folder/FolderActionsMenu.tsx", "folder/FolderSpawnButtons.tsx"]) {
       expect(readSurface(name), `${name} missing focus-ring`).toContain("focus-ring");
     }
   });

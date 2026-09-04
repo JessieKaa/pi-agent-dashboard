@@ -13,6 +13,7 @@ import { runEnrollStep } from "../../lib/gateway/gateway-api.js";
 import type { GatewayProviderId } from "../../lib/gateway/gateway-providers.js";
 import { GATEWAY_SETUP_STEPS, type SetupStep } from "../../lib/gateway/gateway-setup.js";
 import { useI18n } from "../../lib/i18n/i18n.js";
+import { GatewayUrlManager } from "./GatewayUrlManager.js";
 
 function InstallStep({ step }: { step: SetupStep }) {
   const { t } = useI18n();
@@ -21,7 +22,7 @@ function InstallStep({ step }: { step: SetupStep }) {
     <div className="flex-1">
       <div className="mb-1 text-[12.5px] text-[var(--text-primary)]">
         {step.title}
-        <span className="ml-1.5 rounded border border-[var(--border)] px-1.5 py-px text-[9.5px] text-[var(--text-muted)]">
+        <span className="ml-1.5 rounded border border-[var(--border)] px-1.5 py-px text-[9.5px] text-[var(--text-secondary)]">
           {t("gateway.setup.copy", undefined, "copy")}
         </span>
       </div>
@@ -40,7 +41,7 @@ function InstallStep({ step }: { step: SetupStep }) {
                 /* ignore */
               }
             }}
-            className="text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+            className="text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
           >
             <Icon path={copied ? mdiCheck : mdiContentCopy} size={0.55} />
           </button>
@@ -85,7 +86,7 @@ function RunStep({
     <div className="flex-1">
       <div className="mb-1 text-[12.5px] text-[var(--text-primary)]">
         {step.title}
-        <span className="ml-1.5 rounded border border-[var(--border)] px-1.5 py-px text-[9.5px] text-[var(--text-muted)]">
+        <span className="ml-1.5 rounded border border-[var(--border)] px-1.5 py-px text-[9.5px] text-[var(--text-secondary)]">
           {t("gateway.setup.runsServerSide", undefined, "runs server-side")}
         </span>
       </div>
@@ -105,7 +106,7 @@ function RunStep({
           data-testid="gateway-setup-run"
           disabled={busy || (needsParam && param.trim().length === 0)}
           onClick={() => void run()}
-          className="rounded border border-[var(--accent,#3b82f6)] bg-[var(--accent-soft,#1d3a63)] px-3 py-1 text-[11.5px] font-semibold text-[var(--text-primary)] disabled:opacity-50"
+          className="rounded border border-[var(--accent)] bg-[var(--accent-soft)] px-3 py-1 text-[11.5px] font-semibold text-[var(--text-primary)] disabled:opacity-50"
         >
           {busy
             ? t("gateway.setup.running", undefined, "Running…")
@@ -129,13 +130,13 @@ function LinkStep({ step }: { step: SetupStep }) {
   const { t } = useI18n();
   return (
     <div className="flex-1">
-      <div className="mb-0.5 text-[12.5px] text-[var(--text-muted)]">{step.title}</div>
+      <div className="mb-0.5 text-[12.5px] text-[var(--text-secondary)]">{step.title}</div>
       {step.href && (
         <a
           href={step.href}
           target={step.href.startsWith("http") ? "_blank" : undefined}
           rel="noreferrer"
-          className="inline-flex items-center gap-1 text-[11.5px] text-[var(--accent,#3b82f6)] hover:underline"
+          className="inline-flex items-center gap-1 text-[11.5px] text-[var(--accent-text)] hover:underline"
         >
           {step.kind === "external"
             ? t("gateway.setup.openAdminConsole", undefined, "Open admin console")
@@ -147,12 +148,25 @@ function LinkStep({ step }: { step: SetupStep }) {
   );
 }
 
-export function GatewaySetupGuide({ provider }: { provider: GatewayProviderId }) {
+export function GatewaySetupGuide({
+  provider,
+  showGatewayUrls = true,
+}: {
+  provider: GatewayProviderId;
+  /**
+   * Render the shared `GatewayUrlManager` as the guide's last step (first-run
+   * entry point, D12). The Gateway PAGE embeds this guide but also mounts the
+   * manager as its own persistent section, so it passes `false` — otherwise the
+   * page shows two copies of the same control.
+   * See change: config-override-oauth-redirect-base.
+   */
+  showGatewayUrls?: boolean;
+}) {
   const { t } = useI18n();
   const steps = GATEWAY_SETUP_STEPS[provider];
   return (
     <div data-testid="gateway-setup-guide">
-      <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--text-muted)]">
+      <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--text-secondary)]">
         {t("gateway.setup.title", undefined, "Setup")}
       </p>
       <div className="flex flex-col">
@@ -161,7 +175,7 @@ export function GatewaySetupGuide({ provider }: { provider: GatewayProviderId })
             key={`${step.kind}:${step.title}`}
             className="flex gap-2.5 border-b border-[var(--border)] py-2.5 last:border-none"
           >
-            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-[var(--border)] bg-[var(--bg-secondary)] text-[10.5px] font-bold text-[var(--text-muted)]">
+            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-[var(--border)] bg-[var(--bg-secondary)] text-[10.5px] font-bold text-[var(--text-secondary)]">
               {i + 1}
             </span>
             {step.kind === "install" ? (
@@ -174,7 +188,15 @@ export function GatewaySetupGuide({ provider }: { provider: GatewayProviderId })
           </div>
         ))}
       </div>
-      <p className="mt-2 text-[10.5px] text-[var(--text-muted)]">
+      {/* Same component the Gateway page renders — first run and steady state
+          cannot drift (D12). See change: config-override-oauth-redirect-base. */}
+      {showGatewayUrls && (
+        <div className="mt-3 border-t border-[var(--border)] pt-3">
+          <GatewayUrlManager />
+        </div>
+      )}
+
+      <p className="mt-2 text-[10.5px] text-[var(--text-secondary)]">
         <b className="text-[var(--text-secondary)]">{t("gateway.setup.securityLabel", undefined, "Security:")}</b>{" "}
         {t(
           "gateway.setup.securityNote",

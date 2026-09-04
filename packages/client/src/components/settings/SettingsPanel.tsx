@@ -1,50 +1,82 @@
-import { type RegisteredSource, SettingsDraftProvider, type SettingsDraftRegistry, SettingsSectionSlot, useSettingsDraftSource } from "@blackbelt-technology/dashboard-plugin-runtime";
+import { type RegisteredSource, SettingsDraftProvider, type SettingsDraftRegistry, useSettingsDraftSource, useSlotIntents } from "@blackbelt-technology/dashboard-plugin-runtime";
 import type { ServerToBrowserMessage } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
 import { VALID_SETTINGS_TABS } from "@blackbelt-technology/pi-dashboard-shared/dashboard-plugin/slot-types.js";
-import { DISPLAY_PRESETS, type DisplayPrefs } from "@blackbelt-technology/pi-dashboard-shared/display-prefs.js";
+import {
+  DISPLAY_PRESETS,
+  type DisplayPrefs,
+  mergeCustomEventGroupPrefs,
+  normalizeNotifyMinLevel,
+} from "@blackbelt-technology/pi-dashboard-shared/display-prefs.js";
+// From the BROWSER-SAFE module, never `config.js`: a value import of the latter
+// pulls node:fs/os/path into the bundle and the SPA dies at boot with
+// `uv.homedir is not a function`. See change: fix-lazy-history-backfill-ux (D7).
+import { DEFAULT_MEMORY_LIMITS } from "@blackbelt-technology/pi-dashboard-shared/memory-limits.js";
+import { mergeModelOptions } from "@blackbelt-technology/pi-dashboard-shared/model-catalogue.js";
 import type { NpmPackageResult } from "@blackbelt-technology/pi-dashboard-shared/rest-api.js";
+import type { ModelInfo } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import { mdiAlert, mdiArrowLeft, mdiBookOpenPageVariant, mdiCheckCircle, mdiClipboardText, mdiCloseCircle, mdiCog, mdiContentSave, mdiDelete, mdiFileDocumentEditOutline, mdiKey, mdiLoading, mdiLock, mdiPackageVariant, mdiPalette, mdiPlay, mdiPlus, mdiPuzzle, mdiPuzzleOutline, mdiRestart, mdiRobotOutline, mdiServer, mdiTextBoxOutline, mdiTunnel, mdiUpdate, mdiViewDashboard, mdiWeb, mdiWrench } from "@mdi/js";
 import { Icon } from "@mdi/react";
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useLocation, useRoute } from "wouter";
 import { useAsyncAction } from "../../hooks/useAsyncAction.js";
-import { useDebugToolsVisible } from "../../hooks/useDebugToolsVisible.js";
 import { useInstalledPackages } from "../../hooks/useInstalledPackages.js";
 import { usePackageOperations } from "../../hooks/usePackageOperations.js";
+import { usePiCompatibility } from "../../hooks/usePiCompatibility.js";
 import { usePiResources } from "../../hooks/usePiResources.js";
+import { usePluginList, usePluginToggle } from "../../hooks/usePluginToggle.js";
+import { PROVIDER_AUTH_EVENT } from "../../hooks/useProvidersReady.js";
 import { useResourceActivation } from "../../hooks/useResourceActivation.js";
 import { getApiBase } from "../../lib/api/api-context.js";
 import { listKnownServers } from "../../lib/api/known-servers-api.js";
-import { useDisplayPrefsContext } from "../../lib/state/DisplayPrefsContext.js";
+import { fetchModelCatalogue, type ModelCatalogueResult } from "../../lib/api/models-api.js";
+import { type ProviderHealth, type TestProviderResult, testProvider } from "../../lib/api/providers-api.js";
 import { type BlockEvent, getBlockEvents } from "../../lib/gateway/gateway-api.js";
-import { suggestTrustEntries } from "../../lib/gateway/gateway-config-ops.js";
+import {
+  type BindReachability,
+  collectTrustedEntries,
+  dedupeInterfaceOffers,
+  pendingEffectiveHost,
+  suggestTrustEntries,
+  type TrustSuggestion,
+  unreachableTrustedEntries,
+} from "../../lib/gateway/gateway-config-ops.js";
 import { fetchAutoInitWorktreePref, fetchAutoNameSessionsPref, setAutoInitWorktreePref, setAutoNameSessionsPref } from "../../lib/git/git-api.js";
-import { t as i18nT } from "../../lib/i18n/i18n.js";
-import { LANGUAGE_OPTIONS, type Language, useI18n } from "../../lib/i18n/i18n.js";
-import { type TestProviderResult, testProvider } from "../../lib/api/providers-api.js";
+import { t as i18nT, LANGUAGE_OPTIONS, type Language, useI18n } from "../../lib/i18n/i18n.js";
 import { buildPiResourceFileUrl } from "../../lib/nav/route-builders.js";
-import { CanvasTypesSettingsSection } from "./CanvasTypesSettingsSection.js";
-import { DiagnosticsSection } from "./DiagnosticsSection.js";
-import { DialogPortal } from "../primitives/DialogPortal.js";
+import { logRejection } from "../../lib/report-error.js";
+import { useCustomEventGroups } from "../../lib/state/custom-event-groups.js";
+import { useDisplayPrefsContext } from "../../lib/state/DisplayPrefsContext.js";
+import { PopoverBoundaryProvider } from "../../lib/state/PopoverBoundaryContext.js";
+import { KnownServersSection } from "../connectivity/KnownServersSection.js";
+import { NetworkDiscoverySection } from "../connectivity/NetworkDiscoverySection.js";
+import { PairedDevicesSection } from "../connectivity/PairedDevicesSection.js";
 import { InstructionsPage } from "../DirectorySettings/InstructionsPage.js";
 import { GatewayPage } from "../Gateway/GatewayPage.js";
-import { KnownServersSection } from "../connectivity/KnownServersSection.js";
-import { ModelProxySection } from "./ModelProxySection.js";
-import { ModelSelector } from "./ModelSelector.js";
-import { NetworkDiscoverySection } from "../connectivity/NetworkDiscoverySection.js";
 import { OpenSpecProfileSection } from "../openspec/OpenSpecProfileSection.js";
+import { useOverlayDismissGuard } from "../overlay/overlay-dismiss-guard.js";
 import { PackageBrowser } from "../packages/PackageBrowser.js";
 import { PackageInstallConfirmDialog } from "../packages/PackageInstallConfirmDialog.js";
 import { PackageReadmeDialog } from "../packages/PackageReadmeDialog.js";
-import { PairedDevicesSection } from "../connectivity/PairedDevicesSection.js";
-import { PairingView } from "../connectivity/PairingView.js";
 import { PiVersionAdvisory } from "../packages/PiVersionAdvisory.js";
 import { PluginsSection } from "../packages/PluginsSection.js";
-import { ProviderAuthSection } from "./ProviderAuthSection.js";
-import type { ResourceType } from "../resource/ResourceCardGrid.js";
-import { ResourceGridPanel } from "../resource/ResourceGridPanel.js";
-import { SpawnFailuresSection, ToolsSection } from "./ToolsSection.js";
 import { UnifiedPackagesSection } from "../packages/UnifiedPackagesSection.js";
+import { DialogPortal } from "../primitives/DialogPortal.js";
+import type { ResourceType } from "../resource/ResourceCardGrid.js";
+import { RESOURCE_PAGE_TYPE, type ResourcePageId, ScopedResourceGrid } from "../resource/ScopedResourceGrid.js";
+import { CanvasTypesSettingsSection } from "./CanvasTypesSettingsSection.js";
+import { DiagnosticsSection } from "./DiagnosticsSection.js";
+import { ModelProxySection } from "./ModelProxySection.js";
+import { ModelSelector } from "./ModelSelector.js";
+import { NodeRuntimeSection } from "./NodeRuntimeSection.js";
+// Curated pi-install picker; sits directly above the raw Tools escape hatch.
+// See change: select-pi-runtime-install (design D12).
+import { PiRuntimeSection } from "./PiRuntimeSection.js";
+import { PiRuntimeStatusRow } from "./PiRuntimeStatusRow.js";
+import { PluginNotFoundNotice, PluginSettingsPage } from "./PluginSettingsPage.js";
+import { ProviderAuthSection } from "./ProviderAuthSection.js";
+import { RetrySettingsSection } from "./RetrySettingsSection.js";
+import { ThinkingLevelSelector } from "./ThinkingLevelSelector.js";
+import { SpawnFailuresSection, ToolsSection } from "./ToolsSection.js";
 
 interface ProviderConfig {
   clientId: string;
@@ -67,19 +99,47 @@ interface AuthConfig {
   allowedUsers?: string[];
   bypassUrls?: string[];
   bypassHosts?: string[];
+  /**
+   * Public origin OAuth providers call back to, overriding the tunnel /
+   * localhost base. See change: config-override-oauth-redirect-base.
+   */
+  redirectBaseUrl?: string;
 }
 
 interface MemoryLimitsConfig {
   maxEventsPerSession: number;
   maxStringFieldSize: number;
   maxWsBufferBytes: number;
+  /** See change: lazy-load-session-history. */
+  maxReplayEvents: number;
+  /** See change: add-tail-only-replay-window (D10). */
+  replayWindowMode: "head-tail" | "tail-only";
 }
+
+/**
+ * Seed for the `!c.memoryLimits` branches below. Extracted so a new field can
+ * never be added to the interface and forgotten in one of four literals —
+ * which would silently drop the other three values on save.
+ */
+const MEMORY_LIMITS_SEED: MemoryLimitsConfig = {
+  maxEventsPerSession: 200,
+  maxStringFieldSize: 4000,
+  maxWsBufferBytes: 4194304,
+  maxReplayEvents: DEFAULT_MEMORY_LIMITS.maxReplayEvents,
+  replayWindowMode: DEFAULT_MEMORY_LIMITS.replayWindowMode,
+};
 
 interface NetworkInterfaceInfo {
   name: string;
   address: string;
   netmask: string;
   cidr: string;
+  /** Human-meaningful name (`tailnet`), falling back to the device name. */
+  label?: string;
+  /** True for a `/32` NIC — it covers its own address only. */
+  pointToPoint?: boolean;
+  /** Trust offers this interface can honestly make; empty = unofferable. */
+  suggestions?: TrustSuggestion[];
 }
 
 interface Config {
@@ -114,6 +174,8 @@ interface Config {
   };
   devBuildOnReload: boolean;
   defaultModel: string;
+  /** Default thinking level for brand-new sessions. "" = do not override. See change: add-default-thinking-level. */
+  defaultThinkingLevel: string;
   /** Display name for the PWA app label. See change: add-dynamic-pwa-manifest-naming. */
   dashboardName?: string;
   auth?: AuthConfig;
@@ -134,6 +196,12 @@ interface Config {
   windowsGitSource?: "auto" | "host" | "bundled";
   /** Keeper log behavior — gates capture of pi stdout/stderr into keeper-<id>.log. Default off. See change: add-keeper-output-capture-toggle. */
   keeperLog?: { capturePiOutput?: boolean };
+  /**
+   * COMPUTED, never persisted. The bind host this process actually bound, the
+   * one the next start would bind, and the trusted entries that bind host
+   * cannot serve. See change: warn-unreachable-trusted-networks.
+   */
+  reachability?: BindReachability | null;
 }
 
 const DEFAULT_OPENSPEC_UI = {
@@ -160,7 +228,7 @@ const CONFIG_FIELD_PAGE: Record<string, string> = {
   tunnel: "server", memoryLimits: "server",
   spawnStrategy: "sessions", reattachPlacement: "sessions", reopenSessionsAfterShutdown: "sessions", completedFirst: "sessions",
   questionFirst: "sessions", askUserPromptTimeoutSeconds: "sessions", spawnRegisterTimeoutMs: "sessions",
-  gitWorktreeEnabled: "sessions", dashboardName: "sessions", defaultModel: "sessions",
+  gitWorktreeEnabled: "sessions", dashboardName: "general", defaultModel: "sessions", defaultThinkingLevel: "sessions",
   windowsGitSource: "sessions", autoStart: "sessions",
   trustedNetworks: "security", auth: "security",
   modelProxy: "providers",
@@ -221,6 +289,7 @@ function computeConfigPartial(config: Config, original: Config): Record<string, 
   }
   if (config.devBuildOnReload !== original.devBuildOnReload) partial.devBuildOnReload = config.devBuildOnReload;
   if (config.defaultModel !== original.defaultModel) partial.defaultModel = config.defaultModel;
+  if (config.defaultThinkingLevel !== original.defaultThinkingLevel) partial.defaultThinkingLevel = config.defaultThinkingLevel;
   if ((config.dashboardName ?? "") !== (original.dashboardName ?? "")) {
     const trimmed = (config.dashboardName ?? "").trim();
     partial.dashboardName = trimmed.length > 0 ? trimmed : "";
@@ -228,8 +297,30 @@ function computeConfigPartial(config: Config, original: Config): Record<string, 
   if (JSON.stringify(config.trustedNetworks) !== JSON.stringify(original.trustedNetworks)) {
     partial.trustedNetworks = config.trustedNetworks ?? [];
   }
+  /**
+   * FIELD-level, not whole-object. `GET /api/config` returns the PARSED config,
+   * so every memory limit is materialized client-side; writing the whole object
+   * back would serialize an explicit `maxReplayEvents` the user never chose
+   * whenever they edit a sibling field — converting a defaulted field into a
+   * pinned one behind their back, and freezing the old default across upgrades.
+   * The server deep-merges `memoryLimits` over the RAW file, so a partial
+   * sub-object is safe: untouched keys stay exactly as the file has them
+   * (including an explicit `0`, the documented rollback lever).
+   * See change: fix-lazy-history-backfill-ux (D7).
+   */
   if (JSON.stringify(config.memoryLimits) !== JSON.stringify(original.memoryLimits)) {
-    partial.memoryLimits = config.memoryLimits;
+    const changed: Partial<MemoryLimitsConfig> = {};
+    const keys = Object.keys(config.memoryLimits ?? {}) as (keyof MemoryLimitsConfig)[];
+    for (const key of keys) {
+      if (config.memoryLimits[key] !== original.memoryLimits?.[key]) {
+        // `MemoryLimitsConfig` is no longer all-numeric (`replayWindowMode` is a
+        // string union), so TS cannot correlate the indexed read with the
+        // indexed write across the key union. The runtime shape is exact.
+        // See change: add-tail-only-replay-window (D10).
+        (changed as Record<string, unknown>)[key] = config.memoryLimits[key];
+      }
+    }
+    if (Object.keys(changed).length > 0) partial.memoryLimits = changed;
   }
   if (JSON.stringify(config.openspec) !== JSON.stringify(original.openspec)) {
     partial.openspec = config.openspec ?? DEFAULT_OPENSPEC_UI;
@@ -252,9 +343,12 @@ const SETTINGS_PAGE_ALIASES: Record<string, string> = {
   advanced: "developer",
   servers: "remote",
 };
-// `instructions` is a built-in global Instructions page, not a plugin-claimable
-// settings tab — so it is added to the client-side route whitelist only, NOT to
-// the shared VALID_SETTINGS_TABS (which gates the plugin slot contract).
+// `instructions` is a built-in global Instructions page, so it is added to the
+// client-side route whitelist only, NOT to the shared VALID_SETTINGS_TABS.
+// (Since plugin-settings-pages, VALID_SETTINGS_TABS no longer gates the plugin
+// slot contract at all — `claim.tab` is inert and every `settings-section`
+// claim renders on `/settings/plugins/<id>`. It remains the built-in page-id
+// enumeration consumed by the route whitelist and the registry lint.)
 // See change: directory-settings-page-and-scoped-md-editing.
 // `gateway` is a built-in Network-group page (tunnel providers UI), added to
 // the client route whitelist only (not a plugin-claimable slot).
@@ -263,13 +357,10 @@ const VALID_PAGES = new Set<string>([...VALID_SETTINGS_TABS, "instructions", "ga
 
 // Global-scope resource card pages. Page id → the singular `PiResource.type` its
 // grid renders. See change: resources-card-tabs.
-const RESOURCE_TAB_TYPE: Record<string, ResourceType> = {
-  skills: "skill",
-  agents: "agent",
-  extensions: "extension",
-  prompts: "prompt",
-  themes: "theme",
-};
+/** Retired in favour of the single map in `ScopedResourceGrid` (D7): two
+ *  byte-identical copies could drift and render the wrong type under a
+ *  correct-looking URL. See change: add-route-backed-overlay-dialogs. */
+const RESOURCE_TAB_TYPE = RESOURCE_PAGE_TYPE;
 
 /** Resolve a raw id (route param or ?tab=) to a canonical page id, or null if invalid. */
 function resolveSettingsPage(raw: string | undefined | null): string | null {
@@ -286,7 +377,13 @@ function resolveSettingsPage(raw: string | undefined | null): string | null {
 const BACK_SENTINEL = "@@back";
 
 export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd, compactSidebar = false, onCompactSidebarChange }: {
-  availableModels?: Array<{ provider: string; id: string }>;
+  /**
+   * Per-session `models_list` union pushed by live bridges. Merged with the
+   * session-independent `GET /api/models` catalogue this panel fetches itself;
+   * session rows win on collision (they carry `name` / `metadataSource`).
+   * See change: settings-default-model-without-session.
+   */
+  availableModels?: ModelInfo[];
   /** Currently-selected session's cwd — backs the canvas-types project scope. */
   selectedCwd?: string;
   /** WS bus subscribe (from App) used to correlate the confirm:"ws" restart. */
@@ -307,9 +404,21 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
 }) {
   const { language, setLanguage, t } = useI18n();
   const [, navigate] = useLocation();
+  /** Settings pages scroll pane — the popover clipping boundary for this surface. */
+  const settingsPaneRef = useRef<HTMLDivElement>(null);
   const [config, setConfig] = useState<Config | null>(null);
   const [original, setOriginal] = useState<Config | null>(null);
   const [llmProviders, setLlmProviders] = useState<LlmProvider[]>([]);
+  /**
+   * Bind-vs-trust reachability, held OUTSIDE the editable config draft: it is
+   * computed server-side, must never enter `configPartial`, and is pushed over
+   * the WS independently of a config reload. Seeded from `GET /api/config`.
+   * See change: warn-unreachable-trusted-networks.
+   */
+  const [reachability, setReachability] = useState<BindReachability | null>(null);
+  // Cached per-provider health from GET /api/providers (`health[name]`), used to
+  // seed each row's pill. See change: surface-provider-health-in-settings.
+  const [providerHealth, setProviderHealth] = useState<Record<string, ProviderHealth>>({});
   // Detect upstream pi-model-proxy extension for ModelProxySection coexistence advisory.
   // See change: add-dashboard-model-proxy task 14.1.
   const installedTopLevel = useInstalledPackages("global");
@@ -361,13 +470,57 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
     },
   );
   const restarting = restart.pending;
-  // Dual-URL routing: canonical `/settings/:page?`, legacy `/settings?tab=<id>`.
-  // A single mounted panel resolves the active page from the URL so the shared
-  // unsaved draft survives page changes. See change: reorganize-settings-into-pages.
-  const [, routeParams] = useRoute("/settings/:page?");
+  // Dual-URL routing: canonical `/settings/:page?/:sub?`, legacy
+  // `/settings?tab=<id>`. A single mounted panel resolves the active page from
+  // the URL so the shared unsaved draft survives page changes.
+  //
+  // `:sub` is interpreted ONLY when `:page === "plugins"` (design D2) — every
+  // other page ignores a trailing segment rather than growing an accidental
+  // sub-route. `activeTab` stays the flat page-id union; `activePluginId`
+  // carries `:sub`. See change: reorganize-settings-into-pages,
+  // plugin-settings-pages.
+  const [, routeParams] = useRoute("/settings/:page?/:sub?");
   const routePage = routeParams?.page;
   const resolvedRoutePage = resolveSettingsPage(routePage);
   const activeTab = resolvedRoutePage ?? "general";
+  const activePluginId = resolvedRoutePage === "plugins" ? (routeParams?.sub ?? null) : null;
+
+  // Plugin rows back the nav children, the plugin page, and the Save Bar's
+  // `Plugins › <name>` labels. See change: plugin-settings-pages (task 4.2).
+  const pluginList = usePluginList();
+  const pluginToggle = usePluginToggle(pluginList);
+  const pluginRows = pluginList.rows;
+  const activePluginRow = activePluginId
+    ? pluginRows.find((r) => r.id === activePluginId) ?? null
+    : null;
+  // "Contributes settings" must cover BOTH contribution forms, or an
+  // intent-only plugin (no refs claim in its manifest — e.g. a JSON-Schema
+  // descriptor broadcast) would be gated out of the nav AND bounced to the
+  // not-found notice, so its intent would never reach the slot that renders it.
+  // `PluginRow.claims` is built from the manifest alone
+  // (`plugin-activation-routes.ts`), so intents are invisible to it.
+  // See change: plugin-settings-pages (design D7).
+  const settingsIntents = useSlotIntents("settings-section", null);
+  const contributesSettings = useCallback(
+    (r: (typeof pluginRows)[number]) =>
+      r.claims.some((c) => c.slot === "settings-section") || settingsIntents.has(r.id),
+    [settingsIntents],
+  );
+  // A page exists only for a plugin that actually contributes settings; an
+  // unknown id or a settings-less plugin falls back to the activation index
+  // plus a notice (design D2).
+  const activePluginHasSettings = !!activePluginRow && contributesSettings(activePluginRow);
+  // Nav children: enabled AND contributing settings, alphabetical by display
+  // name. Keys on `enabled`, NOT `loaded` — a plugin that failed to load is
+  // exactly when the user needs to reach its page (design D4).
+  const pluginNavChildren = useMemo(
+    () =>
+      pluginRows
+        .filter((r) => r.status?.enabled !== false && contributesSettings(r))
+        .slice()
+        .sort((a, b) => a.displayName.localeCompare(b.displayName)),
+    [pluginRows, contributesSettings],
+  );
 
   // Global-scope resource card pages (Resources nav group). One fetch backs the
   // nav count pills + the active page grid. See change: resources-card-tabs.
@@ -394,10 +547,13 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
   }, [piResources.data]);
 
   useEffect(() => {
-    // 1) valid route param → nothing to do (already canonical).
+    // 1) valid route param → nothing to do (already canonical). An alias is
+    //    rewritten, preserving the plugin sub-segment so a deep link to
+    //    `/settings/plugins/<id>` never bounces to General.
     if (resolvedRoutePage) {
       if (resolvedRoutePage !== routePage) {
-        navigate(`/settings/${resolvedRoutePage}`, { replace: true });
+        const sub = activePluginId ? `/${activePluginId}` : "";
+        navigate(`/settings/${resolvedRoutePage}${sub}`, { replace: true });
       }
       return;
     }
@@ -410,7 +566,7 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
     const legacy = new URLSearchParams(window.location.search).get("tab");
     const resolvedLegacy = resolveSettingsPage(legacy);
     navigate(`/settings/${resolvedLegacy ?? "general"}`, { replace: true });
-  }, [routePage, resolvedRoutePage, navigate]);
+  }, [routePage, resolvedRoutePage, activePluginId, navigate]);
 
   // Windows-only live git/sh source readout from /api/health. null on
   // macOS/Linux (section hidden). See change: embed-git-bash-on-windows.
@@ -418,10 +574,63 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
     setting: string; source: string; gitPath: string | null;
     gitVersion: string | null; shellPath: string | null;
   } | null>(null);
+  // Session-independent model catalogue (GET /api/models). Owned here because
+  // this panel also owns the refetch triggers (credential writes) and the
+  // unavailable callout. `null` = no response yet (loading).
+  // See change: settings-default-model-without-session.
+  const [catalogue, setCatalogue] = useState<ModelCatalogueResult | null>(null);
+  // Last models a request actually returned. Held separately so a refetch that
+  // fails does not BLANK a catalogue that already loaded — the proxy editors
+  // would lose every option on one transient 503. The callout still fires, so
+  // the failure is reported rather than swallowed.
+  const [lastGoodModels, setLastGoodModels] = useState<ModelInfo[] | null>(null);
+  const [catalogueFetching, setCatalogueFetching] = useState(true);
+  // LAST-RESPONSE-wins, deliberately: whichever response arrives last is the
+  // rendered catalogue, even if its request was issued first. A stale payload
+  // may therefore win transiently; the next refetch corrects it. Spec'd that
+  // way so the rule is one observable sentence rather than request bookkeeping.
+  const refetchCatalogue = useCallback(() => {
+    setCatalogueFetching(true);
+    return fetchModelCatalogue()
+      .then((result) => {
+        setCatalogue(result);
+        if (result.status === "ok") setLastGoodModels(result.models);
+      })
+      .finally(() => setCatalogueFetching(false));
+  }, []);
+  useEffect(() => {
+    void refetchCatalogue();
+  }, [refetchCatalogue]);
+
+  const catalogueModels = useMemo(
+    () => (catalogue?.status === "ok" ? catalogue.models : (lastGoodModels ?? [])),
+    [catalogue, lastGoodModels],
+  );
+  /** Default Model options: catalogue ∪ every session list, session row wins. */
+  const defaultModelOptions = useMemo(
+    () => mergeModelOptions(catalogueModels, availableModels ?? []),
+    [catalogueModels, availableModels],
+  );
+  const catalogueUnavailable = catalogue?.status === "unavailable";
+  // Loading is the COLD state only: once a response has landed, a refetch keeps
+  // rendering the options it has instead of flipping back to a spinner.
+  const catalogueLoading = catalogueFetching && catalogue === null;
+
+  // LIVE gateway endpoint. The Pi Gateway Port field below is the CONFIGURED
+  // value, and since the gateway became socket-by-default that number names a
+  // port nothing is bound to — the field advertised a listener that did not
+  // exist. `/api/health.piGatewayPort` carries what is actually bound: a number
+  // for TCP, the socket PATH for a unix listener, null for neither.
+  // See change: add-pi-gateway-transport-identity (task 2.9).
+  const [gatewayEndpoint, setGatewayEndpoint] = useState<number | string | null | undefined>(undefined);
+
   const refreshGitSourceReadout = useCallback(() => {
     return fetch(`${getApiBase()}/api/health`)
       .then((res) => (res.ok ? res.json() : null))
-      .then((h) => setGitSourceReadout(h?.gitSource ?? null))
+      .then((h) => {
+        setGitSourceReadout(h?.gitSource ?? null);
+        setGatewayEndpoint(h ? (h.piGatewayPort ?? null) : null);
+      })
       .catch(() => {});
   }, []);
   useEffect(() => {
@@ -439,6 +648,7 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
         if (configData.success) {
           setConfig(configData.data);
           setOriginal(JSON.parse(JSON.stringify(configData.data)));
+          setReachability(configData.data.reachability ?? null);
         }
         if (providersData?.success && providersData.providers) {
           const list: LlmProvider[] = Object.entries(providersData.providers).map(
@@ -451,6 +661,9 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
           );
           setLlmProviders(list);
           setOriginalLlmProviders(JSON.parse(JSON.stringify(list)));
+          if (providersData.health && typeof providersData.health === "object") {
+            setProviderHealth(providersData.health as Record<string, ProviderHealth>);
+          }
         }
       })
       .catch(() => setMessage({ type: "error", text: t("settings.failedLoad", undefined, "Failed to load settings") }))
@@ -505,6 +718,60 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
     for (const s of draftSources.values()) if (s.isDirty) pages.add(s.page);
     return pages;
   }, [configPartial, llmChanged, draftSources]);
+
+  // ── Bind-vs-trust reachability ───────────────────────────────────────
+  // The predicate's input is the RESOLVED bind host, never `config.bindHost`:
+  // a container seeds no `bindHost` key, so the saved value reads `127.0.0.1`
+  // while the server actually binds `0.0.0.0` from `PI_DASHBOARD_HOST` — the
+  // advisory would then fire in every container that has a trusted network.
+  // An UNSAVED listen-interface edit outranks even the server's pending value,
+  // because that draft is what the next restart applies.
+  // See change: warn-unreachable-trusted-networks.
+  useEffect(() => {
+    if (!onMessage) return;
+    return onMessage((msg) => {
+      if (msg.type === "reachability_updated") setReachability(msg.reachability);
+    });
+  }, [onMessage]);
+
+  const pendingBindHost = useMemo(
+    () =>
+      pendingEffectiveHost({
+        draftBindHost:
+          config && original && config.bindHost !== original.bindHost ? config.bindHost : null,
+        pendingBindHost: reachability?.pendingBindHost,
+        resolvedBindHost: reachability?.resolvedBindHost,
+      }),
+    [config, original, reachability],
+  );
+
+  // Recomputed CLIENT-SIDE from the draft, so adding an entry or flipping the
+  // listen interface converges the advisory without a save or a reload.
+  const unreachableEntries = useMemo(
+    () => (config ? unreachableTrustedEntries(pendingBindHost, collectTrustedEntries(config)) : []),
+    [config, pendingBindHost],
+  );
+
+  // `--host` / `PI_DASHBOARD_HOST` outrank `config.bindHost`, so under either
+  // the inline remediation (which writes config.bindHost) cannot take effect.
+  const bindHostShadowedBy =
+    reachability?.bindHostSource === "flag" || reachability?.bindHostSource === "env"
+      ? reachability.bindHostSource
+      : null;
+
+  // A saved-but-unapplied bind host. Surfaced through the header's EXISTING
+  // Restart affordance rather than a new notice component.
+  const restartPendingForBindHost =
+    !!reachability && reachability.resolvedBindHost !== reachability.pendingBindHost;
+
+  // Plugin draft state lives in the plugin component and dies on unmount, so
+  // leaving a dirty plugin page must guard. Scoped to THIS page's sources —
+  // keying off the panel-level `isDirty` would block a user with unsaved Server
+  // edits from opening any other page (design D5a).
+  const activePluginPageDirty = useMemo(() => {
+    if (!activePluginId) return false;
+    return dirtyPages.has(`plugins/${activePluginId}`);
+  }, [activePluginId, dirtyPages]);
 
   const handleDiscard = useCallback(() => {
     if (original) setConfig(JSON.parse(JSON.stringify(original)));
@@ -570,9 +837,37 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
           });
           const data = await res.json();
           if (!data.success) throw new Error(data.error || "providers");
+          // Success branch only — a body-level failure must not dispatch. The
+          // PUT has replace semantics, so this one dispatch covers adding,
+          // editing, and deleting a custom provider. Over-dispatch (a save
+          // that changes no credential) is accepted. See change:
+          // dispatch-provider-auth-event.
+          window.dispatchEvent(new CustomEvent(PROVIDER_AUTH_EVENT));
           const saved = validProviders.map(({ isNew, ...rest }) => rest);
           setLlmProviders(saved);
+          // A provider save/removal changes the catalogue; refetch off THIS
+          // response, never a fixed delay.
+          // See change: settings-default-model-without-session.
+          void refetchCatalogue();
           setOriginalLlmProviders(JSON.parse(JSON.stringify(saved)));
+          // The PUT awaited a server-side probe per provider; refetch so each
+          // pill reflects the freshly cached health without a remount. See
+          // change: surface-provider-health-in-settings.
+          try {
+            const refetched = await fetch(`${getApiBase()}/api/providers`).then((r) => (r.ok ? r.json() : null));
+            if (refetched?.health && typeof refetched.health === "object") {
+              setProviderHealth(refetched.health as Record<string, ProviderHealth>);
+            }
+          } catch {
+            // Refetch failed: the just-saved providers' cached health is stale
+            // (their config changed), so drop it to not-tested rather than show
+            // a stale pill. See change: surface-provider-health-in-settings.
+            setProviderHealth((prev) => {
+              const next = { ...prev };
+              for (const p of saved) delete next[p.name];
+              return next;
+            });
+          }
           return {};
         },
       });
@@ -610,6 +905,8 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
 
   // ── Unsaved-changes navigation guards ─────────────────────────────────────
   const [pendingNav, setPendingNav] = useState<string | null>(null);
+  // Resolver for a pending "disable this plugin while its page is dirty" prompt.
+  const [disableGuard, setDisableGuard] = useState<((ok: boolean) => void) | null>(null);
   const isDirtyRef = useRef(isDirty);
   isDirtyRef.current = isDirty;
 
@@ -618,6 +915,54 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
     if (isDirtyRef.current) setPendingNav(to);
     else navigate(to);
   }, [navigate]);
+
+  // Rail navigation between settings pages. Guards ONLY when leaving a plugin
+  // page with unsaved edits of its own — built-in draft state lives in this
+  // panel's `useState` and survives the switch. See design D5a.
+  const pluginPageDirtyRef = useRef(activePluginPageDirty);
+  pluginPageDirtyRef.current = activePluginPageDirty;
+  // Transient scroll intent for navigate-then-scroll (e.g. the General runtime
+  // row's `Change…` → the picker on Developer). Carried through the
+  // deferred-navigation round trip in its own ref — deliberately NOT a
+  // `pendingNav` type change, leaving the BACK_SENTINEL string comparisons
+  // untouched — and consumed once the destination page has rendered. Never
+  // encoded in the route. See change: surface-pi-runtime-on-general (D4).
+  const pendingScrollTargetRef = useRef<string | null>(null);
+  const requestRailNavigate = useCallback((to: string, scrollTarget?: string) => {
+    pendingScrollTargetRef.current = scrollTarget ?? null;
+    if (pluginPageDirtyRef.current) setPendingNav(to);
+    else navigate(to);
+  }, [navigate]);
+  // Consume the scroll intent after the destination renders. `activeTab` is
+  // the dependency: the effect fires on the commit that paints the target
+  // page, whose section root (e.g. data-testid="pi-runtime-section") is
+  // rendered synchronously with it.
+  useEffect(() => {
+    const target = pendingScrollTargetRef.current;
+    if (!target) return;
+    pendingScrollTargetRef.current = null;
+    document.querySelector(`[data-testid="${target}"]`)?.scrollIntoView({ block: "start" });
+  }, [activeTab]);
+  // The runtime row + advisory share one navigate-then-scroll affordance.
+  const navigateToRuntimePicker = useCallback(() => {
+    requestRailNavigate("/settings/developer", "pi-runtime-section");
+  }, [requestRailNavigate]);
+  // One `/api/health` poller per panel (the hook is instance-scoped): its
+  // `compatibility` feeds the advisory, its `piRuntime` the status row.
+  // Invoked EXACTLY here — the row and the advisory poll nothing themselves.
+  // See change: surface-pi-runtime-on-general (D2 wiring rule).
+  const { compatibility, piRuntime } = usePiCompatibility();
+
+  // Disabling the plugin whose page is open must resolve unsaved edits BEFORE
+  // the rail drops the nav child, or a dirty source ends up filed under a page
+  // with no entry (design Open Question 3). Resolves `false` when the user
+  // cancels, leaving the toggle untouched.
+  const pluginDisableGuard = useCallback(async () => {
+    if (!pluginPageDirtyRef.current) return true;
+    return await new Promise<boolean>((resolve) => {
+      setDisableGuard(() => resolve);
+    });
+  }, []);
 
   // Back arrow: resolve through the depth-aware `onBack` (launching route) when
   // provided, else fall back to the card list. Routed through the same dirty
@@ -631,6 +976,13 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
     if (isDirtyRef.current) setPendingNav(BACK_SENTINEL);
     else performBack();
   }, [performBack]);
+
+  // Overlay dismissal (backdrop / Escape / ✕) — gestures the full page never
+  // had. Route them through the SAME prompt as the back arrow rather than
+  // letting the container navigate out from under unsaved edits (R1). Opt-in,
+  // so this arms only while dirty.
+  // See change: add-route-backed-overlay-dialogs (task 6.2).
+  useOverlayDismissGuard(isDirty, requestBack);
 
   // Hard exits (tab close / reload / Electron window close): native prompt,
   // registered only while dirty.
@@ -649,7 +1001,11 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
     const onPop = () => {
       if (isDirtyRef.current) {
         window.history.pushState(null, "", window.location.href);
-        setPendingNav("/");
+        // Discarding must return to the LAUNCHING route, not the card list.
+        // The old hardcoded "/" evicted the user to the cards — exactly the
+        // defect this change exists to fix (D1b).
+        // See change: add-route-backed-overlay-dialogs (task 6.3).
+        setPendingNav(BACK_SENTINEL);
       }
     };
     window.addEventListener("popstate", onPop);
@@ -668,7 +1024,12 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
     const to = pendingNav;
     const ok = await handleSave();
     setPendingNav(null);
-    if (!ok) return;
+    if (!ok) {
+      // Save failed: the navigation never happens, so the carried scroll
+      // intent must not survive for a later page switch to inherit.
+      pendingScrollTargetRef.current = null;
+      return;
+    }
     if (to === BACK_SENTINEL) performBack();
     else if (to) navigate(to);
   }, [pendingNav, handleSave, navigate, performBack]);
@@ -753,9 +1114,28 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
     },
   ];
 
+  // Save Bar attribution: every dirty page, named and navigable. Plugin pages
+  // read `Plugins › <Display Name>`. No cap — wrapping is accepted (Non-Goals).
+  // See change: plugin-settings-pages (design D5).
+  const dirtyPageEntries = Array.from(dirtyPages).map((page) => {
+    if (page.startsWith("plugins/")) {
+      const id = page.slice("plugins/".length);
+      const name = pluginRows.find((r) => r.id === id)?.displayName ?? id;
+      return { page, label: `${t("settings.plugins", undefined, "Plugins")} › ${name}`, to: `/settings/${page}` };
+    }
+    const item = navGroups.flatMap((g) => g.items).find((i) => i.id === page);
+    return { page, label: item?.label ?? page, to: `/settings/${page}` };
+  });
+
   return (
     <SettingsDraftProvider registry={draftRegistry}>
-    <div className="flex-1 flex flex-col min-w-0 h-full">
+    {/* `min-h-0`, not `h-full`: the flush Dialog panel is a max-h-capped flex
+        column with no definite height, so `h-full` resolves to `auto` and this
+        root grows to content (clipping, no scroller). `min-h-0` releases the
+        flex item's content floor so the body below can scroll. Shared with the
+        MobileShell detail panel, which is also a definite-height flex column.
+        See change: fix-flush-dialog-scroll-and-close-collision. */}
+    <div className="flex-1 flex flex-col min-w-0 min-h-0">
       {/* Header */}
       <div data-testid="settings-header" className="flex items-center gap-3 p-4 border-b border-[var(--border-primary)] shrink-0">
         <button
@@ -766,15 +1146,41 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
           <Icon path={mdiArrowLeft} size={0.8} />
         </button>
         <h1 className="text-lg font-bold text-[var(--text-primary)]">{t("common.settings", undefined, "Settings")}</h1>
+        {dirtyPageEntries.length > 0 && (
+          <span
+            data-testid="settings-dirty-page-count"
+            title={t(
+              "settings.unsavedPageCount",
+              undefined,
+              `${dirtyPageEntries.length} page(s) with unsaved changes`,
+            )}
+            className="px-1.5 py-0.5 rounded text-[11px] font-medium bg-amber-400/20 text-amber-400 border border-amber-400/40"
+          >
+            {dirtyPageEntries.length}
+          </span>
+        )}
         <div className="flex-1" />
         <button
           onClick={() => { setMessage(null); restart.run(); }}
           disabled={restarting || saving}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-[var(--bg-tertiary)] hover:bg-[var(--bg-secondary)] text-[var(--text-secondary)] text-sm font-medium disabled:opacity-50 border border-[var(--border-secondary)]"
-          title={t("settings.restartServer", undefined, "Restart server")}
+          title={
+            restartPendingForBindHost
+              ? t("settings.restartPendingBindHost", undefined, "Restart required — the saved listen interface is not the one this server bound")
+              : t("settings.restartServer", undefined, "Restart server")
+          }
+          data-testid="settings-restart-button"
+          data-restart-pending={restartPendingForBindHost ? "true" : "false"}
         >
           <Icon path={mdiRestart} size={0.6} />
           {restarting ? t("common.restarting", undefined, "Restarting...") : t("common.restart", undefined, "Restart")}
+          {restartPendingForBindHost && (
+            <span
+              data-testid="settings-restart-pending-dot"
+              aria-label={t("settings.restartPending", undefined, "Restart pending")}
+              className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-[var(--warn-fg,#e2b24a)]"
+            />
+          )}
         </button>
       </div>
 
@@ -803,13 +1209,19 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                 {group.label}
               </div>
               {group.items.map((item) => {
-                const active = activeTab === item.id;
+                // Top-level entries compare against `activeTab`; the `plugins`
+                // parent is active only on the activation index, never when a
+                // child page is open (design D8a).
+                const active =
+                  item.id === "plugins"
+                    ? activeTab === "plugins" && !activePluginId
+                    : activeTab === item.id;
                 return (
+                  <div key={item.id} className="contents md:block">
                   <button
-                    key={item.id}
-                    onClick={() => navigate("/settings/" + item.id)}
+                    onClick={() => requestRailNavigate("/settings/" + item.id)}
                     aria-current={active ? "page" : undefined}
-                    className={`flex items-center gap-2.5 px-3 py-2 rounded-md text-sm whitespace-nowrap transition-colors cursor-pointer ${
+                    className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-md text-sm whitespace-nowrap transition-colors cursor-pointer ${
                       active
                         ? "bg-blue-600/15 text-[var(--text-primary)] font-semibold"
                         : "text-[var(--text-muted)] hover:bg-[var(--bg-secondary)] hover:text-[var(--text-secondary)]"
@@ -825,6 +1237,46 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                       />
                     )}
                   </button>
+                  {item.id === "plugins" &&
+                    pluginNavChildren.map((p) => {
+                      const childActive = activePluginId === p.id;
+                      const st = p.status;
+                      const health = st?.error
+                        ? { cls: "bg-[var(--accent-red)]", label: "error" }
+                        : st?.loaded === false
+                          ? { cls: "bg-[var(--accent-yellow)]", label: "not loaded" }
+                          : { cls: "bg-[var(--accent-green)]", label: "loaded" };
+                      return (
+                        <button
+                          key={`plugins/${p.id}`}
+                          onClick={() => requestRailNavigate(`/settings/plugins/${p.id}`)}
+                          aria-current={childActive ? "page" : undefined}
+                          data-testid={`nav-plugin-${p.id}`}
+                          className={`w-full flex items-center gap-2 pl-9 pr-3 py-1.5 rounded-md text-[13px] whitespace-nowrap transition-colors cursor-pointer ${
+                            childActive
+                              ? "bg-blue-600/15 text-[var(--text-primary)] font-semibold"
+                              : "text-[var(--text-muted)] hover:bg-[var(--bg-secondary)] hover:text-[var(--text-secondary)]"
+                          }`}
+                        >
+                          <span
+                            className={`w-1.5 h-1.5 rounded-full shrink-0 ${health.cls}`}
+                            data-testid={`nav-plugin-status-${p.id}`}
+                            role="img"
+                            aria-label={health.label}
+                            title={health.label}
+                          />
+                          <span className="truncate">{p.displayName}</span>
+                          {dirtyPages.has(`plugins/${p.id}`) && (
+                            <span
+                              data-testid={`nav-dirty-plugins/${p.id}`}
+                              title={t("settings.unsavedOnPage", undefined, "Unsaved changes on this page")}
+                              className="ml-auto w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"
+                            />
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
                 );
               })}
             </div>
@@ -836,42 +1288,48 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
             wrapper that would collapse its height). See change:
             directory-settings-page-and-scoped-md-editing. */}
         <div data-testid="settings-content" className="flex-1 min-h-0 min-w-0 flex flex-col">
+          {/* The settings pages scroll in `settingsPaneRef` below — that pane is
+              what clips a popover opened inside it (e.g. the Default Model
+              selector), so it provides itself as the popover boundary.
+
+              The provider sits ABOVE the branch, but the ref is attached only
+              inside the third branch. On the `instructions` and resource-grid
+              branches `.current` is null and the hook falls back to the
+              viewport — correct today because neither hosts a popover consumer.
+              A popover added to either branch must attach the ref to that
+              branch's own scroll pane, or it will silently measure against the
+              viewport again. See change: fix-popover-pane-bounded-height. */}
+          <PopoverBoundaryProvider value={settingsPaneRef}>
           {activeTab === "instructions" ? (
             <InstructionsPage />
           ) : activeTab in RESOURCE_TAB_TYPE ? (
             <div className="flex-1 overflow-y-auto min-w-0">
-              <ResourceGridPanel
+              <ScopedResourceGrid
+                page={activeTab as ResourcePageId}
                 data={piResources.data}
                 isLoading={piResources.isLoading}
                 error={piResources.error}
                 refresh={piResources.refresh}
                 activation={resourceActivation}
-                type={RESOURCE_TAB_TYPE[activeTab]}
-                scopes={["global"]}
-                showScopeFilter={false}
-                globalPill
-                onViewFile={(filePath, title) => navigate(buildPiResourceFileUrl(filePath, title))}
               />
-              {/* Per-page plugin slot mounts (literal ids for the registry lint). */}
-              <div className="px-3">
-                {activeTab === "skills" && <SettingsSectionSlot tab="skills" />}
-                {activeTab === "agents" && <SettingsSectionSlot tab="agents" />}
-                {activeTab === "extensions" && <SettingsSectionSlot tab="extensions" />}
-                {activeTab === "prompts" && <SettingsSectionSlot tab="prompts" />}
-                {activeTab === "themes" && <SettingsSectionSlot tab="themes" />}
-              </div>
             </div>
           ) : (
-          <div className="p-4 space-y-6 max-w-3xl overflow-y-auto">
+          <div ref={settingsPaneRef} className="p-4 space-y-6 max-w-3xl overflow-y-auto">
 
             {activeTab === "general" && (
               <>
-                <PiVersionAdvisory />
+                <PiVersionAdvisory compatibility={compatibility} onChangeRuntime={navigateToRuntimePicker} />
+                {/* Always-visible read-only summary — NOT gated on the advisory's
+                    visibility condition (it renders from `piRuntime`, the
+                    advisory from `compatibility`). See change:
+                    surface-pi-runtime-on-general. */}
+                <PiRuntimeStatusRow piRuntime={piRuntime} onChangeRuntime={navigateToRuntimePicker} />
                 <Section title={t("settings.interface", undefined, "Interface")}>
                   <p className="text-xs text-[var(--text-tertiary)] mb-2">
                     {t("settings.interfaceDescription", undefined, "Choose the dashboard interface language. The selection is saved in this browser.")}
                   </p>
                   <SelectField
+                    hint={i18nT("settings.hint.uiLanguage", undefined, "UI language for the dashboard. Session content is never translated.")}
                     label={t("settings.language", undefined, "Language")}
                     value={language}
                     options={LANGUAGE_OPTIONS}
@@ -882,43 +1340,81 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                       label={t("settings.compactWorkspaceSidebar", undefined, "Compact workspace sidebar")}
                       value={compactSidebar}
                       onChange={(value) => onCompactSidebarChange?.(value)}
-                    />
-                    <p className="text-xs text-[var(--text-tertiary)]">
-                      {t(
+                      hint={t(
                         "settings.compactWorkspaceSidebarDescription",
                         undefined,
                         "Hide folder creation and plugin sections while keeping project, Git, project actions, and session information.",
                       )}
+                    />
+                  </div>
+                  {/* Moved here from Sessions: it names the installed PWA, which
+                      is an interface concern, not a session one. Its
+                      CONFIG_FIELD_PAGE entry moved to "general" in the same
+                      change so the Save Bar chip follows it.
+                      See change: reorganize-settings-pages-and-descriptions. */}
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <label className="text-sm text-[var(--text-secondary)]">{i18nT("landing.pwaDisplayName", undefined, "PWA Display Name")}</label>
+                      <input
+                        type="text"
+                        className="w-56 bg-[var(--bg-secondary)] border border-[var(--border-secondary)] rounded px-2 py-1 text-sm text-[var(--text-primary)]"
+                        placeholder={i18nT("common.autoFromHostname", undefined, "(auto from hostname)")}
+                        value={config.dashboardName ?? ""}
+                        onChange={(e) => update((c) => { c.dashboardName = e.target.value; })}
+                      />
+                    </div>
+                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">
+                      {i18nT("landing.shownOnTheHomeScreenApp", undefined, "Shown on the home screen / app drawer when the dashboard is installed as a PWA. Leave blank to auto-derive from the request")} <code>{i18nT("common.host", undefined, "Host")}</code> {i18nT("common.headerOrTheServerHostnameDistinguishe", undefined, "header (or the server hostname). Distinguishes installs from multiple machines or tunnels.")}
                     </p>
                   </div>
                 </Section>
                 <DisplayPrefsSection />
-                <SettingsSectionSlot tab="general" />
               </>
             )}
 
             {activeTab === "server" && (
               <>
-                <Section title={i18nT("common.server", undefined, "Server")}>
-                  <NumberField label={t("settings.httpPort", undefined, "HTTP Port")} value={config.port} onChange={(v) => update((c) => { c.port = v; })} />
-                  <NumberField label={t("settings.piGatewayPort", undefined, "Pi Gateway Port")} value={config.piPort} onChange={(v) => update((c) => { c.piPort = v; })} />
+                <Section title={t("settings.ports", undefined, "Ports")}>
+                  <NumberField label={t("settings.httpPort", undefined, "HTTP Port")} value={config.port} onChange={(v) => update((c) => { c.port = v; })} hint={i18nT("settings.hint.httpPort", undefined, "Port the dashboard web UI and REST API listen on. Changing it needs a restart and breaks bookmarked URLs. Default 8000.")} />
+                  <NumberField label={t("settings.piGatewayPort", undefined, "Pi Gateway Port")} value={config.piPort} onChange={(v) => update((c) => { c.piPort = v; })} hint={i18nT("settings.hint.piGatewayPort", undefined, "Port pi sessions connect their bridge WebSocket to. Must be free and reachable from every machine running pi. Default 8001.")} />
+                  {gatewayEndpoint !== undefined && (
+                    <p
+                      className="text-xs text-[var(--text-tertiary)] -mt-2 mb-3"
+                      data-testid="gateway-transport-live"
+                      data-transport={typeof gatewayEndpoint === "string" ? "unix" : gatewayEndpoint === null ? "none" : "tcp"}
+                    >
+                      {typeof gatewayEndpoint === "string"
+                        ? i18nT("settings.gatewayLiveSocket", undefined, "Currently serving bridges on a local socket:")
+                        : gatewayEndpoint === null
+                          ? i18nT("settings.gatewayLiveNone", undefined, "No bridge listener is currently bound.")
+                          : i18nT("settings.gatewayLiveTcp", undefined, "Currently listening on port:")}
+                      {gatewayEndpoint !== null && (
+                        <span className="ml-1 font-mono break-all">{String(gatewayEndpoint)}</span>
+                      )}
+                    </p>
+                  )}
                   <ListenInterfaceField
                     bindHost={config.bindHost ?? "127.0.0.1"}
                     hasGuardConfig={hasGuardConfig(config)}
                     onChange={(v) => update((c) => { c.bindHost = v; })}
                   />
-                  <ToggleField label={t("settings.autoShutdown", undefined, "Auto Shutdown")} value={config.autoShutdown} onChange={(v) => update((c) => { c.autoShutdown = v; })} />
+                </Section>
+                <Section title={t("settings.idleShutdown", undefined, "Idle shutdown")}>
+                  <ToggleField label={t("settings.autoShutdown", undefined, "Auto Shutdown")} value={config.autoShutdown} onChange={(v) => update((c) => { c.autoShutdown = v; })} hint={i18nT("settings.hint.autoShutdown", undefined, "Stop the server once no session has been active for the window below. Off keeps it running forever.")} />
                   {config.autoShutdown && (
-                    <NumberField label={i18nT("status.idleSecondsBeforeShutdown", undefined, "Idle Seconds Before Shutdown")} value={config.shutdownIdleSeconds} onChange={(v) => update((c) => { c.shutdownIdleSeconds = v; })} />
+                    <GatedGroup>
+                      <NumberField label={i18nT("status.idleSecondsBeforeShutdown", undefined, "Idle before shutdown")} unit="s" value={config.shutdownIdleSeconds} onChange={(v) => update((c) => { c.shutdownIdleSeconds = v; })} hint={i18nT("settings.hint.idleBeforeShutdown", undefined, "Idle time before shutting down. Counts from the last session event, not the last page view.")} />
+                    </GatedGroup>
                   )}
                 </Section>
                 <Section title={t("settings.tunnel", undefined, "Gateway")}>
-                  <ToggleField label={t("settings.enableZrokTunnel", undefined, "Enable Gateway")} value={config.tunnel.enabled} onChange={(v) => update((c) => { c.tunnel.enabled = v; })} />
+                  <ToggleField label={t("settings.enableZrokTunnel", undefined, "Enable Gateway")} value={config.tunnel.enabled} onChange={(v) => update((c) => { c.tunnel.enabled = v; })} hint={i18nT("settings.hint.enableGateway", undefined, "Expose the dashboard through a public tunnel.")} />
                   <div className="mt-3 pt-3 border-t border-[var(--border-secondary)] space-y-2">
                     <p className="text-xs text-[var(--text-tertiary)]">
                       {i18nT("tunnel.watchdogProbesThePublicTunnelUrl", undefined, "Watchdog probes the public Gateway URL periodically and recycles it after consecutive failures (e.g. a zrok edge returning 502).")}
                     </p>
                     <ToggleField
+                      hint={i18nT("settings.hint.enableWatchdog", undefined, "Probe the tunnel on a timer and restart it when it stops answering. Off leaves a dead tunnel dead until you notice.")}
                       label={t("settings.enableWatchdog", undefined, "Enable Watchdog")}
                       value={config.tunnel.watchdog?.enabled ?? true}
                       onChange={(v) => update((c) => {
@@ -931,7 +1427,9 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                       })}
                     />
                     <NumberField
-                      label={t("settings.probeInterval", undefined, "Probe Interval (seconds)")}
+                      hint={i18nT("settings.hint.probeInterval", undefined, "Time between tunnel health probes. Lower detects a dead tunnel sooner and costs more requests.")}
+                      label={t("settings.probeInterval", undefined, "Probe interval")}
+                      unit="s"
                       value={Math.round((config.tunnel.watchdog?.intervalMs ?? 60000) / 1000)}
                       onChange={(v) => update((c) => {
                         c.tunnel.watchdog = {
@@ -943,6 +1441,7 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                       })}
                     />
                     <NumberField
+                      hint={i18nT("settings.hint.failureThreshold", undefined, "Consecutive failed probes before the watchdog restarts the tunnel. Raise it on a flaky network to avoid needless restarts.")}
                       label={i18nT("settings.failureThreshold", undefined, "Failure Threshold")}
                       value={config.tunnel.watchdog?.failureThreshold ?? 2}
                       onChange={(v) => update((c) => {
@@ -955,7 +1454,9 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                       })}
                     />
                     <NumberField
-                      label={t("settings.probeTimeout", undefined, "Probe Timeout (seconds)")}
+                      hint={i18nT("settings.hint.probeTimeout", undefined, "How long a single probe waits for an answer before counting as a failure.")}
+                      label={t("settings.probeTimeout", undefined, "Probe timeout")}
+                      unit="s"
                       value={Math.round((config.tunnel.watchdog?.probeTimeoutMs ?? 10000) / 1000)}
                       onChange={(v) => update((c) => {
                         c.tunnel.watchdog = {
@@ -973,106 +1474,237 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                     {t("settings.memoryLimitsDescription", undefined, "Controls for bounding server memory usage. Set to 0 to disable a limit. Requires server restart.")}
                   </p>
                   <NumberField
+                    hint={i18nT("settings.hint.maxEventsPerSession", undefined, "Ring-buffer size per session. Older events are trimmed from the middle so the chat head survives. 0 = unlimited (grows without bound).")}
                     label={i18nT("session.maxEventsPerSession", undefined, "Max Events Per Session")}
                     value={config.memoryLimits?.maxEventsPerSession ?? 200}
                     onChange={(v) => update((c) => {
-                      if (!c.memoryLimits) c.memoryLimits = { maxEventsPerSession: 200, maxStringFieldSize: 4000, maxWsBufferBytes: 4194304 };
+                      if (!c.memoryLimits) c.memoryLimits = { ...MEMORY_LIMITS_SEED };
                       c.memoryLimits.maxEventsPerSession = v;
                     })}
                   />
                   <NumberField
-                    label={i18nT("settings.maxStringTruncationChars", undefined, "Max String Truncation (chars)")}
+                    hint={i18nT("settings.hint.maxStringTruncation", undefined, "Cut long strings inside stored events to this length. 0 = never truncate. Relieve memory pressure here before lowering the event cap.")}
+                    label={i18nT("settings.maxStringTruncationChars", undefined, "Max string truncation")}
+                    unit="chars"
                     value={config.memoryLimits?.maxStringFieldSize ?? 4000}
                     onChange={(v) => update((c) => {
-                      if (!c.memoryLimits) c.memoryLimits = { maxEventsPerSession: 200, maxStringFieldSize: 4000, maxWsBufferBytes: 4194304 };
+                      if (!c.memoryLimits) c.memoryLimits = { ...MEMORY_LIMITS_SEED };
                       c.memoryLimits.maxStringFieldSize = v;
                     })}
                   />
                   <NumberField
-                    label={i18nT("settings.maxWebsocketBufferBytes", undefined, "Max WebSocket Buffer (bytes)")}
+                    hint={i18nT("settings.hint.maxWsBuffer", undefined, "Once a browser's outgoing buffer exceeds this, messages are dropped rather than queued — protects the server from one slow client. 0 = no limit.")}
+                    label={i18nT("settings.maxWebsocketBufferBytes", undefined, "Max WebSocket buffer")}
+                    unit="bytes"
                     value={config.memoryLimits?.maxWsBufferBytes ?? 4194304}
                     onChange={(v) => update((c) => {
-                      if (!c.memoryLimits) c.memoryLimits = { maxEventsPerSession: 200, maxStringFieldSize: 4000, maxWsBufferBytes: 4194304 };
+                      if (!c.memoryLimits) c.memoryLimits = { ...MEMORY_LIMITS_SEED };
                       c.memoryLimits.maxWsBufferBytes = v;
                     })}
                   />
+                  {/* The hint names the OUTCOME ("keeps the start and the most
+                      recent"), not the mechanism ("head/tail window"), mirroring
+                      the sibling maxEventsPerSession hint. The section's shared
+                      "Requires server restart" line covers this control too.
+                      See change: lazy-load-session-history. */}
+                  <NumberField
+                    hint={i18nT("settings.hint.maxReplayEvents", undefined, "Cap events sent to the browser when reopening a session. Keeps the start and the most recent messages; earlier ones load on demand. 0 = unlimited.")}
+                    label={i18nT("session.maxReplayEvents", undefined, "Max Replay Events")}
+                    value={config.memoryLimits?.maxReplayEvents ?? DEFAULT_MEMORY_LIMITS.maxReplayEvents}
+                    onChange={(v) => update((c) => {
+                      if (!c.memoryLimits) c.memoryLimits = { ...MEMORY_LIMITS_SEED };
+                      c.memoryLimits.maxReplayEvents = v;
+                    })}
+                  />
+                  {/* The mode is INERT at `maxReplayEvents: 0` — no window
+                      forms, so there is no shape to choose. Disabled with an
+                      explanation rather than hidden: hiding it would make the
+                      dependency invisible.
+
+                      The hint carries BOTH the tradeoff (opening messages are
+                      omitted) and the SCOPE. Scope is not a detail:
+                      `memoryLimits` is server config consulted before any
+                      per-client preference, so flipping this changes the
+                      transcript shape for every client of this server.
+                      See change: add-tail-only-replay-window (D1, D10). */}
+                  <SelectField
+                    label={i18nT("settings.replayWindowMode", undefined, "Replay window shape")}
+                    hint={
+                      (config.memoryLimits?.maxReplayEvents ?? DEFAULT_MEMORY_LIMITS.maxReplayEvents) === 0
+                        ? i18nT(
+                            "settings.hint.replayWindowModeInert",
+                            undefined,
+                            "Has no effect until Max Replay Events is set to a positive value.",
+                          )
+                        : i18nT(
+                            "settings.hint.replayWindowMode",
+                            undefined,
+                            "Keep start and recent: the session's opening messages stay pinned above the gap. Recent only: the transcript opens on the latest messages and loads earlier ones as you scroll up, omitting the opening messages. Affects every client of this server.",
+                          )
+                    }
+                    disabled={(config.memoryLimits?.maxReplayEvents ?? DEFAULT_MEMORY_LIMITS.maxReplayEvents) === 0}
+                    value={config.memoryLimits?.replayWindowMode ?? DEFAULT_MEMORY_LIMITS.replayWindowMode}
+                    options={[
+                      { value: "head-tail", label: i18nT("settings.replayWindowMode.headTail", undefined, "Keep start and recent") },
+                      { value: "tail-only", label: i18nT("settings.replayWindowMode.tailOnly", undefined, "Recent only") },
+                    ]}
+                    onChange={(v) => update((c) => {
+                      if (!c.memoryLimits) c.memoryLimits = { ...MEMORY_LIMITS_SEED };
+                      c.memoryLimits.replayWindowMode = v as "head-tail" | "tail-only";
+                    })}
+                  />
+                  {/* UNCONDITIONAL. A conditional warning comparing the two
+                      values is both backwards and undecidable: when
+                      `maxEventsPerSession <= maxReplayEvents` no window forms at
+                      all, so the warned-about pairing is inert; the genuinely
+                      harmful case depends on session size, unknowable at
+                      settings time. State the interaction instead.
+                      See change: fix-lazy-history-backfill-ux (D8). */}
+                  <p
+                    data-testid="memory-limits-replay-help"
+                    className="text-xs text-[var(--text-secondary)]"
+                  >
+                    {i18nT(
+                      "settings.help.replayWindowRetention",
+                      undefined,
+                      "Max Replay Events and Max Events Per Session work together: the replay window decides how much of a session the browser receives up front, while the event cap decides how much the server still holds. Earlier messages can only be loaded on demand while the server still holds them.",
+                    )}
+                  </p>
                 </Section>
-                <SettingsSectionSlot tab="server" />
               </>
             )}
 
             {activeTab === "sessions" && (
               <>
-                <Section title={t("settings.sessions", undefined, "Sessions")}>
+                <Section title={t("settings.newSessionDefaults", undefined, "New session defaults")}>
+                  {/* defaultModel is the setting that decides what every new session IS,
+                      so it leads the page in an info callout instead of sitting near the
+                      bottom. The caveat is the one the bridge already enforces.
+                      See change: reorganize-settings-pages-and-descriptions. */}
+                  <div className="rounded border px-3 py-2.5 bg-[var(--severity-info-bg)] border-[var(--severity-info-border)]">
+                    <div className="flex items-center justify-between">
+                      <label className="text-sm font-medium text-[var(--severity-info-fg)]">{t("settings.defaultModel", undefined, "Default model")}</label>
+                      <div className="flex items-center gap-2">
+                        <ModelSelector
+                          current={config.defaultModel || undefined}
+                          models={defaultModelOptions}
+                          onSelect={(v) => update((c) => { c.defaultModel = v; })}
+                        />
+                        {(() => {
+                          // Thinking-level control paired with the Default Model. Levels
+                          // derive from the selected model's supportedThinkingLevels (same
+                          // source the composer uses). No model selected → locked to `off`:
+                          // only `off` renders and selection is a persistence no-op (the
+                          // field stays "", never a spurious `off`). See change:
+                          // add-default-thinking-level.
+                          const selected = config.defaultModel
+                            ? defaultModelOptions.find((m) => `${m.provider}/${m.id}` === config.defaultModel)
+                            : undefined;
+                          const locked = !config.defaultModel;
+                          return (
+                            <ThinkingLevelSelector
+                              current={config.defaultThinkingLevel || "off"}
+                              supportedLevels={locked ? ["off"] : selected?.supportedThinkingLevels}
+                              onSelect={(v) => { if (!locked) update((c) => { c.defaultThinkingLevel = v; }); }}
+                            />
+                          );
+                        })()}
+                      </div>
+                    </div>
+                    {/* Catalogue states render HERE, beside the control: the
+                        selector trigger is disabled while its list is empty, so
+                        an in-picker state would be unreachable.
+                        See change: settings-default-model-without-session. */}
+                    {catalogueLoading && (
+                      <p className="mt-1 text-xs text-[var(--text-tertiary)]" data-testid="default-model-catalogue-loading">
+                        {i18nT("settings.modelCatalogueLoading", undefined, "Loading model catalogue…")}
+                      </p>
+                    )}
+                    {catalogueUnavailable && (
+                      <p className="mt-1 text-xs text-[var(--severity-warning-fg)]" data-testid="default-model-catalogue-unavailable">
+                        {i18nT("settings.modelCatalogueUnavailable", undefined, "The model catalogue could not be loaded. Only models reported by connected sessions are listed.")}
+                      </p>
+                    )}
+                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">
+                      {i18nT("settings.hint.defaultModel", undefined, "Applied only to brand-new sessions. A resumed session keeps the model it was started with. Leave empty to use pi's own default.")}
+                    </p>
+                  </div>
                   <SelectField
+                    hint={i18nT("settings.hint.sessionStrategy", undefined, "How +Session launches pi. Tmux keeps an attachable terminal you can join from a shell; headless runs detached and is lighter.")}
                     label={t("settings.spawnStrategy", undefined, "+Session Strategy")}
                     value={config.spawnStrategy}
                     options={[{ value: "headless", label: "Headless" }, { value: "tmux", label: "Tmux" }]}
                     onChange={(v) => update((c) => { c.spawnStrategy = v; })}
                   />
-                  <div>
-                    <SelectField
-                      label={i18nT("common.reattachPlacement", undefined, "Reattach Placement")}
-                      value={config.reattachPlacement ?? "always"}
-                      options={[
-                        { value: "always", label: "Always move to top (default)" },
-                        { value: "streaming-only", label: "Only when streaming" },
-                        { value: "preserve", label: "Preserve drag order" },
-                      ]}
-                      onChange={(v) => update((c) => { c.reattachPlacement = v as "preserve" | "streaming-only" | "always"; })}
-                    />
-                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">
-                      {i18nT("common.whenTheDashboardRestartsAndA", undefined, "When the dashboard restarts and a still-alive pi session reconnects, choose where its card goes in the folder list.")}
-                    </p>
-                  </div>
-                  <div>
-                    <SelectField
-                      label={i18nT("session.reopenSessionsAfterShutdown", undefined, "Reopen sessions after shutdown")}
-                      value={config.reopenSessionsAfterShutdown ?? "ask"}
-                      options={[
-                        { value: "ask", label: "Ask (default)" },
-                        { value: "auto", label: "Reopen automatically" },
-                        { value: "off", label: "Never" },
-                      ]}
-                      onChange={(v) => update((c) => { c.reopenSessionsAfterShutdown = v as "off" | "ask" | "auto"; })}
-                    />
-                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">
-                      {i18nT("session.whenSessionsWereRunningAtShutdown", undefined, "When sessions were running when the machine shut down or crashed, offer to reopen them on next launch. Ask shows a prompt; Auto reopens them silently; Never ignores them.")}
-                    </p>
-                  </div>
-                  <div>
-                    <ToggleField
-                      label={i18nT("session.putCompletedSessionFirst", undefined, "Put completed session first")}
-                      value={config.completedFirst ?? false}
-                      onChange={(v) => update((c) => { c.completedFirst = v; })}
-                    />
-                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">
-                      {i18nT("session.whenASessionFinishesATurn", undefined, "When a session finishes a turn or ends, move its card to the top of its tier (active, resp. ended). Off keeps the card in place.")}
-                    </p>
-                  </div>
-                  <div>
-                    <ToggleField
-                      label={i18nT("session.putQuestionSessionFirst", undefined, "Put question session first")}
-                      value={config.questionFirst ?? false}
-                      onChange={(v) => update((c) => { c.questionFirst = v; })}
-                    />
-                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">
-                      {i18nT("session.whenASessionAsksAQuestion", undefined, "When a session asks a question (ask_user), move its card to the top of the active tier. Off keeps the card in place.")}
-                    </p>
-                  </div>
-                  <div>
-                    <NumberField
-                      label={i18nT("session.askUserPromptTimeoutSeconds", undefined, "ask_user Prompt Timeout (seconds)")}
-                      value={config.askUserPromptTimeoutSeconds ?? 300}
-                      onChange={(v) => update((c) => { c.askUserPromptTimeoutSeconds = v; })}
-                    />
-                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">
-                      {i18nT("session.howLongAnInteractiveAskUser", undefined, "How long an interactive ask_user prompt waits for an answer before auto-cancelling. Use")} <code>-1</code> (or <code>0</code>{i18nT("common.toWaitForeverDefault3005", undefined, ") to wait forever. Default: 300 (5 min).")}
-                    </p>
-                  </div>
+                  <AutoNameSessionsToggle
+                    hint={<>
+                      {i18nT("settings.autoNameSessionsDesc", undefined, "Let pi automatically name new sessions by their topic.")}
+                      {" "}
+                      {/* The naming model is the `naming` role, so it is configured in
+                          the Roles panel rather than here — one source of truth, no
+                          second preference. This pointer exists so it is still
+                          discoverable at the point of use.
+                          See change: fix-auto-naming-reasoning-model (design D1). */}
+                      <span data-testid="auto-name-model-pointer">
+                        {i18nT("settings.autoNameModelPointer", undefined, "The model is the @naming role (Settings → Roles); when it is unassigned, @fast is used.")}
+                      </span>
+                    </>}
+                  />
+                </Section>
+                <Section title={t("settings.sessionList", undefined, "Session list")}>
+                  <SelectField
+                    label={i18nT("common.reattachPlacement", undefined, "Reattach Placement")}
+                    value={config.reattachPlacement ?? "always"}
+                    options={[
+                      { value: "always", label: "Always move to top (default)" },
+                      { value: "streaming-only", label: "Only when streaming" },
+                      { value: "preserve", label: "Preserve drag order" },
+                    ]}
+                    onChange={(v) => update((c) => { c.reattachPlacement = v as "preserve" | "streaming-only" | "always"; })}
+                    hint={i18nT("common.whenTheDashboardRestartsAndA", undefined, "When the dashboard restarts and a still-alive pi session reconnects, choose where its card goes in the folder list.")}
+                  />
+                  <ToggleField
+                    label={i18nT("session.putCompletedSessionFirst", undefined, "Put completed session first")}
+                    value={config.completedFirst ?? false}
+                    onChange={(v) => update((c) => { c.completedFirst = v; })}
+                    hint={i18nT("session.whenASessionFinishesATurn", undefined, "When a session finishes a turn or ends, move its card to the top of its tier (active, resp. ended). Off keeps the card in place.")}
+                  />
+                  <ToggleField
+                    label={i18nT("session.putQuestionSessionFirst", undefined, "Put question session first")}
+                    value={config.questionFirst ?? false}
+                    onChange={(v) => update((c) => { c.questionFirst = v; })}
+                    hint={i18nT("session.whenASessionAsksAQuestion", undefined, "When a session asks a question (ask_user), move its card to the top of the active tier. Off keeps the card in place.")}
+                  />
+                </Section>
+                <Section title={t("settings.lifecycleRecovery", undefined, "Lifecycle & recovery")}>
+                  <SelectField
+                    label={i18nT("session.reopenSessionsAfterShutdown", undefined, "Reopen sessions after shutdown")}
+                    value={config.reopenSessionsAfterShutdown ?? "ask"}
+                    options={[
+                      { value: "ask", label: "Ask (default)" },
+                      { value: "auto", label: "Reopen automatically" },
+                      { value: "off", label: "Never" },
+                    ]}
+                    onChange={(v) => update((c) => { c.reopenSessionsAfterShutdown = v as "off" | "ask" | "auto"; })}
+                    hint={i18nT("session.whenSessionsWereRunningAtShutdown", undefined, "When sessions were running when the machine shut down or crashed, offer to reopen them on next launch. Ask shows a prompt; Auto reopens them silently; Never ignores them.")}
+                  />
+                  <NumberField
+                    label={i18nT("session.askUserPromptTimeoutSeconds", undefined, "ask_user prompt timeout")}
+                    unit="s"
+                    value={config.askUserPromptTimeoutSeconds ?? 300}
+                    onChange={(v) => update((c) => { c.askUserPromptTimeoutSeconds = v; })}
+                    hint={<>{i18nT("session.howLongAnInteractiveAskUser", undefined, "How long an interactive ask_user prompt waits for an answer before auto-cancelling. Use")} <code>-1</code> (or <code>0</code>{i18nT("common.toWaitForeverDefault3005", undefined, ") to wait forever. Default: 300 (5 min).")}</>}
+                  />
                   <div>
                     <div className="flex items-center justify-between">
-                      <label className="text-sm text-[var(--text-secondary)]">{i18nT("session.sessionRegisterTimeoutMs", undefined, "+Session register timeout (ms)")}</label>
+                      {/* Bespoke control: label/unit cleanup only, never a swap
+                          for the shared NumberField (D3). The unit chip mirrors
+                          FieldShell's so it reads the same, and the "+Session"
+                          prefix stays because it names the spawn button (D10). */}
+                      <label className="text-sm text-[var(--text-secondary)]">
+                        {i18nT("session.sessionRegisterTimeoutMs", undefined, "+Session register timeout")}
+                        <span className="ml-1.5 px-1 py-0.5 rounded text-[10px] align-middle bg-[var(--bg-tertiary)] text-[var(--text-tertiary)]">ms</span>
+                      </label>
                       <input
                         type="number"
                         className={`w-28 bg-[var(--bg-secondary)] border rounded px-2 py-1 text-sm text-[var(--text-primary)] text-right ${
@@ -1096,77 +1728,55 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                       {i18nT("common.howLongToWaitForA", undefined, "How long to wait for a spawned pi session to connect before showing a warning. Default 30000 (30s). Range 5000–120000.")}
                     </p>
                   </div>
-                  <div>
-                    <ToggleField
-                      label={i18nT("worktree.showWorktreeSpawnButtonsInFolders", undefined, "Show worktree spawn buttons in folders and OpenSpec rows")}
-                      value={config.gitWorktreeEnabled ?? true}
-                      onChange={(v) => update((c) => { c.gitWorktreeEnabled = v; })}
-                    />
-                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">
+                </Section>
+                <Section title={t("settings.worktrees", undefined, "Worktrees")}>
+                  <ToggleField
+                    label={i18nT("worktree.showWorktreeSpawnButtonsInFolders", undefined, "Show worktree spawn buttons in folders and OpenSpec rows")}
+                    value={config.gitWorktreeEnabled ?? true}
+                    onChange={(v) => update((c) => { c.gitWorktreeEnabled = v; })}
+
+                    hint={<>
                       {i18nT("folders.uiPreferenceOnlyHidesTheFolder", undefined, "UI preference only. Hides the folder")} <code>+Worktree</code> {i18nT("common.buttonAndThePerChange", undefined, "button and the per-change")} <code>⥂2+</code> {i18nT("openspec.buttonOnOpenspecRowsThe", undefined, "button on OpenSpec rows. The")} <code>/api/git/worktree*</code> {i18nT("common.restEndpointsStayReachableForTooling", undefined, "REST endpoints stay reachable for tooling. Default on.")}
-                    </p>
-                  </div>
-                  <div>
-                    <AutoNameSessionsToggle />
-                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">
-                      {i18nT("settings.autoNameSessionsDesc", undefined, "Let pi automatically name new sessions by their topic using the fast model.")}
-                    </p>
-                  </div>
-                  <div>
-                    <WorktreeAutoInitToggle />
-                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">
+                    </>}
+                  />
+                  <WorktreeAutoInitToggle
+                    hint={<>
                       {i18nT("worktree.afterSpawningAWorktreeAutoRun", undefined, "After spawning a worktree, automatically run its declared")} <code>worktreeInit</code> {i18nT("common.hookOnlyWhenAlreadyTrusted", undefined, "hook — only when the hook is already trusted. Untrusted hooks still require a manual Initialize click to grant trust. Default off.")}
-                    </p>
-                  </div>
+                    </>}
+                  />
                   {/* Windows-only: bundled-vs-host git & bash. Hidden on
                       macOS/Linux (gitSourceReadout null). See change:
                       embed-git-bash-on-windows. */}
                   {gitSourceReadout && (
-                    <div>
-                      <SelectField
-                        label={i18nT("git.gitBashSource", undefined, "Git & Bash source (Windows)")}
-                        value={config.windowsGitSource ?? "auto"}
-                        options={[
-                          { value: "auto", label: "Auto — host when installed, else bundled (default)" },
-                          { value: "host", label: "Host only — use the installed Git for Windows" },
-                          { value: "bundled", label: "Bundled only — always use the shipped git" },
-                        ]}
-                        onChange={(v) => update((c) => { c.windowsGitSource = v as "auto" | "host" | "bundled"; })}
-                      />
-                      <p className="mt-1 text-xs text-[var(--text-tertiary)]">
+                    <SelectField
+                      label={i18nT("git.gitBashSource", undefined, "Git & Bash source (Windows)")}
+                      value={config.windowsGitSource ?? "auto"}
+                      options={[
+                        { value: "auto", label: "Auto — host when installed, else bundled (default)" },
+                        { value: "host", label: "Host only — use the installed Git for Windows" },
+                        { value: "bundled", label: "Bundled only — always use the shipped git" },
+                      ]}
+                      onChange={(v) => update((c) => { c.windowsGitSource = v as "auto" | "host" | "bundled"; })}
+
+                      hint={<>
                         {i18nT("common.currentlyActive", undefined, "Currently active:")}{" "}
                         <strong>{gitSourceReadout.source}</strong>
                         {gitSourceReadout.gitPath ? <> — <code>{gitSourceReadout.gitPath}</code></> : null}
                         {gitSourceReadout.gitVersion ? <> ({gitSourceReadout.gitVersion})</> : null}
                         . {i18nT("git.gitSourceTakesEffect", undefined, "Takes effect for newly spawned sessions. macOS/Linux ignore this setting.")}
-                      </p>
-                    </div>
-                  )}
-                  <div className="flex items-center justify-between">
-                      <label className="text-sm text-[var(--text-secondary)]">{t("settings.defaultModel", undefined, "Default Model")}</label>
-                    <ModelSelector
-                      current={config.defaultModel || undefined}
-                      models={availableModels}
-                      onSelect={(v) => update((c) => { c.defaultModel = v; })}
+                      </>}
                     />
-                  </div>
-                  <div>
-                    <div className="flex items-center justify-between">
-                      <label className="text-sm text-[var(--text-secondary)]">{i18nT("landing.pwaDisplayName", undefined, "PWA Display Name")}</label>
-                      <input
-                        type="text"
-                        className="w-56 bg-[var(--bg-secondary)] border border-[var(--border-secondary)] rounded px-2 py-1 text-sm text-[var(--text-primary)]"
-                        placeholder={i18nT("common.autoFromHostname", undefined, "(auto from hostname)")}
-                        value={config.dashboardName ?? ""}
-                        onChange={(e) => update((c) => { c.dashboardName = e.target.value; })}
-                      />
-                    </div>
-                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">
-                      {i18nT("landing.shownOnTheHomeScreenApp", undefined, "Shown on the home screen / app drawer when the dashboard is installed as a PWA. Leave blank to auto-derive from the request")} <code>{i18nT("common.host", undefined, "Host")}</code> {i18nT("common.headerOrTheServerHostnameDistinguishe", undefined, "header (or the server hostname). Distinguishes installs from multiple machines or tunnels.")}
-                    </p>
-                  </div>
+                  )}
                 </Section>
-                <SettingsSectionSlot tab="sessions" />
+                {/* "Retry", not "Provider Retry": three of the six fields
+                    (`enabled`, `maxRetries`, `baseDelayMs`) are turn-level, not
+                    provider-scoped. The provider trio keeps its own subhead.
+                    Filed under Sessions, not Providers: the observable effect is
+                    on a session (waiting / attempt n / countdown / Stop), and the
+                    sibling turn-lifecycle timeouts already live here. */}
+                <Section title={t("settings.retry", undefined, "Retry")}>
+                  <RetrySettingsSection />
+                </Section>
               </>
             )}
 
@@ -1175,7 +1785,6 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
             {activeTab === "remote" && (
               <>
                 <ServersTab />
-                <SettingsSectionSlot tab="remote" />
               </>
             )}
 
@@ -1218,6 +1827,40 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                       }}
                     />
                   </div>
+                  {/* OAuth redirect base — the operator's disambiguator when the
+                      dashboard answers on several addresses. `publicBaseUrls` is a
+                      list; an OAuth redirect_uri must be ONE pre-registered origin,
+                      so it is stated here rather than inferred (D7).
+                      See change: config-override-oauth-redirect-base. */}
+                  <div className="mt-3">
+                    <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">
+                      {t("settings.redirectBaseUrl", undefined, "OAuth Redirect Base URL")}{" "}
+                      <span className="text-[var(--text-tertiary)]">
+                        ({t(
+                          "settings.redirectBaseUrlHint",
+                          undefined,
+                          "public origin the provider calls back to, e.g. https://pi.example.com — register the same URL with the provider too",
+                        )})
+                      </span>
+                    </label>
+                    <input
+                      type="url"
+                      inputMode="url"
+                      data-testid="redirect-base-url-input"
+                      className="w-full bg-[var(--bg-secondary)] border border-[var(--border-secondary)] rounded px-2 py-1.5 text-sm text-[var(--text-primary)] font-mono"
+                      placeholder="https://pi.example.com"
+                      value={config.auth?.redirectBaseUrl ?? ""}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        update((c) => {
+                          if (!c.auth) c.auth = { secret: "", providers: {} };
+                          // Empty string clears it (`||` semantics, D1) — omitting
+                          // the key would PRESERVE the old value instead.
+                          c.auth.redirectBaseUrl = value;
+                        });
+                      }}
+                    />
+                  </div>
                   <div className="mt-3">
                     <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">
                       {t("settings.bypassUrls", undefined, "Bypass URL Prefixes")} <span className="text-[var(--text-tertiary)]">({t("settings.bypassUrlsHint", undefined, "one per line — requests to these paths skip auth")})</span>
@@ -1241,34 +1884,76 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                 <TrustedNetworksSection
                   bypassHosts={config.auth?.bypassHosts ?? []}
                   legacyTrustedNetworks={config.trustedNetworks ?? []}
+                  pendingBindHost={pendingBindHost}
+                  unreachable={unreachableEntries}
+                  bindHostShadowedBy={bindHostShadowedBy}
+                  onListenOnAllInterfaces={() => update((c) => { c.bindHost = "0.0.0.0"; })}
+                  onGoToServerPage={() => navigate("/settings/server")}
                   onChange={(nets) => update((c) => {
                     if (!c.auth) c.auth = { secret: "", providers: {} };
                     c.auth.bypassHosts = nets;
                   })}
                 />
                 <Section title={t("settings.pairDevice", undefined, "Pair a device")}>
-                  <PairingView />
+                  {/* A route, not a duplicate (D2): Security keeps the words an
+                      operator expects and one click to the act, which lives on
+                      the Gateway "Connect a device" surface. Body names the
+                      destination and what happens there (NN/g link writing);
+                      button mirrors the Gateway page's `Open Security →` shape.
+                      See mockups/security-pair.html variant A1. */}
+                  <p className="mb-3 max-w-[56ch] text-xs text-[var(--text-secondary)]">
+                    {t(
+                      "settings.pairDeviceBody",
+                      undefined,
+                      "Pairing happens on the Gateway page, where you pick which endpoint the device connects over, scan the QR, and approve it with the code shown on the device.",
+                    )}
+                  </p>
+                  <button
+                    type="button"
+                    data-testid="security-pair-link"
+                    className="rounded border border-[var(--border-secondary)] px-3 py-1.5 text-sm text-[var(--text-primary)] hover:bg-[var(--bg-secondary)]"
+                    onClick={() => {
+                      navigate("/settings/gateway");
+                      // The section renders after the route swap — scroll once
+                      // it exists, so the link LANDS + SCROLLS (test-plan F3).
+                      requestAnimationFrame(() => {
+                        document.getElementById("connect-a-device")?.scrollIntoView({ block: "start" });
+                      });
+                    }}
+                  >
+                    {t("settings.pairDeviceLink", undefined, "Open Gateway ▸ Connect a device →")}
+                  </button>
                 </Section>
                 <Section title={t("settings.pairedDevices", undefined, "Paired Devices")}>
                   <PairedDevicesSection />
                 </Section>
-                <SettingsSectionSlot tab="security" />
               </>
             )}
 
             {activeTab === "providers" && (
               <>
                 <Section title={t("settings.providerAuth", undefined, "Provider Authentication")}>
-                  <ProviderAuthSection />
+                  <ProviderAuthSection onCredentialsChanged={refetchCatalogue} />
                 </Section>
                 <Section title={t("settings.llmProviders", undefined, "LLM Providers")}>
                   <p className="text-xs text-[var(--text-tertiary)] mb-3">
                     {t("settings.llmProvidersDescription", undefined, "Register custom OpenAI-compatible API endpoints for model access.")}
                   </p>
-                  {llmProviders.map((provider, index) => (
+                  {llmProviders.map((provider, index) => {
+                    // Suppress cached health for a row edited since its last save:
+                    // the cache reflects the SAVED config, so showing it against
+                    // unsaved edits would be misleading. See change:
+                    // surface-provider-health-in-settings.
+                    const savedOriginal = originalLlmProviders.find((o) => o.name === provider.name);
+                    const rowDirty = provider.isNew || !savedOriginal
+                      || savedOriginal.baseUrl !== provider.baseUrl
+                      || savedOriginal.apiKey !== provider.apiKey
+                      || savedOriginal.api !== provider.api;
+                    return (
                     <LlmProviderCard
                       key={`${provider.name}-${index}`}
                       provider={provider}
+                      health={rowDirty ? undefined : providerHealth[provider.name]}
                       onChange={(updated) => {
                         setLlmProviders((prev) => prev.map((p, i) => (i === index ? updated : p)));
                       }}
@@ -1276,7 +1961,8 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                         setLlmProviders((prev) => prev.filter((_, i) => i !== index));
                       }}
                     />
-                  ))}
+                    );
+                  })}
                   <button
                     onClick={() => setLlmProviders((prev) => [...prev, { name: "", baseUrl: "", apiKey: "", api: "openai-completions", isNew: true }])}
                     className="flex items-center gap-1.5 text-sm text-[var(--accent-blue)] hover:text-blue-400 mt-1"
@@ -1290,10 +1976,9 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                     config={config.modelProxy ?? {}}
                     onChange={(patch) => update((c) => { c.modelProxy = { ...c.modelProxy, ...patch }; })}
                     upstreamExtensionDetected={upstreamPiModelProxyInstalled}
-                    availableModels={availableModels}
+                    availableModels={catalogueModels}
                   />
                 </Section>
-                <SettingsSectionSlot tab="providers" />
               </>
             )}
 
@@ -1301,15 +1986,29 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
               <>
                 <UnifiedPackagesSection />
                 <GlobalPackagesBrowseAndDialogs />
-                <SettingsSectionSlot tab="packages" />
               </>
             )}
 
             {activeTab === "plugins" && (
-              <>
-                <PluginsSection />
-                <SettingsSectionSlot tab="plugins" />
-              </>
+              activePluginRow && activePluginHasSettings ? (
+                <PluginSettingsPage
+                  row={activePluginRow}
+                  toggle={pluginToggle}
+                  onLeaveGuard={pluginDisableGuard}
+                  onNavigate={requestRailNavigate}
+                />
+              ) : (
+                <>
+                  {/* Unknown id, or an installed plugin with no settings → the
+                      activation index plus a notice, never a blank page or an
+                      empty-bodied plugin page (design D2). Held until the list
+                      loads so a notice never flashes for a real plugin. */}
+                  {activePluginId && !pluginList.loading && !activePluginHasSettings && (
+                    <PluginNotFoundNotice pluginId={activePluginId} />
+                  )}
+                  <PluginsSection list={pluginList} toggle={pluginToggle} contributesSettings={contributesSettings} />
+                </>
+              )
             )}
 
             {activeTab === "openspec" && (
@@ -1319,6 +2018,7 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                     {i18nT("settings.controlsHowAggressivelyTheServerPolls", undefined, "Controls how aggressively the server polls")} <code>{i18nT("openspec.openspecList", undefined, "openspec list")}</code> and <code>{i18nT("openspec.openspecStatus", undefined, "openspec status")}</code> {i18nT("folders.forEachKnownDirectoryLongerInterval", undefined, "for each known directory. Longer interval → less CPU, slightly staler UI. Lower concurrency → smoother curve. Change detection")} <code>mtime</code> {i18nT("openspec.skipsRePollingUnchangedProposalsRecom", undefined, "skips re-polling unchanged proposals (recommended).")}
                   </p>
                   <ToggleField
+                    hint={i18nT("settings.hint.enableOpenspecPolling", undefined, "Watch registered folders for OpenSpec changes and spawn sessions for them. Off disables every setting below.")}
                     label={t("settings.enableOpenSpec", undefined, "Enable OpenSpec")}
                     value={config.openspec?.enabled ?? DEFAULT_OPENSPEC_UI.enabled}
                     onChange={(v) => update((c) => {
@@ -1332,9 +2032,11 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                   {(() => {
                     const openspecOff = (config.openspec?.enabled ?? DEFAULT_OPENSPEC_UI.enabled) === false;
                     return (
-                      <>
+                      <GatedGroup>
                         <NumberField
-                          label={i18nT("settings.pollIntervalSeconds53600", undefined, "Poll Interval (seconds, 5–3600)")}
+                          hint={i18nT("settings.hint.pollInterval", undefined, "Time between scans of every watched folder. Lower reacts faster and costs more filesystem I/O. Range 5–3600.")}
+                          label={i18nT("settings.pollIntervalSeconds53600", undefined, "Poll interval")}
+                          unit="s"
                           disabled={openspecOff}
                           value={config.openspec?.pollIntervalSeconds ?? DEFAULT_OPENSPEC_UI.pollIntervalSeconds}
                           onChange={(v) => update((c) => {
@@ -1343,7 +2045,8 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                           })}
                         />
                         <NumberField
-                          label={i18nT("session.maxConcurrentSessions116", undefined, "Max Concurrent +Sessions (1–16)")}
+                          hint={i18nT("settings.hint.maxConcurrentSpawns", undefined, "Upper bound on sessions polling spawns at once. Each one is a full pi process — raise only if your machine has the RAM. Range 1–16.")}
+                          label={i18nT("session.maxConcurrentSessions116", undefined, "Max concurrent +Sessions")}
                           disabled={openspecOff}
                           value={config.openspec?.maxConcurrentSpawns ?? DEFAULT_OPENSPEC_UI.maxConcurrentSpawns}
                           onChange={(v) => update((c) => {
@@ -1352,6 +2055,7 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                           })}
                         />
                         <SelectField
+                          hint={i18nT("settings.hint.changeDetection", undefined, "mtime re-reads a proposal only when its file timestamp moved — cheap, but misses same-second edits. always re-reads every tick.")}
                           label={i18nT("common.changeDetection", undefined, "Change Detection")}
                           disabled={openspecOff}
                           value={config.openspec?.changeDetection ?? DEFAULT_OPENSPEC_UI.changeDetection}
@@ -1365,7 +2069,9 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                           })}
                         />
                         <NumberField
-                          label={i18nT("settings.jitterSeconds060", undefined, "Jitter (seconds, 0–60)")}
+                          hint={i18nT("settings.hint.jitter", undefined, "Random offset added to each interval so many folders don't all scan on the same tick. 0 disables. Range 0–60.")}
+                          label={i18nT("settings.jitterSeconds060", undefined, "Jitter")}
+                          unit="s"
                           disabled={openspecOff}
                           value={config.openspec?.jitterSeconds ?? DEFAULT_OPENSPEC_UI.jitterSeconds}
                           onChange={(v) => update((c) => {
@@ -1373,47 +2079,49 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                             c.openspec.jitterSeconds = v;
                           })}
                         />
-                      </>
+                      </GatedGroup>
                     );
                   })()}
                 </Section>
                 {/* See change: add-openspec-profile-settings. */}
                 <OpenSpecProfileSection />
-                <SettingsSectionSlot tab="openspec" />
               </>
             )}
 
             {activeTab === "developer" && (
               <>
-                <Section title={t("settings.chatDisplay", undefined, "Chat Display")}>
-                  <p className="text-xs text-[var(--text-tertiary)] mb-2">
-                    {t("settings.chatDisplayAdvancedDescription", undefined, "Controls what is shown in the chat message stream.")}
-                  </p>
-                  <DebugToolsToggle />
-                </Section>
-                {/* Configurable chat display (configurable-chat-display). */}
+                {/* The Developer "Chat Display" section is gone: its only control
+                    was a second toggle for displayPrefs.debugTools, which
+                    DisplayPrefsSection already owns through the buffered
+                    display-prefs draft source. The two desynced until reload
+                    because this one PATCHed immediately. Chat-display
+                    preferences now live only on General.
+                    See change: reorganize-settings-pages-and-descriptions (D7). */}
                 <Section title={t("settings.developer", undefined, "Developer")}>
-                  <ToggleField label={t("settings.devBuildOnReload", undefined, "Dev Build on Reload")} value={config.devBuildOnReload} onChange={(v) => update((c) => { c.devBuildOnReload = v; })} />
+                  <ToggleField label={t("settings.devBuildOnReload", undefined, "Dev Build on Reload")} value={config.devBuildOnReload} onChange={(v) => update((c) => { c.devBuildOnReload = v; })} hint={i18nT("settings.hint.devBuildOnReload", undefined, "Rebuild the web client each time you reload sessions. Slower reloads, but you see client edits without a manual build.")} />
                   <ToggleField
                     label={t("settings.capturePiOutput", undefined, "Capture pi session output (debug)")}
                     value={config.keeperLog?.capturePiOutput ?? false}
                     onChange={(v) => update((c) => { c.keeperLog = { ...c.keeperLog, capturePiOutput: v }; })}
+                    hint={t("settings.capturePiOutputHint", undefined, "Archives each session's full pi stdout/stderr into keeper-<id>.log for debugging. Consumes significant disk on long sessions — leave off unless diagnosing a session. Applies to newly spawned sessions.")}
                   />
-                  <p className="text-xs text-[var(--text-tertiary)] mt-1">
-                    {t("settings.capturePiOutputHint", undefined, "Archives each session's full pi stdout/stderr into keeper-<id>.log for debugging. Consumes significant disk on long sessions — leave off unless diagnosing a session. Applies to newly spawned sessions.")}
-                  </p>
                 </Section>
                 <DiagnosticsSection />
+                <PiRuntimeSection />
+                {/* Node family picker — same pattern as the pi picker above:
+                    one curated selection surface per family. See change:
+                    add-node-runtime-family-selection. */}
+                <NodeRuntimeSection />
                 <ToolsSection />
                 <SpawnFailuresSection />
                 {/* See change: auto-canvas (task 5.2). */}
                 <CanvasTypesSettingsSection selectedCwd={selectedCwd} />
-                <SettingsSectionSlot tab="developer" />
               </>
             )}
 
           </div>
           )}
+          </PopoverBoundaryProvider>
         </div>
       </div>
 
@@ -1430,6 +2138,19 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
               ? t("settings.unsavedOne", undefined, "unsaved change")
               : t("settings.unsavedMany", undefined, "unsaved changes")}
           </span>
+          <div className="flex flex-wrap items-center gap-1.5" data-testid="save-bar-pages">
+            {dirtyPageEntries.map((e) => (
+              <button
+                key={e.page}
+                type="button"
+                onClick={() => requestRailNavigate(e.to)}
+                data-testid={`save-bar-page-${e.page}`}
+                className="px-2 py-0.5 rounded text-[11px] text-[var(--text-secondary)] bg-[var(--bg-tertiary)] border border-[var(--border-secondary)] hover:bg-[var(--bg-surface)]"
+              >
+                {e.label}
+              </button>
+            ))}
+          </div>
           <div className="flex-1" />
           <button
             onClick={handleDiscard}
@@ -1457,7 +2178,34 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
         saving={saving}
         onSave={confirmSaveLeave}
         onDiscard={confirmDiscardLeave}
-        onCancel={() => setPendingNav(null)}
+        onCancel={() => {
+          // Cancelled navigation: drop the carried scroll intent with the
+          // pending destination, so a later chip navigation can't inherit it.
+          pendingScrollTargetRef.current = null;
+          setPendingNav(null);
+        }}
+      />
+    )}
+
+    {/* Disable-while-dirty: resolves BEFORE the toggle fires, so the rail never
+        drops the nav child out from under a dirty source (design OQ3). */}
+    {disableGuard !== null && (
+      <UnsavedChangesDialog
+        saving={saving}
+        onSave={async () => {
+          const ok = await handleSave();
+          setDisableGuard(null);
+          disableGuard(ok);
+        }}
+        onDiscard={() => {
+          handleDiscard();
+          setDisableGuard(null);
+          disableGuard(true);
+        }}
+        onCancel={() => {
+          setDisableGuard(null);
+          disableGuard(false);
+        }}
       />
     )}
     </SettingsDraftProvider>
@@ -1478,7 +2226,7 @@ function UnsavedChangesDialog({ saving, onSave, onDiscard, onCancel }: {
   return (
     <DialogPortal>
       <div
-        className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+        className="fixed inset-0 z-dialog flex items-center justify-center bg-black/50 p-4"
         onClick={onCancel}
       >
         <div
@@ -1524,22 +2272,10 @@ function UnsavedChangesDialog({ saving, onSave, onDiscard, onCancel }: {
   );
 }
 
-function DebugToolsToggle() {
-  const { t } = useI18n();
-  const [visible, setVisible] = useDebugToolsVisible();
-  return (
-    <ToggleField
-      label={t("settings.showDebugEvents", undefined, "Show debug events (raw events, flow:list-flows, resources_discover)")}
-      value={visible}
-      onChange={setVisible}
-    />
-  );
-}
-
 // ── Worktree auto-init toggle (auto-init-worktree-on-spawn) ───────────────
 // Self-contained: reads the preference on mount, PATCHes immediately on
 // toggle (decoupled from the config Save button). Fail-safe to OFF.
-function WorktreeAutoInitToggle() {
+function WorktreeAutoInitToggle({ hint }: { hint: React.ReactNode }) {
   // Buffered source: the toggle edits a local draft; the preference persists
   // only on the unified Save. See change: unify-settings-save-contract.
   const [baseline, setBaseline] = useState<boolean | null>(null);
@@ -1561,6 +2297,7 @@ function WorktreeAutoInitToggle() {
   useSettingsDraftSource({ id: "worktree-auto-init", page: "sessions", isDirty, commit, reset });
   return (
     <ToggleField
+      hint={hint}
       label={i18nT("worktree.initializeOnWorktree", undefined, "Initialize on worktree")}
       value={draft}
       onChange={setDraft}
@@ -1571,7 +2308,7 @@ function WorktreeAutoInitToggle() {
 // ── Auto-name sessions toggle (add-auto-session-naming) ───────────────────
 // Self-contained, mirrors WorktreeAutoInitToggle: reads the preference on
 // mount, persists on the unified Save. Fail-safe to ON (the default).
-function AutoNameSessionsToggle() {
+function AutoNameSessionsToggle({ hint }: { hint: React.ReactNode }) {
   const [baseline, setBaseline] = useState<boolean | null>(null);
   const [draft, setDraft] = useState(true);
   useEffect(() => {
@@ -1591,6 +2328,7 @@ function AutoNameSessionsToggle() {
   useSettingsDraftSource({ id: "auto-name-sessions", page: "sessions", isDirty, commit, reset });
   return (
     <ToggleField
+      hint={hint}
       label={i18nT("settings.autoNameSessions", undefined, "Auto-name sessions")}
       value={draft}
       onChange={setDraft}
@@ -1608,19 +2346,39 @@ function DisplayPrefsSection() {
   const baselineKey = JSON.stringify(global ?? DISPLAY_PRESETS.standard);
   const [draft, setDraft] = useState<DisplayPrefs>(() => JSON.parse(baselineKey));
   const isDirty = JSON.stringify(draft) !== baselineKey;
-  const dirtyRef = useRef(isDirty); dirtyRef.current = isDirty;
   const baselineRef = useRef(baselineKey); baselineRef.current = baselineKey;
   const draftRef = useRef(draft); draftRef.current = draft;
   // Adopt a new baseline (e.g. cross-tab broadcast) only while clean.
-  useEffect(() => { if (!dirtyRef.current) setDraft(JSON.parse(baselineKey)); }, [baselineKey]);
+  //
+  // The MOUNT pass must be a no-op: `useState` already seeded the draft from
+  // this very baseline, and re-applying it here reverts a toggle flipped
+  // between the commit that painted it and the scheduler's passive-effect
+  // flush -- a real first-click-does-nothing bug, and the CI flake
+  // "Token stats bar did not flip". Dirtiness is therefore decided against the
+  // PREVIOUS baseline inside the updater, where the current draft is readable,
+  // instead of a ref written during render (still `false` for that edit).
+  const adoptedBaselineRef = useRef(baselineKey);
+  useEffect(() => {
+    const previous = adoptedBaselineRef.current;
+    if (previous === baselineKey) return;
+    adoptedBaselineRef.current = baselineKey;
+    setDraft((prev) => (JSON.stringify(prev) === previous ? JSON.parse(baselineKey) : prev));
+  }, [baselineKey]);
 
   type ToolCallPatch = Partial<DisplayPrefs["toolCalls"]>;
-  type DisplayPrefsPatch = Partial<Omit<DisplayPrefs, "toolCalls">> & { toolCalls?: ToolCallPatch };
+  type CustomEventGroupsPatch = Partial<DisplayPrefs["customEventGroups"]>;
+  type DisplayPrefsPatch =
+    Partial<Omit<DisplayPrefs, "toolCalls" | "customEventGroups">> & {
+      toolCalls?: ToolCallPatch;
+      customEventGroups?: CustomEventGroupsPatch;
+    };
+  const customGroups = useCustomEventGroups();
   const patch = useCallback((partial: DisplayPrefsPatch) => {
     setDraft((prev) => ({
       ...prev,
       ...partial,
       toolCalls: { ...prev.toolCalls, ...(partial.toolCalls ?? {}) },
+      customEventGroups: mergeCustomEventGroupPrefs(prev.customEventGroups, partial.customEventGroups),
     }));
   }, []);
   const commit = useCallback(async () => {
@@ -1636,8 +2394,14 @@ function DisplayPrefsSection() {
   useSettingsDraftSource({ id: "display-prefs", page: "general", isDirty, commit, reset });
 
   const resetToDefaults = useCallback(() => {
-    patch(DISPLAY_PRESETS.standard);
-  }, [patch]);
+    // The preset only carries SHIPPED group ids — a user-configured group
+    // absent from it would retain its old value through "reset to defaults".
+    // Build the group arm from the FETCHED definitions so every configured id
+    // resets to its configured default.
+    const groupReset: Record<string, boolean> = {};
+    for (const g of customGroups ?? []) groupReset[g.id] = g.default;
+    patch({ ...DISPLAY_PRESETS.standard, customEventGroups: groupReset });
+  }, [patch, customGroups]);
   const prefs = draft;
 
   return (
@@ -1645,38 +2409,85 @@ function DisplayPrefsSection() {
       <p className="text-xs text-[var(--text-tertiary)] mb-2">
         {t("settings.chatDisplayDescription", undefined, "Hide chat elements you don't need. Per-session overrides live in the chat view's View popover.")}
       </p>
-      <ToggleField label={t("settings.tokenStatsBar", undefined, "Token stats bar")} value={prefs.tokenStatsBar} onChange={(v) => patch({ tokenStatsBar: v })} />
-      <ToggleField label={t("settings.contextUsageBar", undefined, "Context usage bar")} value={prefs.contextUsageBar} onChange={(v) => patch({ contextUsageBar: v })} />
-      <ToggleField label={t("settings.reasoningBlocks", undefined, "Reasoning blocks")} value={prefs.reasoning} onChange={(v) => patch({ reasoning: v })} />
-      <NumberField
-        label={t("settings.reasoningAutoCollapse", undefined, "Reasoning auto-collapse (seconds, 0 = never)")}
-        value={Math.round(prefs.reasoningAutoCollapseMs / 1000)}
-        onChange={(v) => patch({ reasoningAutoCollapseMs: Math.max(0, v) * 1000 })}
-        disabled={!prefs.reasoning}
+      {/* Three visual sub-sections, ONE draft source. Registering three would
+          triple the dirty-chip noise for a single preference blob (D8). */}
+      <h3 className="text-xs font-semibold text-[var(--text-primary)] mt-3 mb-2">{t("settings.chatDisplayMessageElements", undefined, "Message elements")}</h3>
+      <ToggleField label={t("settings.tokenStatsBar", undefined, "Token stats bar")} value={prefs.tokenStatsBar} onChange={(v) => patch({ tokenStatsBar: v })} hint={i18nT("settings.hint.tokenStatsBar", undefined, "Per-turn token counts and cost under each assistant message.")} />
+      <ToggleField label={t("settings.contextUsageBar", undefined, "Context usage bar")} value={prefs.contextUsageBar} onChange={(v) => patch({ contextUsageBar: v })} hint={i18nT("settings.hint.contextUsageBar", undefined, "Bar showing how full the model's context window is. Hide it if you never hit the limit.")} />
+      <ToggleField label={t("settings.turnMetadata", undefined, "Turn metadata separators")} value={prefs.turnMetadata} onChange={(v) => patch({ turnMetadata: v })} hint={i18nT("settings.hint.turnMetadataSeparators", undefined, "Thin rule between turns carrying model, duration, and timestamp.")} />
+      <ToggleField label={t("settings.changeSummaryTable", undefined, "Per-turn change summary")} value={prefs.changeSummaryTable} onChange={(v) => patch({ changeSummaryTable: v })} hint={i18nT("settings.hint.perTurnChangeSummary", undefined, "Table of files added/changed/deleted by each turn.")} />
+      <ToggleField label={t("settings.reserveProcessLineAtIdle", undefined, "Reserve process line at idle")} value={prefs.reserveProcessLineAtIdle} onChange={(v) => patch({ reserveProcessLineAtIdle: v })} hint={i18nT("settings.hint.reserveProcessLine", undefined, "Keep the status line's height reserved while idle so the composer does not jump when a turn starts.")} />
+      {/* A floor, not a switch: `errors` is the strictest stop, so a failing
+          extension can always report. See change: gate-notify-rows-by-level. */}
+      <SelectField
+        label={t("settings.notifyMinLevel", undefined, "Extension notifications")}
+        value={normalizeNotifyMinLevel(prefs.notifyMinLevel)}
+        options={[
+          { value: "all", label: t("settings.notifyMinLevel.all", undefined, "All") },
+          { value: "success", label: t("settings.notifyMinLevel.success", undefined, "Outcomes and problems") },
+          { value: "warnings", label: t("settings.notifyMinLevel.warnings", undefined, "Problems only") },
+          { value: "errors", label: t("settings.notifyMinLevel.errors", undefined, "Failures only") },
+        ]}
+        onChange={(v) => patch({ notifyMinLevel: v as DisplayPrefs["notifyMinLevel"] })}
+        hint={i18nT("settings.hint.notifyMinLevel", undefined, "Minimum level of extension notification shown in chat. Errors are never hidden, and questions that need an answer always appear.")}
       />
+      {/* One toggle per configured custom event group (including the
+          catch-all `other`), in configured order, replacing the removed
+          single "Custom entries in chat" switch. Labels come from the
+          groups file; an id absent from prefs resolves to the group's
+          configured default. See change: add-custom-event-group-filters. */}
+      <div className="text-xs font-semibold text-[var(--text-primary)] mt-3 mb-2">{i18nT("settings.customEventGroups", undefined, "Custom event groups")}</div>
+      {(customGroups ?? []).map((g) => (
+        <ToggleField
+          key={g.id}
+          label={g.label}
+          value={prefs.customEventGroups[g.id] ?? g.default}
+          onChange={(v) => patch({ customEventGroups: { [g.id]: v } })}
+          hint={i18nT("settings.hint.customEventGroups", undefined, "One toggle per group defined in ~/.pi/dashboard/custom-event-groups.json (restart to apply edits to that file). om.* memory telemetry ships hidden.")}
+        />
+      ))}
+      <h3 className="text-xs font-semibold text-[var(--text-primary)] mt-3 mb-2">{t("settings.chatDisplayReasoning", undefined, "Reasoning")}</h3>
+      <ToggleField label={t("settings.reasoningBlocks", undefined, "Reasoning blocks")} value={prefs.reasoning} onChange={(v) => patch({ reasoning: v })} hint={i18nT("settings.hint.reasoningBlocks", undefined, "Show the model's thinking. Off hides it entirely and disables the two settings below.")} />
+      <GatedGroup>
+        <NumberField
+          hint={i18nT("settings.hint.reasoningAutoCollapse", undefined, "Collapse a finished reasoning block after this many seconds. 0 = never collapse.")}
+          label={t("settings.reasoningAutoCollapse", undefined, "Reasoning auto-collapse")}
+          unit="s"
+          value={Math.round(prefs.reasoningAutoCollapseMs / 1000)}
+          onChange={(v) => patch({ reasoningAutoCollapseMs: Math.max(0, v) * 1000 })}
+          disabled={!prefs.reasoning}
+        />
+        <ToggleField
+          hint={i18nT("settings.hint.keepReasoningOpen", undefined, "Ignore auto-collapse while the turn is still running.")}
+          label={t("settings.keepReasoningOpenUntilTurnEnds", undefined, "Keep reasoning open until turn ends")}
+          value={prefs.keepReasoningOpenUntilTurnEnds}
+          onChange={(v) => patch({ keepReasoningOpenUntilTurnEnds: v })}
+          disabled={!prefs.reasoning}
+        />
+        <ToggleField
+          hint={i18nT("settings.hint.reasoningInlineFlow", undefined, "Let reasoning flow down the chat with no height cap instead of scrolling inside its own box. Changes height only — collapse behavior is unchanged.")}
+          label={t("settings.reasoningInlineFlow", undefined, "Inline reasoning flow")}
+          value={prefs.reasoningInlineFlow}
+          onChange={(v) => patch({ reasoningInlineFlow: v })}
+          disabled={!prefs.reasoning}
+        />
+      </GatedGroup>
+      <h3 className="text-xs font-semibold text-[var(--text-primary)] mt-3 mb-2">{t("settings.chatDisplayToolCalls", undefined, "Tool calls")}</h3>
       <ToggleField
-        label={t("settings.keepReasoningOpenUntilTurnEnds", undefined, "Keep reasoning open until turn ends")}
-        value={prefs.keepReasoningOpenUntilTurnEnds}
-        onChange={(v) => patch({ keepReasoningOpenUntilTurnEnds: v })}
-        disabled={!prefs.reasoning}
-      />
-      <ToggleField
+        hint={i18nT("settings.hint.toolGroupsCollapsed", undefined, "Consecutive tool calls open collapsed; click to expand.")}
         label={t("settings.toolGroupDefaultCollapsed", undefined, "Keep tool groups collapsed by default")}
         value={prefs.toolGroupDefaultCollapsed}
         onChange={(v) => patch({ toolGroupDefaultCollapsed: v })}
       />
-      <ToggleField label={t("settings.toolResultBodies", undefined, "Tool result bodies")} value={prefs.toolResults} onChange={(v) => patch({ toolResults: v })} />
-      <ToggleField label={t("settings.turnMetadata", undefined, "Turn metadata separators")} value={prefs.turnMetadata} onChange={(v) => patch({ turnMetadata: v })} />
-      <ToggleField label={t("settings.changeSummaryTable", undefined, "Per-turn change summary")} value={prefs.changeSummaryTable} onChange={(v) => patch({ changeSummaryTable: v })} />
-      <ToggleField label={t("settings.reserveProcessLineAtIdle", undefined, "Reserve process line at idle")} value={prefs.reserveProcessLineAtIdle} onChange={(v) => patch({ reserveProcessLineAtIdle: v })} />
-      <ToggleField label={t("settings.debugEvents", undefined, "Debug events")} value={prefs.debugTools} onChange={(v) => patch({ debugTools: v })} />
+      <ToggleField label={t("settings.toolResultBodies", undefined, "Tool result bodies")} value={prefs.toolResults} onChange={(v) => patch({ toolResults: v })} hint={i18nT("settings.hint.toolResultBodies", undefined, "Show what a tool returned, not just that it ran.")} />
+      <ToggleField label={t("settings.debugEvents", undefined, "Debug events")} value={prefs.debugTools} onChange={(v) => patch({ debugTools: v })} hint={i18nT("settings.hint.debugEvents", undefined, "Raw protocol traffic (flow:list-flows, resources_discover, …). Noisy — for diagnosing the bridge.")} />
       <div className="pt-2">
         <h3 className="text-xs font-semibold text-[var(--text-primary)] mb-2">{t("settings.toolCallsHeader", undefined, "Tool calls - show these types")}</h3>
-        <ToggleField label={t("settings.toolRead", undefined, "Read")} value={prefs.toolCalls.read} onChange={(v) => patch({ toolCalls: { read: v } })} />
-        <ToggleField label={t("settings.toolBash", undefined, "Bash")} value={prefs.toolCalls.bash} onChange={(v) => patch({ toolCalls: { bash: v } })} />
-        <ToggleField label={t("settings.toolEdit", undefined, "Edit / Write")} value={prefs.toolCalls.edit} onChange={(v) => patch({ toolCalls: { edit: v } })} />
-        <ToggleField label={t("settings.toolAgent", undefined, "Agent")} value={prefs.toolCalls.agent} onChange={(v) => patch({ toolCalls: { agent: v } })} />
-        <ToggleField label={t("settings.toolOther", undefined, "Other")} value={prefs.toolCalls.generic} onChange={(v) => patch({ toolCalls: { generic: v } })} />
+        <ToggleField label={t("settings.toolRead", undefined, "Read")} value={prefs.toolCalls.read} onChange={(v) => patch({ toolCalls: { read: v } })} hint={i18nT("settings.hint.toolRead", undefined, "File reads.")} />
+        <ToggleField label={t("settings.toolBash", undefined, "Bash")} value={prefs.toolCalls.bash} onChange={(v) => patch({ toolCalls: { bash: v } })} hint={i18nT("settings.hint.toolBash", undefined, "Shell commands.")} />
+        <ToggleField label={t("settings.toolEdit", undefined, "Edit / Write")} value={prefs.toolCalls.edit} onChange={(v) => patch({ toolCalls: { edit: v } })} hint={i18nT("settings.hint.toolEditWrite", undefined, "File mutations.")} />
+        <ToggleField label={t("settings.toolAgent", undefined, "Agent")} value={prefs.toolCalls.agent} onChange={(v) => patch({ toolCalls: { agent: v } })} hint={i18nT("settings.hint.toolAgent", undefined, "Subagent spawns.")} />
+        <ToggleField label={t("settings.toolOther", undefined, "Other")} value={prefs.toolCalls.generic} onChange={(v) => patch({ toolCalls: { generic: v } })} hint={i18nT("settings.hint.toolOther", undefined, "Every remaining tool, incl. MCP tools.")} />
       </div>
       <div className="pt-2">
         <button
@@ -1786,13 +2597,120 @@ export function shouldShowLegacyHint(legacyTrustedNetworks: string[]): boolean {
   return legacyTrustedNetworks.length > 0;
 }
 
+/**
+ * "These trusted networks cannot reach this dashboard" advisory.
+ *
+ * Fills the silent quadrant: with a loopback or specific-NIC bind, a peer in an
+ * unreachable range is refused at the TCP layer, so no request handler runs, no
+ * block event is recorded, and `BlockEventTrustBanner` stays permanently blank.
+ *
+ * INDEPENDENT of that banner, not mutually exclusive with it — with
+ * `bindHost=10.0.0.5` and a trusted `192.168.1.0/24`, a peer at `10.0.0.9` IS
+ * accepted by the NIC, denied by the guard, and recorded. Both render; this one
+ * goes first, because it explains why block events may be MISSING for the
+ * unreachable range.
+ *
+ * A live region: the condition can arise while the section is already on screen
+ * (the user adds an entry, or a WS push moves `pendingBindHost`), so its
+ * appearance must be announced rather than silently painted.
+ *
+ * See change: warn-unreachable-trusted-networks.
+ */
+function UnreachableTrustedNetworksAdvisory({
+  pendingBindHost,
+  unreachable,
+  bindHostShadowedBy,
+  onListenOnAllInterfaces,
+  onGoToServerPage,
+}: {
+  pendingBindHost: string;
+  unreachable: string[];
+  /**
+   * `"flag"` / `"env"` when `--host` or `PI_DASHBOARD_HOST` decides the bind
+   * host. Both remediations write `config.bindHost`, which those two shadow —
+   * offering them there would hand the user a fix that silently does nothing.
+   */
+  bindHostShadowedBy?: "flag" | "env" | null;
+  onListenOnAllInterfaces?: () => void;
+  onGoToServerPage?: () => void;
+}) {
+  const { t } = useI18n();
+  if (unreachable.length === 0) return null;
+  const shadowed = bindHostShadowedBy === "flag" || bindHostShadowedBy === "env";
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      data-testid="unreachable-trusted-networks-advisory"
+      className="mb-2 rounded border border-[var(--warn-border,#4a3c14)] bg-[var(--warn-bg,#3a2e10)] px-2.5 py-2"
+    >
+      <p className="text-xs text-[var(--warn-body,var(--text-secondary))]">
+        {t(
+          "settings.unreachableTrustedNetworks",
+          { host: pendingBindHost, entries: unreachable.join(", ") },
+          `This dashboard listens on {host}, so devices in {entries} cannot reach it — these entries have no effect.`,
+        )}
+      </p>
+      {shadowed && (
+        <p className="mt-1.5 text-[11px] text-[var(--warn-body,var(--text-secondary))]" data-testid="unreachable-advisory-shadowed">
+          {bindHostShadowedBy === "flag"
+            ? t("settings.bindHostShadowedByFlag", undefined, "The listen interface comes from the --host flag, which overrides this setting. Restart the server with --host 0.0.0.0.")
+            : t("settings.bindHostShadowedByEnv", undefined, "The listen interface comes from PI_DASHBOARD_HOST, which overrides this setting. Set PI_DASHBOARD_HOST=0.0.0.0 and restart.")}
+        </p>
+      )}
+      <div className="mt-1.5 flex flex-wrap items-center gap-2">
+        {!shadowed && onListenOnAllInterfaces && (
+          <button
+            type="button"
+            onClick={onListenOnAllInterfaces}
+            data-testid="unreachable-advisory-listen-all"
+            className="rounded border border-[var(--warn-border,#4a3c14)] px-2 py-0.5 text-[11px] font-semibold text-[var(--warn-fg,#e2b24a)] hover:bg-[var(--warn-bg,#3a2e10)] cursor-pointer"
+          >
+            {t("settings.listenOnAllInterfacesAction", undefined, "Listen on all interfaces (0.0.0.0)")}
+          </button>
+        )}
+        {!shadowed && onGoToServerPage && (
+          <button
+            type="button"
+            onClick={onGoToServerPage}
+            data-testid="unreachable-advisory-server-link"
+            className="text-[11px] underline text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
+          >
+            {t("settings.chooseListenInterfaceOnServer", undefined, "Choose a listen interface on the Server page")}
+          </button>
+        )}
+      </div>
+      <p className="mt-1.5 text-[11px] text-[var(--text-tertiary)]">
+        {t(
+          "settings.bindHostRestartNote",
+          undefined,
+          "Changing the listen interface is a Server setting and takes effect after a restart.",
+        )}
+      </p>
+    </div>
+  );
+}
+
 function TrustedNetworksSection({
   bypassHosts,
   legacyTrustedNetworks,
+  pendingBindHost,
+  unreachable = [],
+  bindHostShadowedBy,
+  onListenOnAllInterfaces,
+  onGoToServerPage,
   onChange,
 }: {
   bypassHosts: string[];
   legacyTrustedNetworks: string[];
+  /** Effective bind host of the NEXT start, draft included. */
+  pendingBindHost?: string;
+  /** Trusted entries that bind host cannot serve. */
+  unreachable?: string[];
+  /** `--host` / `PI_DASHBOARD_HOST` shadowing, when either governs. */
+  bindHostShadowedBy?: "flag" | "env" | null;
+  onListenOnAllInterfaces?: () => void;
+  onGoToServerPage?: () => void;
   onChange: (nets: string[]) => void;
 }) {
   const { t } = useI18n();
@@ -1819,12 +2737,25 @@ function TrustedNetworksSection({
     setLoading(true);
     try {
       const res = await fetch(`${getApiBase()}/api/network-interfaces`);
-      const data = await res.json();
-      if (data.success) setInterfaces(data.data);
-    } catch { /* ignore */ }
+      const data = res.ok ? await res.json() : null;
+      // A failed enumeration degrades the dropdown to empty; the section and
+      // the manual-entry field stay usable (#X5).
+      setInterfaces(data?.success ? data.data : []);
+    } catch { setInterfaces([]); }
     setLoading(false);
     setDropdownOpen(true);
   };
+
+  // One row per OFFER, not per interface. Dedupe lives here rather than in the
+  // endpoint: the listen-interface picker consumes the same payload one option
+  // per ADDRESS, so collapsing server-side would make a real bind address
+  // unselectable (Decision 12). Keyed on the suggestion value, so two tunnels
+  // that both resolve to `100.64.0.0/10` produce one row.
+  const offerRows = React.useMemo(() => dedupeInterfaceOffers(interfaces), [interfaces]);
+  const unofferable = React.useMemo(
+    () => interfaces.filter((i) => i.pointToPoint && (i.suggestions?.length ?? 0) === 0),
+    [interfaces],
+  );
 
   const addNetwork = (entry: string) => {
     const next = addTrustedEntry(bypassHosts, entry);
@@ -1848,6 +2779,17 @@ function TrustedNetworksSection({
       <p className="text-xs text-[var(--text-tertiary)] mb-2">
         {t("settings.trustedNetworksDescription", undefined, "Devices matching these networks or hosts can access the dashboard without authentication. Accepts exact IP, wildcard, or CIDR.")}
       </p>
+
+      {/* Reachability advisory FIRST — it explains why block events may be
+          missing for the unreachable range. The two are independent and may
+          coexist. See change: warn-unreachable-trusted-networks. */}
+      <UnreachableTrustedNetworksAdvisory
+        pendingBindHost={pendingBindHost ?? "127.0.0.1"}
+        unreachable={unreachable}
+        bindHostShadowedBy={bindHostShadowedBy}
+        onListenOnAllInterfaces={onListenOnAllInterfaces}
+        onGoToServerPage={onGoToServerPage}
+      />
 
       {/* Block-event "Trust this network?" banner (task 7.2). */}
       <BlockEventTrustBanner trusted={bypassHosts} onTrust={addNetwork} />
@@ -1879,20 +2821,55 @@ function TrustedNetworksSection({
           >
             {loading ? t("settings.detecting", undefined, "Detecting...") : t("settings.addLocalNetwork", undefined, "+ Add Local Network")}
           </button>
-          {dropdownOpen && interfaces.length > 0 && (
-            <div className="absolute left-0 top-full mt-1 z-50 min-w-[260px] bg-[var(--bg-surface)] border border-[var(--border-primary)] rounded-lg shadow-xl py-1">
-              {interfaces.map((iface) => (
+          {dropdownOpen && (offerRows.length > 0 || unofferable.length > 0) && (
+            <div
+              className="absolute left-0 top-full mt-1 z-50 min-w-[280px] bg-[var(--bg-surface)] border border-[var(--border-primary)] rounded-lg shadow-xl py-1"
+              data-testid="trusted-networks-dropdown"
+            >
+              {offerRows.map((row) => (
                 <button
-                  key={`${iface.name}-${iface.cidr}`}
-                  onClick={() => addNetwork(iface.cidr)}
-                  disabled={bypassHosts.includes(iface.cidr)}
+                  key={row.value}
+                  onClick={() => addNetwork(row.value)}
+                  disabled={bypassHosts.includes(row.value)}
+                  data-testid={`trusted-networks-offer-${row.value}`}
+                  data-wide={row.wide ? "true" : "false"}
+                  title={
+                    row.wide
+                      ? i18nT("settings.trustWholeRangeTitle", { range: row.value }, "Grants unauthenticated access to the whole {range} range")
+                      : undefined
+                  }
                   className={`w-full flex items-center justify-between px-3 py-1.5 text-xs text-left hover:bg-[var(--bg-tertiary)] transition-colors cursor-pointer ${
-                    bypassHosts.includes(iface.cidr) ? "opacity-40" : ""
-                  }`}
+                    bypassHosts.includes(row.value) ? "opacity-40" : ""
+                  } ${row.wide ? "text-[var(--warn-fg,#e2b24a)]" : ""}`}
                 >
-                  <span className="font-mono text-[var(--text-primary)]">{iface.cidr}</span>
-                  <span className="text-[var(--text-tertiary)] ml-2">{iface.name}</span>
+                  <span className={`font-mono ${row.wide ? "text-[var(--warn-fg,#e2b24a)]" : "text-[var(--text-primary)]"}`}>
+                    {row.value}
+                  </span>
+                  <span className="text-[var(--text-tertiary)] ml-2">
+                    {row.label}
+                    {row.wide ? ` · ${i18nT("settings.wideRange", undefined, "whole range")}` : ""}
+                  </span>
                 </button>
+              ))}
+              {/* A /32 in no recognised range is SHOWN, not omitted: the user has
+                  the device and legitimately wants it trusted, so the absence of
+                  an offer has to be legible rather than a silent hole.
+                  See change: warn-unreachable-trusted-networks. */}
+              {unofferable.map((iface) => (
+                <div
+                  key={`unofferable-${iface.address}`}
+                  data-testid={`trusted-networks-unofferable-${iface.name}`}
+                  className="w-full px-3 py-1.5 text-xs text-left opacity-60"
+                >
+                  <span className="text-[var(--text-tertiary)]">{iface.label ?? iface.name}</span>
+                  <span className="block text-[10px] text-[var(--text-tertiary)]">
+                    {i18nT(
+                      "settings.noTrustRangeForInterface",
+                      { address: iface.address },
+                      "No range can be derived for {address} — add an entry manually below.",
+                    )}
+                  </span>
+                </div>
               ))}
             </div>
           )}
@@ -1946,7 +2923,7 @@ function ServersTab() {
     } catch { /* ignore */ }
   }, []);
 
-  useEffect(() => { reload(); }, [reload, loadCount]);
+  useEffect(() => { void reload().catch(logRejection("SettingsPanel.knownServers.reload")); }, [reload, loadCount]);
 
   return (
     <>
@@ -2076,41 +3053,121 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-function NumberField({ label, value, onChange, disabled }: { label: string; value: number; onChange: (v: number) => void; disabled?: boolean }) {
+// ─── Shared settings field contract ──────────────────────────────────────────
+//
+// The four field components below all owe their control an accessible NAME (a
+// label associated via htmlFor/id) and an accessible DESCRIPTION (the `hint`,
+// referenced via aria-describedby). `hint` is REQUIRED so that adding a field
+// without deciding about its description is a type error rather than a silent
+// omission — the compiler is the gate, so there is no allowlist to drift.
+// `hint={null}` is the explicit, greppable "nothing useful to add here".
+// `unit` renders inside the <label> so it forms part of the accessible name.
+// See change: reorganize-settings-pages-and-descriptions (design D1/D4/D5).
+
+type FieldContract = {
+  /** Accessible description. Required: pass `null` to state there is none. */
+  hint: React.ReactNode;
+  /** Short unit rendered as a chip inside the label (e.g. "ms", "s"). */
+  unit?: string;
+};
+
+/** True when a hint should render and be referenced by aria-describedby. */
+function hasHint(hint: React.ReactNode): boolean {
+  return hint !== null && hint !== undefined;
+}
+
+/**
+ * Indents controls beneath the control that gates them, so the dependency is
+ * visible instead of being implied by a `disabled` prop or a conditional
+ * render. Presentational only — it changes no gating logic (design D9).
+ */
+function GatedGroup({ children }: { children: React.ReactNode }) {
   return (
-    <div className={`flex items-center justify-between ${disabled ? "opacity-50" : ""}`}>
-      <label className="text-sm text-[var(--text-secondary)]">{label}</label>
+    <div data-testid="gated-group" className="ml-3 pl-3 border-l border-[var(--border-secondary)] space-y-2">
+      {children}
+    </div>
+  );
+}
+
+function FieldShell({ label, unit, hint, controlId, hintId, disabled, stacked, children }: FieldContract & {
+  label: string;
+  controlId: string;
+  hintId: string;
+  disabled?: boolean;
+  /** Label above the control (TextField) instead of on the same row. */
+  stacked?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className={disabled ? "opacity-50" : ""}>
+      <div className={stacked ? "" : "flex items-center justify-between"}>
+        <label
+          htmlFor={controlId}
+          className={stacked ? "block text-xs text-[var(--text-tertiary)] mb-0.5" : "text-sm text-[var(--text-secondary)]"}
+        >
+          {label}
+          {unit ? (
+            <span className="ml-1.5 px-1 py-0.5 rounded text-[10px] align-middle bg-[var(--bg-tertiary)] text-[var(--text-tertiary)]">{unit}</span>
+          ) : null}
+        </label>
+        {children}
+      </div>
+      {hasHint(hint) ? <p id={hintId} className="mt-1 text-xs text-[var(--text-tertiary)]">{hint}</p> : null}
+    </div>
+  );
+}
+
+export function NumberField({ label, value, onChange, disabled, hint, unit }: FieldContract & { label: string; value: number; onChange: (v: number) => void; disabled?: boolean }) {
+  const controlId = useId();
+  const hintId = `${controlId}-hint`;
+  return (
+    <FieldShell label={label} unit={unit} hint={hint} controlId={controlId} hintId={hintId} disabled={disabled}>
       <input
+        id={controlId}
+        aria-describedby={hasHint(hint) ? hintId : undefined}
         type="number"
         disabled={disabled}
         className="w-24 bg-[var(--bg-secondary)] border border-[var(--border-secondary)] rounded px-2 py-1 text-sm text-[var(--text-primary)] text-right disabled:cursor-not-allowed"
         value={value}
         onChange={(e) => onChange(parseInt(e.target.value, 10) || 0)}
       />
-    </div>
+    </FieldShell>
   );
 }
 
-function ToggleField({ label, value, onChange, disabled }: { label: string; value: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+export function ToggleField({ label, value, onChange, disabled, hint, unit }: FieldContract & { label: string; value: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+  const controlId = useId();
+  const hintId = `${controlId}-hint`;
   return (
-    <div className={`flex items-center justify-between ${disabled ? "opacity-50" : ""}`}>
-      <label className="text-sm text-[var(--text-secondary)]">{label}</label>
+    <FieldShell label={label} unit={unit} hint={hint} controlId={controlId} hintId={hintId} disabled={disabled}>
+      {/* role="switch" + aria-checked expose the ON/OFF STATE. Without them a
+          screen-reader user hears the name and description this change added
+          but cannot tell whether the setting is on — half an a11y fix.
+          type="button" keeps it from submitting an enclosing form. */}
       <button
+        id={controlId}
+        type="button"
+        role="switch"
+        aria-checked={value}
+        aria-describedby={hasHint(hint) ? hintId : undefined}
         disabled={disabled}
         onClick={() => onChange(!value)}
         className={`relative w-10 h-5 rounded-full transition-colors disabled:cursor-not-allowed ${value ? "bg-blue-600" : "bg-[var(--bg-tertiary)]"}`}
       >
         <span className={`absolute left-0.5 top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${value ? "translate-x-5" : "translate-x-0"}`} />
       </button>
-    </div>
+    </FieldShell>
   );
 }
 
-function SelectField({ label, value, options, onChange, disabled }: { label: string; value: string; options: { value: string; label: string }[]; onChange: (v: string) => void; disabled?: boolean }) {
+export function SelectField({ label, value, options, onChange, disabled, hint, unit }: FieldContract & { label: string; value: string; options: { value: string; label: string }[]; onChange: (v: string) => void; disabled?: boolean }) {
+  const controlId = useId();
+  const hintId = `${controlId}-hint`;
   return (
-    <div className={`flex items-center justify-between ${disabled ? "opacity-50" : ""}`}>
-      <label className="text-sm text-[var(--text-secondary)]">{label}</label>
+    <FieldShell label={label} unit={unit} hint={hint} controlId={controlId} hintId={hintId} disabled={disabled}>
       <select
+        id={controlId}
+        aria-describedby={hasHint(hint) ? hintId : undefined}
         disabled={disabled}
         className="bg-[var(--bg-secondary)] border border-[var(--border-secondary)] rounded px-2 py-1 text-sm text-[var(--text-primary)] disabled:cursor-not-allowed"
         value={value}
@@ -2118,7 +3175,7 @@ function SelectField({ label, value, options, onChange, disabled }: { label: str
       >
         {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
       </select>
-    </div>
+    </FieldShell>
   );
 }
 
@@ -2152,11 +3209,13 @@ function ProviderSection({ providerKey, provider, onChange }: {
       {enabled && (
         <div className="space-y-2">
           <TextField
+            hint={null}
             label={i18nT("gateway.clientId", undefined, "Client ID")}
             value={provider!.clientId}
             onChange={(v) => onChange({ ...provider!, clientId: v })}
           />
           <TextField
+            hint={null}
             label={i18nT("gateway.clientSecret", undefined, "Client Secret")}
             value={provider!.clientSecret}
             onChange={(v) => onChange({ ...provider!, clientSecret: v })}
@@ -2164,6 +3223,7 @@ function ProviderSection({ providerKey, provider, onChange }: {
           />
           {needsIssuer && (
             <TextField
+              hint={null}
               label={i18nT("gateway.issuerUrl", undefined, "Issuer URL")}
               value={provider!.issuerUrl || ""}
               onChange={(v) => onChange({ ...provider!, issuerUrl: v })}
@@ -2176,20 +3236,23 @@ function ProviderSection({ providerKey, provider, onChange }: {
   );
 }
 
-function TextField({ label, value, onChange, type = "text", placeholder }: {
+export function TextField({ label, value, onChange, type = "text", placeholder, hint, unit }: FieldContract & {
   label: string; value: string; onChange: (v: string) => void; type?: string; placeholder?: string;
 }) {
+  const controlId = useId();
+  const hintId = `${controlId}-hint`;
   return (
-    <div>
-      <label className="block text-xs text-[var(--text-tertiary)] mb-0.5">{label}</label>
+    <FieldShell label={label} unit={unit} hint={hint} controlId={controlId} hintId={hintId} stacked>
       <input
+        id={controlId}
+        aria-describedby={hasHint(hint) ? hintId : undefined}
         type={type}
         className="w-full bg-[var(--bg-secondary)] border border-[var(--border-secondary)] rounded px-2 py-1 text-sm text-[var(--text-primary)]"
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
       />
-    </div>
+    </FieldShell>
   );
 }
 
@@ -2270,13 +3333,22 @@ type TestState =
   | { kind: "ok"; modelCount: number; sample: string[] }
   | { kind: "err"; status?: number; message: string };
 
-export function LlmProviderCard({ provider, onChange, onRemove }: {
+export function LlmProviderCard({ provider, health, onChange, onRemove }: {
   provider: LlmProvider;
+  health?: ProviderHealth;
   onChange: (p: LlmProvider) => void;
   onRemove: () => void;
 }) {
   const { t } = useI18n();
   const [testState, setTestState] = useState<TestState>({ kind: "idle" });
+
+  // Reset the live Test result when the provider's config changes from OUTSIDE
+  // this card (e.g. Discard restoring saved values). derivePillView prioritizes
+  // testState, so a stale failed-Test would otherwise mask the restored cached
+  // health. See change: surface-provider-health-in-settings.
+  useEffect(() => {
+    setTestState({ kind: "idle" });
+  }, [provider.baseUrl, provider.apiKey, provider.api]);
 
   const handleChange = (update: LlmProvider) => {
     // Any change to baseUrl / apiKey / api clears a stale test result.
@@ -2307,8 +3379,10 @@ export function LlmProviderCard({ provider, onChange, onRemove }: {
     if (result.ok) {
       setTestState({ kind: "ok", modelCount: result.modelCount, sample: result.sample ?? [] });
     } else {
-      const firstLine = (result.error ?? "Test failed").split("\n")[0].trim();
-      setTestState({ kind: "err", status: result.status, message: firstLine || "Test failed" });
+      // Keep the verbatim error for the monospace error line; the pill itself
+      // shows only the status code / Unreachable. See change:
+      // surface-provider-health-in-settings.
+      setTestState({ kind: "err", status: result.status, message: result.error ?? "Test failed" });
     }
   };
 
@@ -2362,12 +3436,14 @@ export function LlmProviderCard({ provider, onChange, onRemove }: {
       </div>
       <div className="space-y-2">
         <TextField
+          hint={null}
           label={i18nT("providers.baseUrl", undefined, "Base URL")}
           value={provider.baseUrl}
           onChange={(v) => handleChange({ ...provider, baseUrl: v })}
           placeholder="https://api.example.com/v1"
         />
         <TextField
+          hint={null}
           label={i18nT("gateway.apiKey", undefined, "API Key")}
           value={provider.apiKey}
           onChange={(v) => handleChange({ ...provider, apiKey: v })}
@@ -2386,55 +3462,94 @@ export function LlmProviderCard({ provider, onChange, onRemove }: {
             ))}
           </select>
         </div>
-        {testState.kind !== "idle" && <TestPill state={testState} />}
+        <HealthPill state={testState} health={health} />
       </div>
     </div>
   );
 }
 
-function TestPill({ state }: { state: TestState }) {
+// Normalized pill view derived from either a live Test result (`state`) or the
+// server-cached health. Four registers per the spec: connected / error (HTTP
+// status) / unreachable (no status) / not-tested.
+type PillView =
+  | { kind: "testing" }
+  | { kind: "ok"; modelCount: number; sample: string[] }
+  | { kind: "error"; status: number; error: string }
+  | { kind: "unreachable"; error: string }
+  | { kind: "not-tested" };
+
+function derivePillView(state: TestState, health?: ProviderHealth): PillView {
+  if (state.kind === "testing") return { kind: "testing" };
+  if (state.kind === "ok") return { kind: "ok", modelCount: state.modelCount, sample: state.sample };
+  if (state.kind === "err") {
+    return state.status !== undefined
+      ? { kind: "error", status: state.status, error: state.message }
+      : { kind: "unreachable", error: state.message };
+  }
+  // idle — fall back to the server-cached health.
+  if (!health) return { kind: "not-tested" };
+  if (health.ok) return { kind: "ok", modelCount: health.modelCount ?? 0, sample: [] };
+  return health.status !== undefined
+    ? { kind: "error", status: health.status, error: health.error ?? "" }
+    : { kind: "unreachable", error: health.error ?? "" };
+}
+
+function HealthPill({ state, health }: { state: TestState; health?: ProviderHealth }) {
   const { t } = useI18n();
-  if (state.kind === "testing") {
+  const view = derivePillView(state, health);
+
+  if (view.kind === "testing") {
     return (
-      <div
-        className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]"
-        data-testid="test-pill"
-        data-state="testing"
-      >
+      <div className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]" data-testid="test-pill" data-state="testing">
         <Icon path={mdiLoading} size={0.45} className="animate-spin" />
         {t("common.testing", undefined, "Testing...")}
       </div>
     );
   }
-  if (state.kind === "ok") {
-    const label = state.modelCount > 0
-      ? t("settings.connectedModels", { count: state.modelCount }, `Connected · ${state.modelCount} models`)
+
+  if (view.kind === "ok") {
+    const label = view.modelCount > 0
+      ? t("settings.connectedModels", { count: view.modelCount }, `Connected · ${view.modelCount} models`)
       : t("settings.connectedOnly", undefined, "Connected");
     return (
       <div
         className="flex items-center gap-1.5 text-xs text-green-400"
         data-testid="test-pill"
         data-state="ok"
-        title={state.sample.length > 0 ? i18nT("settings.sampleModels", { list: state.sample.join(", ") }, "Sample: {list}") : undefined}
+        title={view.sample.length > 0 ? i18nT("settings.sampleModels", { list: view.sample.join(", ") }, "Sample: {list}") : undefined}
       >
         <Icon path={mdiCheckCircle} size={0.5} />
         {label}
       </div>
     );
   }
-  if (state.kind === "err") {
-    const prefix = state.status ? `${state.status} — ` : "";
+
+  if (view.kind === "not-tested") {
     return (
-      <div
-        className="flex items-center gap-1.5 text-xs text-red-400"
-        data-testid="test-pill"
-        data-state="err"
-      >
-        <Icon path={mdiCloseCircle} size={0.5} />
-        <span className="truncate" title={`${prefix}${state.message}`}>{prefix}{state.message}</span>
+      <div className="flex items-center gap-1.5 text-xs text-[var(--text-tertiary)]" data-testid="test-pill" data-state="not-tested">
+        {t("settings.providerNotTested", undefined, "Not tested")}
       </div>
     );
   }
-  // idle — parent guards against rendering, but keep a safe default.
-  return null;
+
+  // error (yellow, HTTP status) or unreachable (red, no status) — both carry a
+  // verbatim error line beneath the pill.
+  const isError = view.kind === "error";
+  return (
+    <>
+      <div
+        className={`flex items-center gap-1.5 text-xs ${isError ? "text-yellow-400" : "text-red-400"}`}
+        data-testid="test-pill"
+        data-state={view.kind}
+      >
+        <Icon path={isError ? mdiAlert : mdiCloseCircle} size={0.5} />
+        {isError ? String(view.status) : t("settings.providerUnreachable", undefined, "Unreachable")}
+      </div>
+      {view.error && (
+        <div className="font-mono text-[11px] text-[var(--text-tertiary)] break-all whitespace-pre-wrap" data-testid="provider-error-line">
+          {view.error}
+        </div>
+      )}
+    </>
+  );
 }

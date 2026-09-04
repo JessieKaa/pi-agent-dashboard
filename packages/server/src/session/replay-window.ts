@@ -40,7 +40,9 @@ export function selectReplayWindow(
   stored: readonly StoredEvent[],
   requestedMessages: number,
 ): ReplayWindowSelection {
-  const requested = Math.max(1, Math.floor(requestedMessages));
+  const requested = Number.isFinite(requestedMessages)
+    ? Math.max(1, Math.floor(requestedMessages))
+    : 1;
   if (stored.length === 0) {
     return {
       events: [],

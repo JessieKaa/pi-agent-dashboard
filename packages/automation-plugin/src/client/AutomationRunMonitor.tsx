@@ -1,5 +1,11 @@
 /**
- * Run monitor (shell-overlay-route `/automation/run/:sid`). Resolves the run
+ * Run monitor (shell-overlay-route `/folder/:encodedCwd/automations/run/:sid`).
+ * The route carries the board's `:encodedCwd` so a cold-load back resolves to
+ * the owning board instead of degrading to the card list — the old
+ * `/automation/run/:sid` shape declared a `parentPath` it could never
+ * interpolate. See change: add-route-backed-overlay-dialogs.
+ *
+ * Resolves the run
  * session by id (slot `sessionParam`) and shows it live: while running it
  * surfaces the run header + status and lets the user open the standard chat
  * (the run is a real session — its live tool calls + messages render via the
@@ -39,9 +45,16 @@ export function AutomationRunMonitor({
   useEffect(() => {
     let cancelled = false;
     if (!ended || !run?.runId) return;
-    getRunResult("folder", session?.cwd, run.runId).then((r) => {
-      if (!cancelled) setResult(r);
-    });
+    // Discard with a stated handler — a failed result fetch leaves the panel in
+    // its loading state, so the reason must be observable.
+    // See change: cleanup-client-plugin-promises.
+    void getRunResult("folder", session?.cwd, run.runId)
+      .then((r) => {
+        if (!cancelled) setResult(r);
+      })
+      .catch((err: unknown) => {
+        console.error("[automation-plugin] failed to load automation run result:", err);
+      });
     return () => {
       cancelled = true;
     };

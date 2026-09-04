@@ -2,7 +2,7 @@ import type { OpenSpecArtifact, OpenSpecChange } from "@blackbelt-technology/pi-
 import React from "react";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
 
-export const LETTER_MAP: Record<string, string> = {
+const LETTER_MAP: Record<string, string> = {
   proposal: "P",
   design: "D",
   specs: "S",
@@ -73,5 +73,7 @@ export function ArtifactLettersButton({
 }
 
 export function allArtifactsDone(artifacts: OpenSpecChange["artifacts"]): boolean {
-  return artifacts.length > 0 && artifacts.every((a) => a.status === "done");
+  // `skipped` (skip_specs change) satisfies — mirrors the CLI's isPlanningComplete.
+  // See change: dispatch-provider-auth-event.
+  return artifacts.length > 0 && artifacts.every((a) => a.status === "done" || a.status === "skipped");
 }

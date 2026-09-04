@@ -1,8 +1,8 @@
 import type { ServerToBrowserMessage } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
 import type { DashboardEvent } from "@blackbelt-technology/pi-dashboard-shared/types.js";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BrowserHandlerContext } from "../browser-handlers/handler-context.js";
-import { handleSubscribe, replaySessionAssets } from "../browser-handlers/subscription-handler.js";
+import { handleSubscribe, replaySessionAssets, sendEventBatches } from "../browser-handlers/subscription-handler.js";
 import { createMemoryEventStore } from "../persistence/memory-event-store.js";
 import { createMemorySessionManager } from "../session/memory-session-manager.js";
 
@@ -23,6 +23,7 @@ function createMockContext(overrides: Partial<BrowserHandlerContext> = {}): Brow
     getSubscribers: () => [],
     trackUiRequest: vi.fn(),
     replayPendingUiRequests: vi.fn(),
+    replayNotifyLog: vi.fn(),
     markReplaying: vi.fn(),
     clearReplaying: vi.fn(),
     ...overrides,
@@ -71,9 +72,25 @@ describe("handleSubscribe — stale lastSeq detection", () => {
     expect(allEvents[1].seq).toBe(5);
   });
 
-  it("sends session_state_reset and full replay when lastSeq > server maxSeq", async () => {
+  /**
+   * The stale-`lastSeq` path no longer emits a call-site `session_state_reset`;
+   * D3 moved the reset into `sendEventBatches`, keyed on `replayWindow !== null`.
+   *
+   * The two arms below are split deliberately, because they fail differently
+   * and only together prove the guarantee survived the move:
+   *   - UNWINDOWED — no reset frame, and none is required. The replay starts at
+   *     seq 1 and the reducer's `firstSeq === 1` rule wipes transcript state.
+   *     Asserting `allEvents[0].seq === 1` is what makes the absence SAFE
+   *     rather than merely tolerated, so it is not a weakened assertion.
+   *   - WINDOWED — exactly one reset, ordered BEFORE `history_window`. This is
+   *     the arm that pins the guarantee D3 relocated; without it, deleting the
+   *     call-site guard would have left the reset untested on this path.
+   * See change: add-tail-only-replay-window (D3, task 2.11).
+   */
+  it("replays the full stream from seq 1 when lastSeq > server maxSeq, with NO reset frame when unwindowed", async () => {
     const ctx = createMockContext();
-    // Insert 3 events (maxSeq = 3)
+    // Insert 3 events (maxSeq = 3). Far below MIN_REPLAY_WINDOW, so no window
+    // can form and `sendEventBatches` has nothing to announce.
     for (let i = 0; i < 3; i++) ctx.eventStore.insertEvent("s1", makeEvent(`e${i}`));
 
     const subs = new Set<string>();
@@ -83,15 +100,43 @@ describe("handleSubscribe — stale lastSeq detection", () => {
     await new Promise((r) => setTimeout(r, 50));
 
     const calls = (ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>;
-    // Should have sent session_state_reset first
     const resets = calls.filter(([, msg]) => msg.type === "session_state_reset");
-    expect(resets).toHaveLength(1);
+    expect(resets).toHaveLength(0);
+    // No window applied, so no gap is disclosed either.
+    expect(calls.filter(([, msg]) => msg.type === "history_window")).toHaveLength(0);
 
-    // Should have replayed ALL events from seq 1
+    // Should have replayed ALL events from seq 1 — the property that makes the
+    // missing reset harmless, via the reducer's `firstSeq === 1` rule.
     const replays = calls.filter(([, msg]) => msg.type === "event_replay");
     const allEvents = replays.flatMap(([, msg]: any) => msg.events);
     expect(allEvents).toHaveLength(3);
     expect(allEvents[0].seq).toBe(1);
+  });
+
+  it("emits exactly one session_state_reset, before history_window, when the stale-lastSeq replay IS windowed", async () => {
+    // 300 events against a 100 budget: a window necessarily applies.
+    const ctx = createMockContext({ maxReplayEvents: 100 });
+    for (let i = 0; i < 300; i++) ctx.eventStore.insertEvent("s1", makeEvent(`e${i}`));
+
+    const subs = new Set<string>();
+    handleSubscribe({ type: "subscribe", sessionId: "s1", lastSeq: 9_999 }, subs, ctx);
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    const calls = (ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>;
+    const types = calls.map(([, msg]) => msg.type);
+
+    // Exactly one — the pre-D3 code emitted two here (call-site + callee).
+    expect(types.filter((t) => t === "session_state_reset")).toHaveLength(1);
+
+    // Ordering is the contract: the gap must never be announced ahead of the
+    // state wipe that precedes its transcript.
+    const resetAt = types.indexOf("session_state_reset");
+    const windowAt = types.indexOf("history_window");
+    expect(windowAt).toBeGreaterThan(-1);
+    expect(resetAt).toBeLessThan(windowAt);
+    // ...and both precede any replayed events.
+    expect(windowAt).toBeLessThan(types.indexOf("event_replay"));
   });
 
   it("marks replaying during delta replay and clears after", async () => {
@@ -367,7 +412,7 @@ describe("handleSubscribe — stale lastSeq detection", () => {
     });
   });
 
-  it("compacts completed message paint while preserving replay cursor and 50-event batches", async () => {
+  it("compacts completed message paint while preserving replay cursor and 200-event batches", async () => {
     const clearReplaying = vi.fn();
     const ctx = createMockContext({ clearReplaying });
     const completedMessage = { role: "assistant", timestamp: 100, content: [{ type: "text", text: "final" }] };
@@ -382,28 +427,28 @@ describe("handleSubscribe — stale lastSeq detection", () => {
       timestamp: 2,
       data: { message: completedMessage, assistantMessageEvent: { type: "toolcall_delta", delta: "y" } },
     });
-    for (let i = 0; i < 50; i++) ctx.eventStore.insertEvent("s1", makeEvent(`keep-${i}`));
+    for (let i = 0; i < 200; i++) ctx.eventStore.insertEvent("s1", makeEvent(`keep-${i}`));
     ctx.eventStore.insertEvent("s1", {
       eventType: "message_end",
-      timestamp: 53,
+      timestamp: 203,
       data: { message: completedMessage },
     });
 
     handleSubscribe({ type: "subscribe", sessionId: "s1", lastSeq: 0 }, new Set(), ctx);
     await vi.waitFor(() => {
-      expect(clearReplaying).toHaveBeenCalledWith(ctx.ws, "s1", 53);
+      expect(clearReplaying).toHaveBeenCalledWith(ctx.ws, "s1", 203);
     });
 
     const replays = ((ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>)
       .map(([, msg]) => msg)
       .filter((msg): msg is Extract<ServerToBrowserMessage, { type: "event_replay" }> => msg.type === "event_replay");
     expect(replays).toHaveLength(2);
-    expect(replays.map((msg) => msg.events.length)).toEqual([50, 1]);
+    expect(replays.map((msg) => msg.events.length)).toEqual([200, 1]);
     expect(replays.map((msg) => msg.isLast)).toEqual([false, true]);
 
     const seqs = replays.flatMap((msg) => msg.events.map((event) => event.seq));
-    expect(seqs).toEqual([...Array.from({ length: 50 }, (_, i) => i + 3), 53]);
-    expect(clearReplaying).toHaveBeenCalledWith(ctx.ws, "s1", 53);
+    expect(seqs).toEqual([...Array.from({ length: 200 }, (_, i) => i + 3), 203]);
+    expect(clearReplaying).toHaveBeenCalledWith(ctx.ws, "s1", 203);
   });
 });
 
@@ -724,6 +769,100 @@ describe("handleSubscribe — cold-hydration heartbeat", () => {
   });
 });
 
+// See change: cleanup-async-semantics-server-extension (test-plan #X1, #X2, #X3)
+//
+// Each of the three `sendEventBatches(...).then(...).catch(onReplayFailed)`
+// replay sites must OWN a rejection: `onReplayFailed` clears the replaying
+// flag with lastReplayedSeq 0 (so the socket is not left permanently muted by
+// `markReplaying`), logs the failure, and no unhandled rejection escapes.
+describe("handleSubscribe — replay rejection is owned (onReplayFailed)", () => {
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+  let unhandled: unknown[];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+
+  beforeEach(() => {
+    errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    unhandled = [];
+    process.on("unhandledRejection", onUnhandled);
+  });
+  afterEach(() => {
+    process.off("unhandledRejection", onUnhandled);
+    errorSpy.mockRestore();
+  });
+
+  async function flush() {
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+  }
+
+  function loggedReplayFailure(): boolean {
+    return errorSpy.mock.calls.some(
+      (c: unknown[]) => typeof c[0] === "string" && c[0].includes("[replay] event replay failed"),
+    );
+  }
+
+  it("X1 stale-lastSeq full replay: a rejected send clears replaying (seq 0) and is logged, no unhandled rejection", async () => {
+    const markReplaying = vi.fn();
+    const clearReplaying = vi.fn();
+    // Make the batch send throw so `sendEventBatches` rejects at the site.
+    const sendTo = vi.fn((_ws: unknown, msg: ServerToBrowserMessage) => {
+      if (msg.type === "event_replay") throw new Error("send failed");
+    });
+    const ctx = createMockContext({ markReplaying, clearReplaying, sendTo });
+    for (let i = 0; i < 3; i++) ctx.eventStore.insertEvent("s1", makeEvent());
+
+    handleSubscribe({ type: "subscribe", sessionId: "s1", lastSeq: 100 }, new Set(), ctx);
+    await flush();
+
+    expect(markReplaying).toHaveBeenCalledWith(ctx.ws, "s1");
+    // onReplayFailed clears the flag with lastReplayedSeq 0 (no catch-up claimable).
+    expect(clearReplaying).toHaveBeenCalledTimes(1);
+    expect(clearReplaying).toHaveBeenCalledWith(ctx.ws, "s1", 0);
+    expect(loggedReplayFailure()).toBe(true);
+    expect(unhandled).toEqual([]);
+  });
+
+  it("X2 warm delta replay: a rejected send clears replaying (seq 0) and is logged, no unhandled rejection", async () => {
+    const markReplaying = vi.fn();
+    const clearReplaying = vi.fn();
+    const sendTo = vi.fn((_ws: unknown, msg: ServerToBrowserMessage) => {
+      if (msg.type === "event_replay") throw new Error("send failed");
+    });
+    const ctx = createMockContext({ markReplaying, clearReplaying, sendTo });
+    for (let i = 0; i < 5; i++) ctx.eventStore.insertEvent("s1", makeEvent());
+
+    // lastSeq 3 within range → delta (events 4,5) → the `events.length > 0` branch.
+    handleSubscribe({ type: "subscribe", sessionId: "s1", lastSeq: 3 }, new Set(), ctx);
+    await flush();
+
+    expect(markReplaying).toHaveBeenCalledWith(ctx.ws, "s1");
+    expect(clearReplaying).toHaveBeenCalledTimes(1);
+    expect(clearReplaying).toHaveBeenCalledWith(ctx.ws, "s1", 0);
+    expect(loggedReplayFailure()).toBe(true);
+    expect(unhandled).toEqual([]);
+  });
+
+  it("X3 empty-delta replay: a rejected post-replay step is owned and logged, no unhandled rejection", async () => {
+    const clearReplaying = vi.fn();
+    // Empty delta → `sendEventBatches([])` resolves; the reject is injected in
+    // the chained `.then` step so the empty-branch `.catch(onReplayFailed)` runs.
+    const replayPendingUiRequests = vi.fn(() => {
+      throw new Error("post-replay step failed");
+    });
+    const ctx = createMockContext({ clearReplaying, replayPendingUiRequests });
+    for (let i = 0; i < 5; i++) ctx.eventStore.insertEvent("s1", makeEvent());
+
+    // lastSeq 5 === maxSeq → delta getEvents(6) is empty → the empty branch.
+    handleSubscribe({ type: "subscribe", sessionId: "s1", lastSeq: 5 }, new Set(), ctx);
+    await flush();
+
+    // The empty branch does not markReplaying, but onReplayFailed still clears
+    // defensively with seq 0.
+    expect(clearReplaying).toHaveBeenCalledWith(ctx.ws, "s1", 0);
+    expect(loggedReplayFailure()).toBe(true);
+    expect(unhandled).toEqual([]);
+  });
+});
+
 describe("handleSubscribe — asset replay precedes events", () => {
   it("sends asset_register messages before event_replay batches", async () => {
     const ctx = createMockContext();
@@ -743,5 +882,95 @@ describe("handleSubscribe — asset replay precedes events", () => {
     expect(firstAssetIdx).toBeGreaterThanOrEqual(0);
     expect(firstEventIdx).toBeGreaterThanOrEqual(0);
     expect(firstAssetIdx).toBeLessThan(firstEventIdx);
+  });
+});
+
+// See change: show-replay-in-flight-indicator (test-plan #E5, #E6, #E7, #E8, #E9)
+//
+// R2: EVERY replay must terminate with exactly one `isLast: true` frame — an
+// empty payload included, so the client's in-flight flag always has a clearing
+// edge. E7/E9 are the falsification rows for Decision 6: a naive "always append
+// a terminal batch" implementation double-terminates on an exact batch multiple.
+describe("sendEventBatches — every replay terminates exactly once", () => {
+  const REPLAY_BATCH_SIZE = 200;
+  const openWs = () => ({ readyState: 1, OPEN: 1, bufferedAmount: 0 }) as any;
+
+  // Non-compactable events so batch maths is not confounded by compaction.
+  function window(n: number): Array<{ seq: number; event: DashboardEvent }> {
+    return Array.from({ length: n }, (_, i) => ({ seq: i + 1, event: makeEvent("turn_start") }));
+  }
+
+  async function sendAll(n: number) {
+    const sent: ServerToBrowserMessage[] = [];
+    await sendEventBatches(openWs(), "s1", window(n), (_w, m) => sent.push(m));
+    return sent.filter((m): m is Extract<ServerToBrowserMessage, { type: "event_replay" }> => m.type === "event_replay");
+  }
+
+  async function flush() {
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+  }
+
+  const replayFrames = (ctx: BrowserHandlerContext) =>
+    ((ctx.sendTo as any).mock.calls as Array<[any, ServerToBrowserMessage]>)
+      .map(([, m]) => m)
+      .filter((m): m is Extract<ServerToBrowserMessage, { type: "event_replay" }> => m.type === "event_replay");
+
+  it("E5 warm subscribe with an empty delta sends exactly one terminal frame", async () => {
+    const ctx = createMockContext();
+    for (let i = 0; i < 5; i++) ctx.eventStore.insertEvent("s1", makeEvent());
+
+    // lastSeq === maxSeq → delta is [] → the empty branch.
+    handleSubscribe({ type: "subscribe", sessionId: "s1", lastSeq: 5 }, new Set(), ctx);
+    await flush();
+
+    const frames = replayFrames(ctx);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].events).toEqual([]);
+    expect(frames[0].isLast).toBe(true);
+  });
+
+  it("E6 cold subscribe for a session with zero events terminates on the success path", async () => {
+    const loadSessionEvents = vi.fn(async () => ({ success: true, events: [] }));
+    const ctx = createMockContext({ directoryService: { loadSessionEvents } as any });
+    ctx.getSubscribers = () => [ctx.ws];
+    ctx.sessionManager.restore({
+      id: "s-cold", cwd: "/test", source: "tui", status: "ended",
+      startedAt: 1000, endedAt: 2000, tokensIn: 0, tokensOut: 0, cost: 0,
+      contextWindow: 200000, sessionFile: "/sessions/s-cold.jsonl",
+      sessionDir: "/sessions", hidden: false,
+    } as any);
+
+    handleSubscribe({ type: "subscribe", sessionId: "s-cold" }, new Set(), ctx);
+    await flush();
+
+    const frames = replayFrames(ctx);
+    // The pre-parse start marker (isLast:false) plus exactly one terminal frame.
+    expect(frames.filter((f) => f.isLast === true)).toHaveLength(1);
+    expect(frames.filter((f) => f.isLast === false)).toHaveLength(1);
+    const terminal = frames.find((f) => f.isLast === true);
+    expect(terminal?.events).toEqual([]);
+  });
+
+  it("E7 a payload of exactly REPLAY_BATCH_SIZE sends 1 frame and no trailing terminal", async () => {
+    const frames = await sendAll(REPLAY_BATCH_SIZE);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].events).toHaveLength(200);
+    expect(frames[0].isLast).toBe(true);
+  });
+
+  it("E8 a payload of 201 events sends exactly 2 frames", async () => {
+    const frames = await sendAll(201);
+    expect(frames).toHaveLength(2);
+    expect(frames[0].events).toHaveLength(200);
+    expect(frames[0].isLast).toBe(false);
+    expect(frames[1].events).toHaveLength(1);
+    expect(frames[1].isLast).toBe(true);
+  });
+
+  it("E9 a payload of exactly 400 events sends 2 frames and no trailing terminal", async () => {
+    const frames = await sendAll(400);
+    expect(frames).toHaveLength(2);
+    expect(frames[1].events).toHaveLength(200);
+    expect(frames[1].isLast).toBe(true);
   });
 });

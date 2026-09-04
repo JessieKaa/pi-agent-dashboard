@@ -27,6 +27,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { flattenModelsJson, type NativeModelEntry } from "@blackbelt-technology/pi-dashboard-shared/models-json-reader.js";
+import {
+  type AdvertisedModelMetadata,
+  isFullyAdvertised,
+  mapAdvertisedModels,
+} from "@blackbelt-technology/pi-dashboard-shared/provider-model-metadata.js";
 import type { ProviderInfo } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadRoleConfig, lookupRole } from "./role-manager.js";
@@ -49,11 +54,14 @@ export interface ModelMetadata {
   input: InputModality[];
   /**
    * `"catalog"` when the probe resolved the model against pi's registry (real
-   * capabilities); `"fallback"` when defaults were forced because no catalog
-   * match (and `input` is the image-capable DEFAULT_INPUT assumption, not a
-   * verified capability). See change: enrich-model-selector-capabilities-favorites.
+   * capabilities); `"endpoint"` when the custom provider advertised every
+   * projected field itself; `"fallback"` when defaults were forced because no
+   * catalog match (and `input` is the image-capable DEFAULT_INPUT assumption,
+   * not a verified capability). A mixed-tier model reports its WEAKEST tier.
+   * See changes: enrich-model-selector-capabilities-favorites,
+   * fix-custom-provider-model-metadata.
    */
-  metadataSource: "catalog" | "fallback";
+  metadataSource: "catalog" | "endpoint" | "fallback";
   /**
    * Native per-model thinking-level override table + opaque request-formatting
    * hints, present only when the metadata came from the user-authored native
@@ -63,6 +71,13 @@ export interface ModelMetadata {
    */
   thinkingLevelMap?: Record<string, unknown>;
   compat?: Record<string, unknown>;
+  /**
+   * Arbitrary OpenAI-compatible sampling parameters (pi 0.84.0), incl. opt-in
+   * vLLM `thinking_token_budget`. Opaque passthrough: pi owns validation, and
+   * a pre-0.84 pi ignores the field. Omitted entirely when the native entry
+   * declares none. See change: update-pi-core-0-84-adopt-apis.
+   */
+  samplingParams?: Record<string, unknown>;
 }
 
 /**
@@ -224,7 +239,7 @@ function loadNativeModels(): NativeModelEntry[] {
 }
 
 /** Turn a native `models.json` entry into `ModelMetadata`, filling gaps with api-typed floors. */
-function metadataFromNative(native: NativeModelEntry, api?: string): ModelMetadata {
+export function metadataFromNative(native: NativeModelEntry, api?: string): ModelMetadata {
   const resolvedApi = api && api in FALLBACK_DEFAULTS ? api : "openai-completions";
   const fb = FALLBACK_DEFAULTS[resolvedApi] ?? FALLBACK_DEFAULTS["openai-completions"];
   return {
@@ -243,16 +258,29 @@ function metadataFromNative(native: NativeModelEntry, api?: string): ModelMetada
     metadataSource: "catalog",
     ...(native.thinkingLevelMap ? { thinkingLevelMap: native.thinkingLevelMap } : {}),
     ...(native.compat ? { compat: native.compat } : {}),
+    // pi 0.84.0 advanced custom-model sampling. Omitted when absent, so a
+    // floor-pi session sees exactly the pre-0.84 metadata shape.
+    // See change: update-pi-core-0-84-adopt-apis.
+    ...(native.samplingParams ? { samplingParams: native.samplingParams } : {}),
   };
 }
 
 /**
  * Resolve a discovered/authored model id to metadata in precedence order,
- * first hit wins: (1) the native `models.json` entry for `name/id`; (2) the
- * session registry's own `find(name, id)` for the custom provider name; (3) the
- * api-typed `enrichModelMetadata` fallback (which itself probes built-in
- * candidate catalogs). Only path 1 supplies `thinkingLevelMap`/`compat`.
- * See change: honor-native-models-json-metadata (D-E1).
+ * PER FIELD, first hit wins: (1) the native `models.json` entry for `name/id`;
+ * (2) the metadata the provider advertised in its own model list; (3) the
+ * session registry's own `find(name, id)` for the custom provider name;
+ * (4) the api-typed `enrichModelMetadata` fallback (which itself probes
+ * built-in candidate catalogs). Only path 1 supplies
+ * `thinkingLevelMap`/`compat`.
+ *
+ * Tier 2 outranks the name-matched catalog probe because the probe cannot
+ * resolve prefixed/hybrid ids (`ag/claude-opus-4-6-thinking`, `glm/glm-5.3`)
+ * and is not conservative when it does match — it would report that model at
+ * 1M while the provider advertises 200k. Only the endpoint knows what a given
+ * proxy route serves.
+ * See changes: honor-native-models-json-metadata (D-E1),
+ * fix-custom-provider-model-metadata (design D3).
  */
 function resolveMetadata(
   name: string,
@@ -260,10 +288,37 @@ function resolveMetadata(
   api: string | undefined,
   probe: CatalogProbe | null,
   native: NativeModelEntry | undefined,
+  advertised: AdvertisedModelMetadata = {},
 ): ModelMetadata {
   // Path 1: native user-authored models.json.
   if (native) return metadataFromNative(native, api);
-  // Path 2: the session registry's own entry for the custom provider name.
+  // Path 2: fields the provider advertised, overlaid on the lower tiers so a
+  // partially-advertising model keeps BOTH its advertised values and the
+  // catalog/floor values for the fields it omitted.
+  const lower = resolveLowerTiers(name, id, api, probe);
+  if (Object.keys(advertised).length > 0) {
+    return {
+      ...lower,
+      ...(advertised.contextWindow !== undefined ? { contextWindow: advertised.contextWindow } : {}),
+      ...(advertised.maxTokens !== undefined ? { maxTokens: advertised.maxTokens } : {}),
+      ...(advertised.reasoning !== undefined ? { reasoning: advertised.reasoning } : {}),
+      ...(advertised.input !== undefined ? { input: [...advertised.input] } : {}),
+      // Weakest adopted tier: only a fully-advertised model is "endpoint";
+      // otherwise the lower tier that filled the gap owns the provenance.
+      metadataSource: isFullyAdvertised(advertised) ? "endpoint" : lower.metadataSource,
+    };
+  }
+  return lower;
+}
+
+/** Tiers 3 + 4 of `resolveMetadata`: session-registry probe, then api-typed floors. */
+function resolveLowerTiers(
+  name: string,
+  id: string,
+  api: string | undefined,
+  probe: CatalogProbe | null,
+): ModelMetadata {
+  // Path 3: the session registry's own entry for the custom provider name.
   if (probe) {
     let hit: ReturnType<CatalogProbe> | undefined;
     try {
@@ -282,7 +337,7 @@ function resolveMetadata(
       };
     }
   }
-  // Path 3: api-typed enrichment fallback (built-in candidate probe → floors).
+  // Path 4: api-typed enrichment fallback (built-in candidate probe → floors).
   return enrichModelMetadata(id, api, probe);
 }
 
@@ -302,7 +357,7 @@ const lastRegistered = new Map<string, ProviderEntry>();
 // catalog models are NOT in this map — they carry real pi-ai metadata, so the
 // push helper defaults them to "catalog".
 // See change: enrich-model-selector-capabilities-favorites.
-const enrichmentSource = new Map<string, "catalog" | "fallback">();
+const enrichmentSource = new Map<string, "catalog" | "endpoint" | "fallback">();
 
 // Canonical thinking-level order. Extends pi 0.75.5's EXTENDED_THINKING_LEVELS
 // (off..xhigh) with the opt-in, runtime-gated `max` tier (reachable on newer
@@ -375,7 +430,7 @@ export function toModelInfo(m: any): {
   reasoning?: boolean;
   vision?: boolean;
   contextWindow?: number;
-  metadataSource?: "catalog" | "fallback";
+  metadataSource?: "catalog" | "endpoint" | "fallback";
   supportedThinkingLevels?: string[];
 } {
   const provider = m?.provider ?? "";
@@ -477,6 +532,12 @@ function hasApiKey(_providerName: string, entry: ProviderEntry): boolean {
 interface DiscoveredModel {
   id: string;
   owned_by?: string;
+  /**
+   * Capability fields this provider advertised in its model list. An absent
+   * key = not advertised, so the catalog probe / api-typed floor supplies it
+   * (per-field fallback). See change: fix-custom-provider-model-metadata.
+   */
+  advertised: AdvertisedModelMetadata;
 }
 
 async function discoverModels(baseUrl: string, apiKey: string): Promise<DiscoveredModel[]> {
@@ -499,15 +560,16 @@ async function discoverModels(baseUrl: string, apiKey: string): Promise<Discover
       return [];
     }
 
-    const body = await response.json() as any;
-    if (!body?.data || !Array.isArray(body.data)) {
+    const body = await response.json() as unknown;
+    // Shape-keyed mapping preserving every advertised capability field. The
+    // former `{ id, owned_by }` projection discarded the metadata one function
+    // too early. See change: fix-custom-provider-model-metadata (design D2).
+    const shaped = body as { data?: unknown; models?: unknown } | null;
+    if (!Array.isArray(shaped?.data) && !Array.isArray(shaped?.models)) {
       console.warn(`[provider] Model discovery: unexpected response format from ${url}`);
       return [];
     }
-
-    return body.data
-      .filter((m: any) => m?.id && typeof m.id === "string")
-      .map((m: any) => ({ id: m.id, owned_by: m.owned_by }));
+    return mapAdvertisedModels(body);
   } catch (err: any) {
     console.warn(`[provider] Model discovery failed for ${url}: ${err.message}`);
     return [];
@@ -792,6 +854,9 @@ async function registerEntry(pi: ExtensionAPI, name: string, entry: ProviderEntr
   // model authored under `providers.<name>.models[]` but absent from
   // `/v1/models` (or when `/v1/models` is unreachable) still reaches the
   // session and the web UI — matching the server path (AC5).
+  const advertisedById = new Map<string, AdvertisedModelMetadata>();
+  for (const d of discovered) advertisedById.set(d.id, d.advertised);
+
   const unionIds: string[] = [];
   const seenIds = new Set<string>();
   for (const id of [...discovered.map((d) => d.id), ...nativeForProvider.keys()]) {
@@ -801,7 +866,7 @@ async function registerEntry(pi: ExtensionAPI, name: string, entry: ProviderEntr
   }
 
   const models = unionIds.map((id) => {
-    const meta = resolveMetadata(name, id, entry.api, probe, nativeForProvider.get(id));
+    const meta = resolveMetadata(name, id, entry.api, probe, nativeForProvider.get(id), advertisedById.get(id));
     // Record enrichment confidence so models_list push sites can flag
     // assumed-vs-verified capabilities. Keyed by the registered provider name.
     enrichmentSource.set(`${name}/${id}`, meta.metadataSource);

@@ -38,12 +38,12 @@ describe("pi gateway session owner identity", () => {
 
     const a = new WebSocket(`ws://localhost:${port}`);
     await waitForOpen(a);
-    a.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/a", source: "tui" }));
+    a.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/a", source: "tui", pid: 123 }));
     await delay(100);
 
     const b = new WebSocket(`ws://localhost:${port}`);
     await waitForOpen(b);
-    b.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/b", source: "tui" }));
+    b.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/b", source: "tui", pid: 123 }));
     await delay(100);
 
     a.send(JSON.stringify({ type: "session_unregister", sessionId: "same", reason: "quit" }));
@@ -71,14 +71,16 @@ describe("pi gateway session owner identity", () => {
 
     const a = new WebSocket(`ws://localhost:${port}`);
     await waitForOpen(a);
-    a.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/a", source: "tui" }));
+    a.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/a", source: "tui", pid: 123 }));
     await delay(100);
 
     const b = new WebSocket(`ws://localhost:${port}`);
     await waitForOpen(b);
-    b.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/b", source: "tui" }));
+    b.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/b", source: "tui", pid: 123 }));
     await delay(100);
 
+    gateway.contention.record("same", 123, 456);
+    expect(gateway.contention.isContended("same")).toBe(true);
     a.close();
     await delay(200);
 
@@ -86,6 +88,7 @@ describe("pi gateway session owner identity", () => {
     expect(sm.get("same")?.cwd).toBe("/b");
     expect(gateway.isSessionConnected("same")).toBe(true);
     expect(onDisconnect).not.toHaveBeenCalledWith("same");
+    expect(gateway.contention.isContended("same")).toBe(true);
 
     b.close();
   }, 10000);
@@ -143,15 +146,15 @@ describe("pi gateway session owner identity", () => {
 
     const a = new WebSocket(`ws://localhost:${port}`);
     await waitForOpen(a);
-    a.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/a", source: "tui" }));
+    a.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/a", source: "tui", pid: 123 }));
     await delay(100);
 
     const b = new WebSocket(`ws://localhost:${port}`);
     await waitForOpen(b);
-    b.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/b", source: "tui", model: "new-model" }));
+    b.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/b", source: "tui", model: "new-model", pid: 123 }));
     await delay(100);
 
-    a.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/a-late", source: "tui", model: "old-model" }));
+    a.send(JSON.stringify({ type: "session_register", sessionId: "same", cwd: "/a-late", source: "tui", model: "old-model", pid: 123 }));
     a.send(JSON.stringify({ type: "model_update", sessionId: "same", model: "old-model" }));
     a.send(JSON.stringify({ type: "event_forward", sessionId: "same", event: { eventType: "stale", timestamp: Date.now(), data: {} } }));
     await delay(100);

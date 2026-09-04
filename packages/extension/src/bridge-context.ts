@@ -4,6 +4,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ConnectionManager } from "./connection.js";
+import { shouldSkipByPrefilter } from "./auto-session-namer.js";
 
 export interface BridgeContext {
   pi: ExtensionAPI;
@@ -92,12 +93,30 @@ export interface BridgeContext {
 // separately by the `__`-prefix rule. See change: fix-extension-slash-commands-in-dashboard.
 export const DASHBOARD_NATIVE_COMMANDS = new Set(["roles"]);
 
-/** Filter out hidden commands (names starting with __) and dashboard-native commands from commands list */
+/**
+ * Filter out hidden commands (names starting with __) and dashboard-native
+ * commands from the commands list, and fill in `CommandInfo.path` from pi's
+ * `sourceInfo.path`.
+ *
+ * The path mapping lives here, not at a sender, because all five
+ * `commands_list` senders pass through this one function (session register,
+ * spawn, flow rediscovery, `session_start` reload, `request_commands`). The
+ * server retains the *latest* list, so a sender that skipped the mapping would
+ * replace a good list with a path-less one and flip every skill to
+ * `not-loaded`. `sourceInfo` is a pi-internal shape, so its absence is
+ * tolerated rather than assumed. See change: fix-skill-discovery-parity.
+ */
 export function filterHiddenCommands(commands: any[]): any[] {
-  return commands.filter((cmd) =>
-    !cmd.name.startsWith("__") &&
-    !DASHBOARD_NATIVE_COMMANDS.has(cmd.name)
-  );
+  return commands
+    .filter((cmd) =>
+      !cmd.name.startsWith("__") &&
+      !DASHBOARD_NATIVE_COMMANDS.has(cmd.name)
+    )
+    .map((cmd) => {
+      const sourcePath = cmd?.sourceInfo?.path;
+      if (cmd?.path !== undefined || typeof sourcePath !== "string") return cmd;
+      return { ...cmd, path: sourcePath };
+    });
 }
 
 /**
@@ -246,6 +265,68 @@ export function extractFirstAssistantReply(ctx: any): string | undefined {
     }
   } catch { /* ignore */ }
   return undefined;
+}
+
+/** Concatenated text of one entry's content, or "" when it carries none. */
+function entryText(entry: any): string {
+  if (typeof entry?.content === "string") return entry.content;
+  if (!Array.isArray(entry?.content)) return "";
+  let text = "";
+  for (const part of entry.content) {
+    if (part?.type === "text" && typeof part.text === "string") text += part.text;
+  }
+  return text;
+}
+
+/**
+ * The ADVANCING transcript window fed to the auto-naming summarizer: the most
+ * recent user entry carrying non-empty text — skipping tool-result-only entries
+ * and empty entries — paired with the assistant reply of that same turn.
+ *
+ * Naming used to send the FIRST user message and FIRST assistant reply forever,
+ * so every retry re-sent a byte-identical request and a session that opened
+ * with a greeting was skipped for life. Only WHICH turn is sent changes here:
+ * the slice bounds are preserved exactly (user 200 chars, assistant 2000), so
+ * at most two bounded slices still leave the process.
+ * See change: fix-auto-naming-reasoning-model (design D6).
+ */
+export function extractLatestTurnWindow(ctx: any): { userMsg?: string; assistantReply?: string } {
+  try {
+    const entries = ctx?.sessionManager?.getEntries?.();
+    if (!entries || !Array.isArray(entries)) return {};
+
+    const windowAt = (i: number, text: string) => {
+      let assistantReply: string | undefined;
+      for (let j = i + 1; j < entries.length; j++) {
+        if (entries[j]?.role !== "assistant") continue;
+        const reply = entryText(entries[j]);
+        if (reply) { assistantReply = reply.slice(0, 2000); break; }
+      }
+      return { userMsg: text.slice(0, 200), assistantReply };
+    };
+
+    let latestNonEmpty: { i: number; text: string } | undefined;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      if (entry?.role !== "user") continue;
+      const text = entryText(entry).trim();
+      // A tool-result-only entry carries the `user` role but no text — it is
+      // not something a human said, so it can never be the naming window.
+      if (!text) continue;
+      if (latestNonEmpty === undefined) latestNonEmpty = { i, text };
+      // Select the latest turn the PRE-FILTER would accept. Selecting merely
+      // the latest non-empty turn means a trailing "ok" / "thanks" masks an
+      // otherwise-nameable session, because the pre-filter then rejects the
+      // window and the session is skipped — the exact defect the advancing
+      // window exists to remove.
+      if (!shouldSkipByPrefilter(text)) return windowAt(i, text);
+    }
+    // Nothing substantive was ever said: fall back to the latest non-empty
+    // turn so a genuinely trivial session still reports `skipped-prefilter`
+    // rather than `not-ready`.
+    if (latestNonEmpty) return windowAt(latestNonEmpty.i, latestNonEmpty.text);
+  } catch { /* ignore */ }
+  return {};
 }
 
 /**

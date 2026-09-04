@@ -262,6 +262,55 @@ describe("ChatView", () => {
     expect(container.textContent).toContain("Attached 2 image(s)");
   });
 
+  it("renders pending prompt card with data-URL images", () => {
+    const state = createInitialState();
+    state.pendingPrompt = {
+      text: "Check this",
+      status: "sending",
+      images: [{ data: "abc123", mimeType: "image/png" }],
+    };
+    const { container } = render(<ThemeProvider><ChatView state={state} toolContext={defaultToolContext} /></ThemeProvider>);
+    const card = container.querySelector('[data-testid="pending-prompt-card"]');
+    expect(card).not.toBeNull();
+    const img = card!.querySelector("img");
+    expect(img).not.toBeNull();
+    expect(img!.getAttribute("src")).toBe("data:image/png;base64,abc123");
+  });
+
+  it("renders a user image with an accessible lightbox button", () => {
+    const state = createInitialState();
+    state.messages.push({
+      id: "img-msg",
+      role: "user",
+      content: "See this",
+      timestamp: Date.now(),
+      images: [{ data: "abc123", mimeType: "image/png" }],
+    });
+    const { container } = render(<ThemeProvider><ChatView state={state} toolContext={defaultToolContext} /></ThemeProvider>);
+    const img = container.querySelector("img");
+    expect(img).not.toBeNull();
+    const trigger = img!.closest("button");
+    expect(trigger).not.toBeNull();
+    expect(trigger!.getAttribute("aria-label")).toBe("Zoom attachment 1");
+    fireEvent.click(trigger!);
+    expect(document.body.querySelector("[data-testid='lightbox-backdrop']")).not.toBeNull();
+  });
+
+  it("renders image metadata and rich images without duplicating the image element", () => {
+    const state = createInitialState();
+    state.messages.push({
+      id: "mixed-img-msg",
+      role: "user",
+      content: "See these",
+      imageCount: 1,
+      timestamp: Date.now(),
+      images: [{ data: "abc123", mimeType: "image/png" }],
+    });
+    const { container } = render(<ThemeProvider><ChatView state={state} toolContext={defaultToolContext} /></ThemeProvider>);
+    expect(container.querySelectorAll('[data-testid="image-attachment-notice"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-testid="attachment-image"]')).toHaveLength(1);
+  });
+
   it("hides empty-state message when pendingPrompt is set", () => {
     const state = createInitialState();
     state.pendingPrompt = { text: "Hello", status: "sending" };
@@ -557,7 +606,7 @@ describe("ChatView", () => {
     it("does not render retry-banner when retryState is set", () => {
       const state = {
         ...createInitialState(),
-        retryState: { attempt: 1, maxAttempts: 3, delayMs: 2000, reason: "rate limit", startedAt: 0 },
+        retryState: { attempt: 1, maxAttempts: 3, delayMs: 2000, waiting: false, reason: "rate limit", startedAt: 0 },
       };
       const { container } = render(
         <ThemeProvider>
@@ -629,7 +678,7 @@ describe("ChatView", () => {
     it("chat view stays banner-free even when both retryState and lastError are set", () => {
       const state = {
         ...createInitialState(),
-        retryState: { attempt: 2, maxAttempts: 3, delayMs: 4000, reason: "x", startedAt: 0 },
+        retryState: { attempt: 2, maxAttempts: 3, delayMs: 4000, waiting: false, reason: "x", startedAt: 0 },
         lastError: { message: "boom", timestamp: 0 },
       };
       const { container } = render(

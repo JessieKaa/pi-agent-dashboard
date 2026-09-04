@@ -59,9 +59,12 @@ const RULES = [
       "eliminate-electron-runtime-install task 1.1.a — pi lifted from " +
       "optional peer to regular dep so `npm install` resolves it for the " +
       "standalone + Electron arms. Floor tracks the deliberate pi bump to " +
-      "0.81.1 (0.81.0 full provider extensions + Qwen Token Plan providers; " +
-      "0.81.1 restored pre-0.81 agent-core stream fallback).",
-    minVersion: "0.81.1",
+      "0.84.4 (0.84.0 null-bearing provider headers, ModelsRefreshOptions/Result, " +
+      "OAuth refresh abort signal, v4 lane-based session model; 0.84.1/0.84.2 add " +
+      "no breaking change; 0.84.3 renames the pi-ai-internal GoogleThinkingLevel " +
+      "type, which the dashboard does not consume; 0.84.4 adds ui_prompt_start/end " +
+      "events and RPC clear_queue). See change: update-pi-core-0-84-adopt-apis.",
+    minVersion: "0.84.4",
   },
   {
     pkgPath: "packages/server/package.json",
@@ -70,9 +73,14 @@ const RULES = [
     evidence:
       "provision-openspec-cli-in-sessions task 1.4 — floor raised 1.3.0 → 1.6.0 " +
       "to match the version that generated the openspec-* skills " +
-      "(generatedBy: 1.6.0). npm hoists the server + extension ^1.6.0 ranges to " +
-      "one installed copy the session shim resolves.",
-    minVersion: "1.6.0",
+      "(generatedBy: 1.6.0). npm hoists the server + extension ranges to one " +
+      "installed copy the session shim resolves. Pinned EXACT (not ^1.6.0): the " +
+      "vendored .pi/skills/openspec-* carry `generatedBy: 1.6.0`, so the CLI and " +
+      "the skills must move together — a caret let a routine install drift the " +
+      "CLI out from under them unreviewed. 1.11.0 itself is CLI-compatible with " +
+      "openspec-poller.ts (`status --change <name> --json` unchanged, artifact " +
+      "shape unchanged + additive isPlanningComplete).",
+    minVersion: "1.11.0",
   },
   {
     pkgPath: "packages/extension/package.json",
@@ -82,8 +90,8 @@ const RULES = [
       "provision-openspec-cli-in-sessions task 1.4 — the bridge shim " +
       "(openspec-cli-shim.ts) require.resolves this dep, so it must travel with " +
       "the published extension into generic projects (no dashboard copy hoisted " +
-      "there). Floor tracks the single-source version 1.6.0.",
-    minVersion: "1.6.0",
+      "there). Floor tracks the single-source version 1.11.0.",
+    minVersion: "1.11.0",
   },
   {
     pkgPath: "packages/server/package.json",
@@ -96,6 +104,28 @@ const RULES = [
       "jiti/tsx loader contract used by packages/server/bin/pi-dashboard.mjs.",
     minVersion: "4.21.0",
   },
+  ...["vite", "@vitejs/plugin-react", "@tailwindcss/vite", "tailwindcss"].map((dep) => ({
+    pkgPath: "packages/client/package.json",
+    dep,
+    kind: "dependencies",
+    evidence:
+      "fix-pi-install-node26-and-omit-dev-build task 1.4 — pi installs via " +
+      "`npm install --omit=dev`, which drops devDependencies. The client `prepare` " +
+      "script runs a Vite build, so its direct build-time requirements must be " +
+      "runtime dependencies or the git-install path dies with " +
+      "`Cannot find module 'vite/package.json'` (issue #357).",
+  })),
+  {
+    pkgPath: "packages/client/package.json",
+    dep: "tsx",
+    kind: "dependencies",
+    evidence:
+      "fix-pi-install-node26-and-omit-dev-build task 1.2 — `scripts/vite-build.mjs` " +
+      "imports `tsx/esm/api`; declared explicitly on the client instead of relying " +
+      "on the fragile hoist of the packages/server runtime tsx dep. Floor 4.21.0 " +
+      "matches the root/server pin.",
+    minVersion: "4.21.0",
+  },
 ];
 
 /**
@@ -106,6 +136,50 @@ const RULES = [
 export function floorOf(range) {
   const m = String(range).match(/(\d+\.\d+\.\d+)/);
   return m ? m[1] : null;
+}
+
+/**
+ * pi pin coherence: the three single-source pi-version pins MUST resolve to the
+ * same normalized version — the server dep range, `piCompatibility.recommended`,
+ * and the docker global-install pin. Compares normalized floors (via `floorOf`)
+ * so the differing syntaxes `^0.83.0` / `0.83.0` / `@0.83.0` are treated equal.
+ * Returns an error string naming the drifted site(s), or null when coherent.
+ * Exported so the unit test can drive it with fixtures.
+ * See change: update-pi-core-0-83-adopt-apis.
+ */
+export function checkPiPinCoherence(serverPkg, dockerfileText) {
+  const depRange = serverPkg?.dependencies?.["@earendil-works/pi-coding-agent"];
+  const recommended = serverPkg?.piCompatibility?.recommended;
+  const dockerMatch = String(dockerfileText ?? "").match(
+    /@earendil-works\/pi-coding-agent@(\S+)/,
+  );
+  const dockerPin = dockerMatch ? dockerMatch[1] : undefined;
+  if (!depRange || !recommended || !dockerPin) {
+    return (
+      "pi pin coherence: missing a governed pi pin " +
+      `(server dep=${depRange ?? "absent"}, recommended=${recommended ?? "absent"}, ` +
+      `dockerfile=${dockerPin ?? "absent"})`
+    );
+  }
+  const depFloor = floorOf(depRange);
+  const recFloor = floorOf(recommended);
+  const dockerFloor = floorOf(dockerPin);
+  if (
+    depFloor === null ||
+    recFloor === null ||
+    dockerFloor === null ||
+    depFloor !== recFloor ||
+    depFloor !== dockerFloor
+  ) {
+    const drifted = [];
+    if (recFloor !== depFloor) drifted.push(`piCompatibility.recommended ("${recommended}")`);
+    if (dockerFloor !== depFloor) drifted.push(`docker/Dockerfile ("${dockerPin}")`);
+    return (
+      "pi pin drift: the three pi-version pins must resolve to one version — " +
+      `server dep "${depRange}" (floor ${depFloor}); drifted: ${drifted.join(", ") || "(unparseable pin)"}`
+    );
+  }
+  return null;
 }
 
 /**
@@ -135,11 +209,17 @@ export function checkOpenspecFloorConsistency(serverPkg, extensionPkg) {
   return null;
 }
 
-function collectFailures() {
+/**
+ * Evaluate every gate against a repo tree. Exported (with an injectable
+ * `repoRoot`) so the unit test can drive it against a tmp fixture tree instead
+ * of mutating tracked files or spawning the CLI.
+ * See change: fix-pi-install-node26-and-omit-dev-build (task 4.7).
+ */
+export function collectFailures({ repoRoot = REPO_ROOT } = {}) {
   const failures = [];
 
   for (const rule of RULES) {
-  const abs = path.join(REPO_ROOT, rule.pkgPath);
+  const abs = path.join(repoRoot, rule.pkgPath);
   let pkg;
   try {
     pkg = JSON.parse(readFileSync(abs, "utf-8"));
@@ -173,15 +253,27 @@ function collectFailures() {
 // Cross-consistency gate: server ↔ extension openspec floors must not drift.
 try {
   const serverPkg = JSON.parse(
-    readFileSync(path.join(REPO_ROOT, "packages/server/package.json"), "utf-8"),
+    readFileSync(path.join(repoRoot, "packages/server/package.json"), "utf-8"),
   );
   const extensionPkg = JSON.parse(
-    readFileSync(path.join(REPO_ROOT, "packages/extension/package.json"), "utf-8"),
+    readFileSync(path.join(repoRoot, "packages/extension/package.json"), "utf-8"),
   );
   const drift = checkOpenspecFloorConsistency(serverPkg, extensionPkg);
   if (drift) failures.push(drift);
   } catch (err) {
     failures.push(`Cannot check openspec floor consistency: ${err.message}`);
+  }
+
+  // pi pin coherence gate: server dep ↔ piCompatibility.recommended ↔ Dockerfile.
+  try {
+    const serverPkg = JSON.parse(
+      readFileSync(path.join(repoRoot, "packages/server/package.json"), "utf-8"),
+    );
+    const dockerfileText = readFileSync(path.join(repoRoot, "docker/Dockerfile"), "utf-8");
+    const piDrift = checkPiPinCoherence(serverPkg, dockerfileText);
+    if (piDrift) failures.push(piDrift);
+  } catch (err) {
+    failures.push(`Cannot check pi pin coherence: ${err.message}`);
   }
 
   return failures;

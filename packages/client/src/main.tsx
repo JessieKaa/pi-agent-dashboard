@@ -43,8 +43,19 @@ import { ToolCallStep } from "./components/chat/ToolCallStep.js";
 import { PairLanding } from "./components/connectivity/PairLanding.js";
 import { MarkdownContent } from "./components/preview/MarkdownContent.js";
 import { LogBlock } from "./components/primitives/LogBlock.js";
-import { ModelSelector } from "./components/settings/ModelSelector.js";
+import { makeToolContext } from "./components/tool-renderers/make-tool-context.js";
+import {
+  ModelSelectorPrimitive,
+  ThinkingLevelSelectorPrimitive,
+} from "./lib/plugins/shell-primitives.js";
 import { installDeviceAuthFetch } from "./lib/pairing/device-auth.js";
+import { installUnhandledRejectionReporter } from "./lib/report-error.js";
+
+// Global unhandled-rejection reporter — the regression guard for the promise
+// handling cleanup. Installed as the first executable statement so a rejection
+// escaping any startup path is observed rather than silently dropped.
+// See change: cleanup-client-plugin-promises (design D2).
+installUnhandledRejectionReporter();
 
 const primitiveRegistry = createUiPrimitiveRegistry();
 registerUiPrimitive(primitiveRegistry, UI_PRIMITIVE_KEYS.agentCard, AgentCardShell);
@@ -87,7 +98,6 @@ registerUiPrimitive(primitiveRegistry, UI_PRIMITIVE_KEYS.formatTokens, formatTok
 registerUiPrimitive(primitiveRegistry, UI_PRIMITIVE_KEYS.formatDuration, formatDuration);
 registerUiPrimitive(primitiveRegistry, UI_PRIMITIVE_KEYS.actionList, ActionList);
 registerUiPrimitive(primitiveRegistry, UI_PRIMITIVE_KEYS.statusPill, StatusPill);
-registerUiPrimitive(primitiveRegistry, UI_PRIMITIVE_KEYS.modelSelector, ModelSelector);
 registerUiPrimitive(primitiveRegistry, UI_PRIMITIVE_KEYS.popover, Popover);
 registerUiPrimitive(primitiveRegistry, UI_PRIMITIVE_KEYS.logBlock, LogBlock);
 
@@ -109,13 +119,24 @@ const ToolCallStepPrimitive: React.FC<UiToolCallStepProps> = (props) => (
     toolDetails={props.toolDetails}
     startedAt={props.startedAt}
     duration={props.duration}
-    context={{ sessionId: props.sessionId }}
+    context={makeToolContext({ sessionId: props.sessionId })}
   />
 );
 registerUiPrimitive(
   primitiveRegistry,
   UI_PRIMITIVE_KEYS.toolCallStep,
   ToolCallStepPrimitive,
+);
+
+registerUiPrimitive(
+  primitiveRegistry,
+  UI_PRIMITIVE_KEYS.modelSelector,
+  ModelSelectorPrimitive,
+);
+registerUiPrimitive(
+  primitiveRegistry,
+  UI_PRIMITIVE_KEYS.thinkingLevelSelector,
+  ThinkingLevelSelectorPrimitive,
 );
 
 const ThinkingBlockPrimitive: React.FC<UiThinkingBlockProps> = (props) => (

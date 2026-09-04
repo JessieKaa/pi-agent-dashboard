@@ -1,6 +1,6 @@
 ---
 name: document-converter
-description: Convert documents bidirectionally via the pi-doc-engine facade. Ingest PDF/DOCX/PPTX/XLSX to provenance-stamped Markdown for kb (with selectable OCR). Produce templated DOCX/PDF from Markdown with diagrams (mmdc or styled nano-banana), TOC, cover page, and round-trip extract/edit/merge. Use on requests like "convert this PDF to markdown", "ingest these docs into kb", "make a DOCX from markdown with our template", "render this spec to PDF", "OCR this scanned Hungarian PDF", "edit this DOCX and merge back", "fill frontmatter", "auto-size tables".
+description: 'Convert documents bidirectionally via the pi-doc-engine facade: ingest PDF/DOCX/PPTX/XLSX to provenance-stamped Markdown (with OCR), and produce templated DOCX/PDF from Markdown with diagrams, TOC and round-trip merge. Use on "convert this PDF to markdown", "ingest these docs into kb", "make a DOCX from markdown with our template", "render this spec to PDF", "OCR this scanned PDF".'
 ---
 
 # Document Converter
@@ -17,6 +17,10 @@ Do NOT read the vendored Python under `engine/document_converter/`.
 ## Prerequisites
 
 - Docker available; image built: `cd packages/document-converter && npm run build:image`.
+  The `pi.tools` manifest (package root) declares `pi-doc-engine` as a
+  `docker-image` probe — `pi-dashboard-ensure <package-root>/package.json`
+  reports image presence and the first-party build hint (confirm-gated) via
+  the registry's Settings → Tools row.
 - Styled diagrams (nano-banana) need `GEMINI_API_KEY` at run time; absent or on
   failure, rendering falls back to mmdc (never hard-fails).
 

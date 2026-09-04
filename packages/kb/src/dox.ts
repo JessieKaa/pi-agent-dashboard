@@ -2,9 +2,11 @@
 // `kb agents <path>` nearest-applicable chain (design §6d). Pure-local,
 // deterministic, no LLM/embedding. The detect-don't-write rule: `dox init`
 // and `--fix` only fill PATH columns / prune orphans; the LLM authors purposes.
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, appendFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+
 import { createHash } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { readStaleness } from "./staleness.js";
 import type { KbStore } from "./types.js";
 
 // delta ②: exclude worktree checkouts, archived openspec proposals, and doc-example noise.
@@ -18,8 +20,20 @@ import type { KbStore } from "./types.js";
 // navigable source) and self-evident top-level docs (`CHANGELOG.md`, `CLAUDE.md`,
 // repo-root `README.md`) with no per-file DOX value; `README` anchored to root so
 // package READMEs stay documented.
-const DEFAULT_EXCLUDE = /(^|\/)(node_modules|\.git|\.github|dist|build|out|\.next|coverage|\.kb|\.pi|\.worktrees|\.reverse-spec-scratch|openspec|doc-example|bundled-extensions|mockups|research|site|Prompt stories)(\/|$)|(^|\/)electron\/resources\/server(\/|$)|(^|\/)(CHANGELOG|CLAUDE)\.md$|^README\.md$/;
-const AGENTS_FILES = ["AGENTS.md"];
+// `.pi` is NOT excluded wholesale: `.pi/skills/`, `.pi/agents/` and `.pi/prompts/`
+// carry per-file DOX rows per the Documentation Update Protocol, and excluding the
+// whole tree blinded the orphan check there. Only the non-source `.pi` subdirs
+// (caches, kb index, npm/git mirrors, flow run state) are skipped.
+const DEFAULT_EXCLUDE = /(^|\/)(node_modules|\.git|\.github|dist|build|out|\.next|coverage|\.kb|\.worktrees|\.reverse-spec-scratch|openspec|doc-example|bundled-extensions|mockups|research|site|Prompt stories)(\/|$)|(^|\/)\.pi\/(dashboard|npm|git|flows)(\/|$)|(^|\/)electron\/resources\/server(\/|$)|(^|\/)(CHANGELOG|CLAUDE)\.md$|^README\.md$/;
+/**
+ * `AGENTS.override.md` (pi 0.84.0) REPLACES a directory's context rather than
+ * adding to it, so it is listed first and shadows the other candidates in the
+ * SAME directory. Mirrors pi's own first-match-wins candidate list in
+ * `dist/core/resource-loader.js`. Ancestor inheritance is unaffected.
+ * See change: update-pi-core-0-84-adopt-apis.
+ */
+const AGENTS_OVERRIDE_FILE = "AGENTS.override.md";
+const AGENTS_FILES = [AGENTS_OVERRIDE_FILE, "AGENTS.md"];
 // delta ①: dox init now maps SOURCE, not docs. Source globs, minus type decls and tests.
 const SOURCE_EXT = /\.(ts|tsx|js|jsx)$/;
 const MD_EXT = /\.(md|mdx)$/i;
@@ -38,8 +52,8 @@ function isMdFile(name: string): boolean {
     !name.endsWith(".agent.md")
   );
 }
-export const AREA_FILE_THRESHOLD = 8; // ≥ this many md files in a subdir → own AGENTS.md
-export const ROW_CAP = 40;
+const AREA_FILE_THRESHOLD = 8; // ≥ this many md files in a subdir → own AGENTS.md
+const ROW_CAP = 40;
 // pi auto-injects a dir AGENTS.md on every turn when cwd sits at/below it. Past
 // this byte cap it is "too large" → split file-based: promote the heaviest rows
 // to `<File>.AGENTS.md` sidecars (pull-only) + cap remaining rows to one line.
@@ -76,7 +90,15 @@ export function agentsChain(cwd: string, targetPath: string, opts: AgentsChainOp
   const ordered = dirs.reverse();
   const chain: AgentsEntry[] = [];
   ordered.forEach((dir, depth) => {
+    // An override replaces this directory's context: take it alone and skip the
+    // siblings, otherwise the same logical scope is injected twice.
+    const override = join(dir, AGENTS_OVERRIDE_FILE);
+    if (existsSync(override)) {
+      chain.push({ path: override, rel: relative(cwd, override) || AGENTS_OVERRIDE_FILE, depth });
+      return;
+    }
     for (const name of names) {
+      if (name === AGENTS_OVERRIDE_FILE) continue;
       const p = join(dir, name);
       if (existsSync(p)) chain.push({ path: p, rel: relative(cwd, p) || name, depth });
     }
@@ -258,20 +280,97 @@ export function doxInit(opts: DoxInitOptions): DoxInitPlan {
 
 // --- dox lint ---
 
+/**
+ * Pull repo-path REFERENCES out of a row's purpose cell.
+ *
+ * The lint hashes the file behind each row but never validates paths written
+ * inside the prose, so a directory move silently rots cross-references (this is
+ * how a routing rule kept pointing at two deleted dirs). The hard part is not
+ * finding candidates — it is rejecting the ~99% that are not repo paths at all:
+ * URL routes, MIME types, npm specifiers, `~`/absolute paths, model ids, code
+ * fragments like `get/list/remove`, and descriptions of OTHER projects' layouts.
+ *
+ * Discriminators, in order of how much noise each removes:
+ *  1. first segment must be a real top-level entry of THIS repo — kills
+ *     `lib/validations.ts` (consumer-project prose) and `provider/model`
+ *  2. must carry a source-file extension or be a glob — kills bare route paths
+ *  3. structural rejects: leading `~` or `/`, `@` scopes, and any char that
+ *     cannot appear in a path we would write (`:?="'()[]{}<>` , whitespace…)
+ */
+export function extractRefPaths(cell: string, topLevel: Set<string>): string[] {
+  const out: string[] = [];
+  for (const m of cell.matchAll(/`([^`]+)`/g)) {
+    const raw = m[1].trim();
+    if (!raw.includes("/")) continue;
+    if (/^[~/@]/.test(raw)) continue; // home, absolute, npm scope
+    if (/[:?="'()[\]{}<>|,;!#\s]/.test(raw)) continue; // routes, code, prose, placeholders
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional non-ASCII guard
+    if (/[^\x20-\x7e]/.test(raw)) continue;
+    const p = raw.replace(/^\.\//, "").replace(/\/$/, "");
+    if (!p.includes("/")) continue;
+    if (!topLevel.has(p.split("/")[0])) continue;
+    if (!/\.[a-z0-9]{1,5}$/i.test(p) && !p.includes("*")) continue;
+    // Build output and excluded trees (`packages/electron/out/*`, `.worktrees/*`)
+    // are legitimately absent until built/created — flagging them is noise, and a
+    // check that cries wolf gets ignored.
+    if (DEFAULT_EXCLUDE.test(p)) continue;
+    out.push(p);
+  }
+  return out;
+}
+
+/** Cheap glob test for `*` / `**` reference paths (no dependency on a matcher). */
+function globHit(pattern: string, cwd: string): boolean {
+  const rx = new RegExp(
+    `^${pattern
+      .split("/")
+      .map((s) =>
+        s
+          .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+          .replace(/\*\*/g, "\u0001")
+          .replace(/\*/g, "[^/]*")
+          .replace(/\u0001/g, ".*"),
+      )
+      .join("/")}$`,
+  );
+  const walk = (dir: string, rel: string): boolean => {
+    let entries: import("node:fs").Dirent[] = [];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    for (const e of entries) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (DEFAULT_EXCLUDE.test(r)) continue;
+      if (rx.test(r)) return true;
+      if (e.isDirectory() && walk(join(dir, e.name), r)) return true;
+    }
+    return false;
+  };
+  return walk(cwd, "");
+}
+
 export interface DoxIssue {
-  kind: "stale" | "orphan" | "missing" | "missing-companion" | "broken-pointer" | "over-threshold";
+  kind: "stale" | "orphan" | "missing" | "missing-companion" | "broken-pointer" | "broken-ref" | "over-threshold";
   agentsFile: string;
   path?: string;
   detail: string;
   // over-threshold discriminator: "bytes" = actionable (auto-injected per turn,
   // remedy = sidecar split); "rows" = informational (advisory, no injection cost).
-  arm?: "bytes" | "rows";
+  // missing discriminator: "source" = an undocumented .ts/.tsx (design D9), which
+  // is opt-in and never auto-fixed; markdown `missing` findings carry no arm.
+  arm?: "bytes" | "rows" | "source";
 }
 export interface DoxLintOptions {
   json?: boolean;
   fix?: boolean;
   cwd: string;
   stalenessFile?: string; // sidecar path (source-path → ack-hash)
+  /** Opt-in: report undocumented SOURCE files as `missing` (design D9). OFF by
+   *  default so an existing tree can adopt the arm incrementally instead of
+   *  red-walling CI with a large one-time finding count. */
+  sourceFileRows?: boolean;
 }
 export interface DoxLintResult {
   issues: DoxIssue[];
@@ -290,6 +389,16 @@ export function doxLint(opts: DoxLintOptions): DoxLintResult {
   const issues: DoxIssue[] = [];
   let fixed = 0;
 
+  // Top-level entries of THIS repo — the primary discriminator that stops
+  // broken-ref from firing on prose that merely looks path-shaped.
+  const topLevelEntries = new Set<string>();
+  try {
+    for (const e of readdirSync(cwd, { withFileTypes: true })) topLevelEntries.add(e.name);
+  } catch {
+    /* empty cwd — leave the set empty, which disables broken-ref entirely */
+  }
+  const seenRefs = new Set<string>();
+
   // find all AGENTS.md
   const agentsFiles: string[] = [];
   // Test the path RELATIVE to cwd (mirrors walkFiles) so an ancestor dir named
@@ -306,10 +415,10 @@ export function doxLint(opts: DoxLintOptions): DoxLintResult {
   };
   walkAgents(cwd);
 
-  // staleness sidecar
-  let staleness: Record<string, string> = {};
+  // staleness sidecar — v1 (sha strings) / v2 (records with stat baseline)
+  // tolerant reader shared with triage, ack-on-edit, and query-time verdicts.
   const sf = opts.stalenessFile ?? join(cwd, ".pi", "dashboard", "kb", "dox-staleness.json");
-  if (existsSync(sf)) { try { staleness = JSON.parse(readFileSync(sf, "utf8")); } catch { /* */ } }
+  const staleness = readStaleness(sf);
 
   const allMd = new Set(walkMd(cwd).map((f) => relative(cwd, f)));
   const rowPaths = new Set<string>();
@@ -337,6 +446,17 @@ export function doxLint(opts: DoxLintOptions): DoxLintResult {
       const m = inDox ? line.match(/^\|\s*`([^`]+)`\s*\|/) : null;
       if (!m) { if (opts.fix) survivingRows.push(line); continue; }
       const rp = m[1];
+      // Cross-references inside the PURPOSE cell. Rot here is invisible to the
+      // hash check, because the row's own file is untouched by the move.
+      const purposeCell = line.slice(line.indexOf("|", line.indexOf("`" + rp + "`")) + 1);
+      for (const ref of extractRefPaths(purposeCell, topLevelEntries)) {
+        if (seenRefs.has(ref)) continue;
+        seenRefs.add(ref);
+        const hit = ref.includes("*")
+          ? globHit(ref, cwd)
+          : existsSync(join(cwd, ref)) || existsSync(join(afDir, ref));
+        if (!hit) issues.push({ kind: "broken-ref", agentsFile: afRel, path: ref, detail: `broken-ref: row prose cites ${ref}, which does not exist` });
+      }
       const abs = resolveRowPath(afDir, cwd, rp);
       const rel = relative(cwd, abs);
       rowPaths.add(rel);
@@ -345,8 +465,11 @@ export function doxLint(opts: DoxLintOptions): DoxLintResult {
         const kind = rp.endsWith("AGENTS.md") ? "broken-pointer" : "orphan";
         issues.push({ kind, agentsFile: afRel, path: rp, detail: `${kind}: ${rp} does not exist` });
         if (opts.fix && kind === "orphan") { fixed++; continue; } // prune orphan row
-      } else if (staleness[rel] && fileSha(abs) && staleness[rel] !== fileSha(abs)) {
-        issues.push({ kind: "stale", agentsFile: afRel, path: rp, detail: `tracked source-hash drifted` });
+      } else if (staleness[rel]?.sha256) {
+        const diskSha = fileSha(abs);
+        if (diskSha && staleness[rel]!.sha256 !== diskSha) {
+          issues.push({ kind: "stale", agentsFile: afRel, path: rp, detail: `tracked source-hash drifted` });
+        }
       }
       if (opts.fix) survivingRows.push(line);
     }
@@ -376,6 +499,22 @@ export function doxLint(opts: DoxLintOptions): DoxLintResult {
       const ownerRel = relative(cwd, owner) || "AGENTS.md";
       issues.push({ kind: "missing", agentsFile: ownerRel, path: md, detail: `no row for ${md}` });
       if (opts.fix) { appendFileSync(owner, `| \`${md}\` |  |\n`); fixed++; }
+    }
+  }
+
+  // missing rows, SOURCE arm (design D9): a .ts/.tsx in a covered area with no
+  // row in ANY ancestor AGENTS.md and no <file>.AGENTS.md sidecar is unreachable
+  // through the `agents` doc-type lane that retrieval depends on. Opt-in, and
+  // never auto-fixed: a blank purpose row is worse than an honest finding.
+  if (opts.sourceFileRows) {
+    for (const abs of sourceFiles(cwd)) {
+      const rel = relative(cwd, abs);
+      if (rowPaths.has(rel)) continue;
+      if (existsSync(join(cwd, `${rel}.AGENTS.md`))) continue;
+      const dir = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : ".";
+      const owner = ownerOf(dir);
+      if (!owner) continue;
+      issues.push({ kind: "missing", arm: "source", agentsFile: relative(cwd, owner) || "AGENTS.md", path: rel, detail: `no row for source file ${rel}` });
     }
   }
 

@@ -515,10 +515,14 @@ describe("GroupGitInfo", () => {
     globalThis.fetch = origFetch;
   });
 
+  // `cwd` matches `makeSession`'s default cwd so the child is ELIGIBLE for the
+  // fallback. See change: fix-folder-header-worktree-branch-leak.
+  const OWN_CWD = "/home/user/project";
+
   it("renders branch icon as clickable button", () => {
     const onClick = vi.fn();
     const sessions = [makeSession({ gitBranch: "main" })];
-    render(<GroupGitInfo sessions={sessions} cwd="/test" onBranchClick={onClick} />);
+    render(<GroupGitInfo sessions={sessions} cwd={OWN_CWD} onBranchClick={onClick} />);
     const btn = screen.getByTestId("git-branch-btn");
     fireEvent.click(btn);
     expect(onClick).toHaveBeenCalled();
@@ -526,13 +530,13 @@ describe("GroupGitInfo", () => {
 
   it("renders branch name for normal branch", () => {
     const sessions = [makeSession({ gitBranch: "feature/new" })];
-    render(<GroupGitInfo sessions={sessions} cwd="/test" />);
+    render(<GroupGitInfo sessions={sessions} cwd={OWN_CWD} />);
     expect(screen.getByText("feature/new")).toBeTruthy();
   });
 
   it("renders detached HEAD (short SHA)", () => {
     const sessions = [makeSession({ gitBranch: "abc1234" })];
-    render(<GroupGitInfo sessions={sessions} cwd="/test" />);
+    render(<GroupGitInfo sessions={sessions} cwd={OWN_CWD} />);
     expect(screen.getByText("abc1234")).toBeTruthy();
   });
 
@@ -568,10 +572,117 @@ describe("GroupGitInfo", () => {
     expect(screen.queryByText("os/foo")).toBeNull();
   });
 
-  it("with no folderBranch entry, falls back to session.gitBranch", () => {
-    const sessions = [makeSession({ gitBranch: "os/foo" })];
+  it("with no folderBranch entry, falls back to a child rooted AT the folder", () => {
+    // Eligibility is cwd identity: this child's own cwd IS the folder cwd.
+    // See change: fix-folder-header-worktree-branch-leak.
+    const sessions = [makeSession({ cwd: "/repo", gitBranch: "os/foo" })];
     render(<GroupGitInfo sessions={sessions} cwd="/repo" />);
     expect(screen.getByText("os/foo")).toBeTruthy();
+  });
+
+  // ── eligible-child fallback (fix-folder-header-worktree-branch-leak) ─────
+  //
+  // Only a session ROOTED AT the folder can report the folder's HEAD. A
+  // worktree child folded in via `gitWorktree.mainPath` is deterministically
+  // ordered FIRST by `maybeRekeyOrder`'s `toFront`, so a positional `find`
+  // leaked its branch into the parent folder header.
+
+  /** Stub `GET /api/git/branches` so the REST seed is deterministic. */
+  function seedBranches(current: string | null): void {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      json: async () => (current === null
+        ? { success: false }
+        : { success: true, data: { current } }),
+    }) as unknown as typeof fetch;
+  }
+
+  it("eligible child wins over a front-ordered worktree child (#E1)", () => {
+    const sessions = [
+      makeSession({ id: "wt", cwd: "/repo/.worktrees/os-foo", gitBranch: "os/foo" }),
+      makeSession({ id: "main", cwd: "/repo", gitBranch: "develop" }),
+    ];
+    render(<GroupGitInfo sessions={sessions} cwd="/repo" />);
+    expect(screen.getByText("develop")).toBeTruthy();
+    expect(screen.queryByText("os/foo")).toBeNull();
+  });
+
+  it("no eligible child falls through to the REST seed (#E2)", async () => {
+    branchCache.delete("/repo-e2");
+    seedBranches("develop");
+    const sessions = [
+      makeSession({ id: "wt1", cwd: "/repo-e2/.worktrees/os-foo", gitBranch: "os/foo" }),
+      makeSession({ id: "wt2", cwd: "/repo-e2/.worktrees/os-bar", gitBranch: "os/bar" }),
+    ];
+    render(<GroupGitInfo sessions={sessions} cwd="/repo-e2" />);
+    expect(screen.queryByText("os/foo")).toBeNull();
+    expect(screen.queryByText("os/bar")).toBeNull();
+    expect(await screen.findByText("develop")).toBeTruthy();
+    branchCache.delete("/repo-e2");
+  });
+
+  it("pinned worktree folder renders its own session's branch (#E3)", () => {
+    // Pin wins in `resolveSessionGroupPath`, so the group cwd IS the worktree
+    // path — cwd identity holds and the session stays eligible.
+    const sessions = [makeSession({ cwd: "/repo/.worktrees/os-foo", gitBranch: "os/foo" })];
+    render(<GroupGitInfo sessions={sessions} cwd="/repo/.worktrees/os-foo" />);
+    expect(screen.getByText("os/foo")).toBeTruthy();
+  });
+
+  it("git-identity tuple never mixes sessions (#E4)", () => {
+    const sessions = [
+      makeSession({
+        id: "wt",
+        cwd: "/repo/.worktrees/os-foo",
+        gitBranch: "os/foo",
+        gitBranchUrl: "https://example.test/tree/os-foo",
+        gitPrNumber: 42,
+        gitPrUrl: "https://example.test/pull/42",
+      }),
+      makeSession({ id: "main", cwd: "/repo", gitBranch: "develop" }),
+    ];
+    const { container } = render(<GroupGitInfo sessions={sessions} cwd="/repo" />);
+    expect(screen.getByText("develop")).toBeTruthy();
+    expect(screen.queryByText("#42")).toBeNull();
+    expect(container.querySelector('a[href="https://example.test/pull/42"]')).toBeNull();
+    expect(container.querySelector('a[href="https://example.test/tree/os-foo"]')).toBeNull();
+  });
+
+  it("folder-HEAD entry still outranks a front-ordered worktree child (#E5)", () => {
+    const sessions = [
+      makeSession({ id: "wt", cwd: "/repo/.worktrees/os-foo", gitBranch: "os/foo" }),
+    ];
+    render(<GroupGitInfo sessions={sessions} cwd="/repo" folderBranch="develop" />);
+    expect(screen.getByText("develop")).toBeTruthy();
+    expect(screen.queryByText("os/foo")).toBeNull();
+  });
+
+  it("null folder-HEAD entry still renders the non-git state (#E6)", () => {
+    const sessions = [
+      makeSession({ id: "wt", cwd: "/repo/.worktrees/os-foo", gitBranch: "os/foo" }),
+    ];
+    render(<GroupGitInfo sessions={sessions} cwd="/repo" folderBranch={null} />);
+    expect(screen.getByTestId("git-init-btn")).toBeTruthy();
+    expect(screen.getByText("Init git")).toBeTruthy();
+    expect(screen.queryByText("os/foo")).toBeNull();
+  });
+
+  it("eligibility uses pathKey, not raw string equality (#E7)", () => {
+    // Trailing separator is cosmetic drift `pathKey` collapses.
+    const sessions = [makeSession({ cwd: "/repo/", gitBranch: "develop" })];
+    render(<GroupGitInfo sessions={sessions} cwd="/repo" />);
+    expect(screen.getByText("develop")).toBeTruthy();
+  });
+
+  it("REST-seed failure must not resurrect an ineligible branch (#X1)", async () => {
+    branchCache.delete("/repo-x1");
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error("boom")) as unknown as typeof fetch;
+    const sessions = [
+      makeSession({ id: "wt", cwd: "/repo-x1/.worktrees/os-foo", gitBranch: "os/foo" }),
+    ];
+    render(<GroupGitInfo sessions={sessions} cwd="/repo-x1" />);
+    expect(await screen.findByTestId("git-init-btn")).toBeTruthy();
+    expect(screen.queryByText("os/foo")).toBeNull();
+    branchCache.delete("/repo-x1");
   });
 
   it("folderBranch null renders the Init git non-git state", () => {
@@ -940,95 +1051,23 @@ describe("SessionCard subcard structure", () => {
   });
 });
 
-// ── Status-tinted mosaic rail (left gutter) ─────────────────────────────
-// See change: add-session-card-status-mosaic-rail.
+// ── Directory rail replaces the per-card status gutter ──────────────────
+// The 20px left gutter (status capsule + icon chip + drag zone) is GONE; the
+// folder now owns one gray rail and each card ticks into it. Status survives
+// only on the inline chip. The rail-tint derivation itself is still unit
+// tested in lib/__tests__/session-status-visuals.test.ts (deriveRailBgColor
+// is retained there but no longer rendered).
+// See change: session-card-directory-rail.
 
-describe("SessionCard left-gutter mosaic rail", () => {
-  function railEl(container: HTMLElement): HTMLElement {
-    const el = container.querySelector("[data-rail-bg]") as HTMLElement | null;
-    if (!el) throw new Error("rail element not found");
-    return el;
-  }
-
-  it("renders idle-token rail tint for idle/active sessions", () => {
-    const { container } = render(
-      <SessionCard session={makeSession({ status: "idle" })} {...defaultProps} />,
-    );
-    expect(railEl(container).getAttribute("data-rail-bg")).toBe("bg-[color-mix(in_srgb,var(--status-idle)_40%,transparent)]");
-  });
-
-  it("renders working-token rail tint for streaming sessions", () => {
+describe("SessionCard directory rail", () => {
+  it("renders NO left status gutter (no data-rail-bg element)", () => {
     const { container } = render(
       <SessionCard session={makeSession({ status: "streaming" })} {...defaultProps} />,
     );
-    expect(railEl(container).getAttribute("data-rail-bg")).toBe("bg-[color-mix(in_srgb,var(--status-working)_40%,transparent)]");
+    expect(container.querySelector("[data-rail-bg]")).toBeNull();
   });
 
-  it("renders needs-you-token rail tint for chat-routed ask_user (not green/idle)", () => {
-    const { container } = render(
-      <SessionCard session={makeSession({ status: "streaming", currentTool: "ask_user" })} {...defaultProps} />,
-    );
-    expect(railEl(container).getAttribute("data-rail-bg")).toBe("bg-[color-mix(in_srgb,var(--status-needs-you)_40%,transparent)]");
-  });
-
-  it("renders muted rail palette for ended sessions", () => {
-    const { container } = render(
-      <SessionCard session={makeSession({ status: "ended" })} {...defaultProps} />,
-    );
-    expect(railEl(container).getAttribute("data-rail-bg")).toBe("bg-[var(--bg-surface)]");
-  });
-
-  it("renders red rail palette when hasError is true", () => {
-    const { container } = render(
-      <SessionCard
-        session={makeSession({ status: "idle" })}
-        {...defaultProps}
-        hasError={true}
-      />,
-    );
-    expect(railEl(container).getAttribute("data-rail-bg")).toBe("bg-[color-mix(in_srgb,var(--status-error)_40%,transparent)]");
-  });
-
-  it("selected idle session uses brighter -400/65 palette", () => {
-    const { container } = render(
-      <SessionCard
-        session={makeSession({ status: "idle" })}
-        {...defaultProps}
-        selectedId="test-session"
-      />,
-    );
-    expect(railEl(container).getAttribute("data-rail-bg")).toBe("bg-[color-mix(in_srgb,var(--status-idle)_65%,transparent)]");
-  });
-
-  it("selected streaming session uses brighter -400/65 palette", () => {
-    const { container } = render(
-      <SessionCard
-        session={makeSession({ status: "streaming" })}
-        {...defaultProps}
-        selectedId="test-session"
-      />,
-    );
-    expect(railEl(container).getAttribute("data-rail-bg")).toBe("bg-[color-mix(in_srgb,var(--status-working)_65%,transparent)]");
-  });
-
-  it("rail bar is a centered capsule (rounded-full, 6px wide, top-2 bottom-2)", () => {
-    const { container } = render(
-      <SessionCard session={makeSession({ status: "idle" })} {...defaultProps} />,
-    );
-    const bar = railEl(container).querySelector("[aria-hidden=true]") as HTMLElement | null;
-    expect(bar).toBeTruthy();
-    expect(bar!.className).toMatch(/absolute/);
-    expect(bar!.className).toMatch(/left-1\/2/);
-    expect(bar!.className).toMatch(/-translate-x-1\/2/);
-    expect(bar!.className).toMatch(/w-1\.5/);
-    expect(bar!.className).toMatch(/rounded-full/);
-    expect(bar!.className).toMatch(/top-7/);
-    expect(bar!.className).toMatch(/bottom-2/);
-    // Status palette class is applied.
-    expect(bar!.className).toContain("bg-[color-mix(in_srgb,var(--status-idle)_40%,transparent)]");
-  });
-
-  it("source icon sits in a circular tertiary-surface chip above the rail bar", () => {
+  it("status chip is the sole status carrier and sits inline in the name row", () => {
     const { container } = render(
       <SessionCard session={makeSession({ status: "idle" })} {...defaultProps} />,
     );
@@ -1038,8 +1077,34 @@ describe("SessionCard left-gutter mosaic rail", () => {
     expect(icon!.className).toContain("rounded-full");
     expect(icon!.className).toMatch(/w-4/);
     expect(icon!.className).toMatch(/h-4/);
-    // Chip sits above the rail bar via z-10.
-    expect(icon!.className).toMatch(/z-10/);
+    // Must not shrink when the session name is long.
+    expect(icon!.className).toMatch(/flex-shrink-0/);
+    // Source + status moved onto the chip when the gutter was deleted.
+    expect(icon!.getAttribute("title")).toContain("idle");
+  });
+
+  it("card draws a 9px tick into the folder rail and slims its left padding", () => {
+    const { container } = render(
+      <SessionCard session={makeSession({ status: "idle" })} {...defaultProps} />,
+    );
+    const card = container.querySelector("[data-testid='session-card-desktop']") as HTMLElement | null;
+    expect(card).toBeTruthy();
+    // Tick connector into the directory rail.
+    expect(card!.className).toContain("before:-left-[11px]");
+    expect(card!.className).toContain("before:w-[9px]");
+    expect(card!.className).toContain("before:bg-[var(--rail-directory)]");
+    // Left padding slimmed 8px -> 6px; right padding untouched.
+    expect(card!.className).toMatch(/pl-1\.5/);
+    expect(card!.className).toMatch(/pr-2/);
+    // Hover group drives the drag bead reveal.
+    expect(card!.className).toContain("group/card");
+  });
+
+  it("renders no drag bead when the card is not inside a sortable wrapper", () => {
+    const { container } = render(
+      <SessionCard session={makeSession({ status: "idle" })} {...defaultProps} />,
+    );
+    expect(container.querySelector("[data-testid='drag-handle-session']")).toBeNull();
   });
 });
 
@@ -1409,5 +1474,253 @@ describe("SessionCard — +Worktree button (session-card-plus-session-button)", 
     render(<SessionCard session={makeSession()} {...defaultProps} onSpawnSibling={() => {}} onSpawnWorktree={() => {}} />);
     expect(screen.getByTestId("session-card-spawn-sibling")).toBeTruthy();
     expect(screen.getByTestId("session-card-spawn-worktree")).toBeTruthy();
+  });
+});
+
+/**
+ * D7 — a prompt raised WITHOUT an `ask_user` tool call (flow adapter, plugin)
+ * now sets `currentTool`. `ActivityIndicator` suppresses the "Needs you" label
+ * for widget-bar-placed prompts and then falls through to the generic
+ * `currentTool` branch, so the card reads `⚡ ask_user` — deliberately, because
+ * the session IS blocked on the user and "Idle" was a lie.
+ *
+ * Delivered with no client code change; this pins the accepted outcome.
+ *
+ * See change: restore-ask-user-tool-state-on-reconnect, test-plan #F7.
+ */
+describe("SessionCard — widget-bar-placed prompt (test-plan #F7)", () => {
+  it("#F7 shows the ask_user tool label, never 'Idle', when a widget-bar prompt owns the prompt", async () => {
+    const runtime = await import("@blackbelt-technology/dashboard-plugin-runtime");
+    const spy = vi.spyOn(runtime, "useHasWidgetBarPrompt").mockReturnValue(true);
+    try {
+      // `status: "idle"` is the exact pair the change makes newly legal: an
+      // agent_end landed while a prompt is still pending. Pre-change this
+      // session rendered "Idle".
+      const session = makeSession({ status: "idle", currentTool: "ask_user" });
+      render(<SessionCard session={session} {...defaultProps} />);
+
+      expect(screen.getByText("ask_user")).toBeTruthy();
+      expect(screen.queryByText("Idle")).toBeNull();
+      // The chat-routed "Needs you" label stays suppressed — the widget bar
+      // owns the affordance.
+      expect(screen.queryByText("Needs you")).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("#F7 keeps the 'Needs you' label when no widget-bar slot owns the prompt", () => {
+    const session = makeSession({ status: "idle", currentTool: "ask_user" });
+    render(<SessionCard session={session} {...defaultProps} />);
+    expect(screen.getByText("Needs you")).toBeTruthy();
+    expect(screen.queryByText("Idle")).toBeNull();
+  });
+});
+
+/**
+ * Defect 4 — the card could not express a retry at all. The retry branch is one
+ * additional case in the existing `ActivityIndicator` precedence chain; the
+ * dot / shape / rail / capsule channels are deliberately untouched.
+ * See change: unify-retry-visibility (design D3/D4).
+ */
+describe("SessionCard — retry in the activity slot", () => {
+  it("renders '↻ Retry N' when retryAttempt is set", () => {
+    render(<SessionCard session={makeSession({ status: "idle" })} {...defaultProps} retryAttempt={2} />);
+    expect(screen.getAllByText(/Retry 2/).length).toBeGreaterThan(0);
+    expect(screen.queryByText("Idle")).toBeNull();
+  });
+
+  it("renders NO retry label when retryAttempt is absent", () => {
+    render(<SessionCard session={makeSession({ status: "idle" })} {...defaultProps} />);
+    expect(screen.queryByText(/Retry \d/)).toBeNull();
+    expect(screen.getAllByText("Idle").length).toBeGreaterThan(0);
+  });
+
+  it("retry BEATS currentTool and streaming (no 'Thinking…' during a backoff)", () => {
+    const { unmount } = render(
+      <SessionCard session={makeSession({ status: "streaming", currentTool: "bash" })} {...defaultProps} retryAttempt={3} />,
+    );
+    expect(screen.getAllByText(/Retry 3/).length).toBeGreaterThan(0);
+    expect(screen.queryByText("bash")).toBeNull();
+    expect(screen.queryByText("Thinking…")).toBeNull();
+    unmount();
+  });
+
+  it("ask_user BEATS retry — blocked-on-you stays the most urgent signal", () => {
+    render(<SessionCard session={makeSession({ status: "idle", currentTool: "ask_user" })} {...defaultProps} retryAttempt={4} />);
+    expect(screen.getAllByText("Needs you").length).toBeGreaterThan(0);
+    expect(screen.queryByText(/Retry 4/)).toBeNull();
+  });
+
+  it("an ENDED session still renders no activity label, retry or not", () => {
+    render(<SessionCard session={makeSession({ status: "ended" })} {...defaultProps} retryAttempt={2} />);
+    expect(screen.queryByText(/Retry 2/)).toBeNull();
+  });
+
+  it("the retry label uses --severity-warning-fg, never raw --status-working", () => {
+    const { container } = render(
+      <SessionCard session={makeSession({ status: "idle" })} {...defaultProps} retryAttempt={2} />,
+    );
+    const label = [...container.querySelectorAll("span")].find((s) => /Retry 2/.test(s.textContent ?? ""));
+    expect(label).toBeTruthy();
+    expect(label!.className).toContain("text-[var(--severity-warning-fg)]");
+    expect(label!.className).not.toContain("--status-working");
+  });
+});
+
+describe("SessionCard — OPENSPEC subcard readiness (add-openspec-init-affordances)", () => {
+  const baseProps = {
+    ...defaultProps,
+    onSendPrompt: () => {},
+    onAttachProposal: () => {},
+    onDetachProposal: () => {},
+  };
+
+  it("ABSENT hides the OPENSPEC subcard entirely", () => {
+    render(
+      <SessionCard
+        session={makeSession()}
+        {...baseProps}
+        openspecChanges={[]}
+        openspecHasDir={false}
+        openspecInitialized={false}
+        openspecPending={false}
+        openspecReadiness={{ state: "ABSENT" }}
+      />,
+    );
+    expect(screen.queryByText("OPENSPEC")).toBeNull();
+  });
+
+  it("BROKEN renders a disabled panel: title OPENSPEC, no action controls in the DOM, exactly one focusable control", () => {
+    const { container } = render(
+      <SessionCard
+        session={makeSession()}
+        {...baseProps}
+        openspecChanges={[]}
+        openspecHasDir={true}
+        openspecInitialized={false}
+        openspecPending={false}
+        openspecReadiness={{ state: "BROKEN", reason: "missing-changes-dir" }}
+        onSeekToFolderOpenSpec={() => {}}
+      />,
+    );
+    // Title still renders (empty-subcard exemption).
+    expect(screen.getByText("OPENSPEC")).toBeTruthy();
+    // The live control set is REMOVED from the DOM, not dimmed.
+    expect(screen.queryByTestId("session-openspec-actions")).toBeNull();
+    expect(screen.queryByTestId("explore-btn")).toBeNull();
+    expect(screen.queryByTestId("propose-btn")).toBeNull();
+    expect(screen.queryByTestId("attach-combo")).toBeNull();
+    expect(screen.queryByTestId("archive-btn")).toBeNull();
+    // Exactly one focusable control inside the disabled panel.
+    const panel = screen.getByTestId("session-openspec-disabled");
+    const focusable = panel.querySelectorAll(
+      "button, a, [role='button'], input, select, textarea, [tabindex]:not([tabindex='-1'])",
+    );
+    expect(focusable.length).toBe(1);
+    void container;
+  });
+
+  it("BROKEN reason text differs from the STALE reason texts", () => {
+    const broken = render(
+      <SessionCard
+        session={makeSession()}
+        {...baseProps}
+        openspecChanges={[]}
+        openspecReadiness={{ state: "BROKEN", reason: "missing-changes-dir" }}
+        onSeekToFolderOpenSpec={() => {}}
+      />,
+    );
+    const brokenText = screen.getByTestId("session-openspec-disabled-reason").textContent;
+    broken.unmount();
+
+    render(
+      <SessionCard
+        session={makeSession()}
+        {...baseProps}
+        openspecChanges={[]}
+        openspecReadiness={{ state: "STALE", reason: "missing-skills" }}
+        onSeekToFolderOpenSpec={() => {}}
+      />,
+    );
+    const staleText = screen.getByTestId("session-openspec-disabled-reason").textContent;
+    expect(brokenText).not.toBe(staleText);
+  });
+
+  it("STALE·missing-skills reason text says the project's OpenSpec skills are missing", () => {
+    render(
+      <SessionCard
+        session={makeSession()}
+        {...baseProps}
+        openspecChanges={[]}
+        openspecReadiness={{ state: "STALE", reason: "missing-skills" }}
+        onSeekToFolderOpenSpec={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("session-openspec-disabled-reason").textContent).toContain("skills");
+  });
+
+  it("BROKEN routes its single control to the folder OpenSpec section, never to Settings", () => {
+    const onSeekToFolderOpenSpec = vi.fn();
+    const onOpenOpenSpecSettings = vi.fn();
+    render(
+      <SessionCard
+        session={makeSession()}
+        {...baseProps}
+        openspecChanges={[]}
+        openspecReadiness={{ state: "BROKEN", reason: "cli-failed" }}
+        onSeekToFolderOpenSpec={onSeekToFolderOpenSpec}
+        onOpenOpenSpecSettings={onOpenOpenSpecSettings}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("session-openspec-remediate"));
+    expect(onSeekToFolderOpenSpec).toHaveBeenCalledWith("/home/user/project");
+    expect(onOpenOpenSpecSettings).not.toHaveBeenCalled();
+  });
+
+  it("STALE·profile-stale routes its single control to Settings, never to the folder", () => {
+    const onSeekToFolderOpenSpec = vi.fn();
+    const onOpenOpenSpecSettings = vi.fn();
+    render(
+      <SessionCard
+        session={makeSession()}
+        {...baseProps}
+        openspecChanges={[]}
+        openspecReadiness={{ state: "STALE", reason: "profile-stale" }}
+        onSeekToFolderOpenSpec={onSeekToFolderOpenSpec}
+        onOpenOpenSpecSettings={onOpenOpenSpecSettings}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("session-openspec-remediate"));
+    expect(onOpenOpenSpecSettings).toHaveBeenCalledTimes(1);
+    expect(onSeekToFolderOpenSpec).not.toHaveBeenCalled();
+  });
+
+  it("legacy payload (readiness undefined) renders the live subcard exactly as before — never disabled", () => {
+    render(
+      <SessionCard
+        session={makeSession()}
+        {...baseProps}
+        openspecChanges={[]}
+        openspecHasDir={true}
+        openspecInitialized={false}
+        openspecPending={false}
+      />,
+    );
+    expect(screen.getByText("OPENSPEC")).toBeTruthy();
+    expect(screen.getByTestId("session-openspec-actions")).toBeTruthy();
+    expect(screen.queryByTestId("session-openspec-disabled")).toBeNull();
+  });
+
+  it("legacy payload with no signals preserves visibility (older parent default)", () => {
+    render(
+      <SessionCard
+        session={makeSession()}
+        {...baseProps}
+        openspecChanges={[]}
+      />,
+    );
+    expect(screen.getByTestId("session-openspec-actions")).toBeTruthy();
+    expect(screen.queryByTestId("session-openspec-disabled")).toBeNull();
   });
 });

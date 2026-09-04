@@ -9,13 +9,14 @@
  *
  * See change: doctor-rich-output (tasks 4.4–4.5).
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import Fastify, { type FastifyInstance } from "fastify";
-import { registerDoctorRoutes } from "../routes/doctor-routes.js";
+
 import type {
   DoctorReport,
   SharedChecksDeps,
 } from "@blackbelt-technology/pi-dashboard-shared/doctor-core.js";
+import Fastify, { type FastifyInstance } from "fastify";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { registerDoctorRoutes } from "../routes/doctor-routes.js";
 
 const ELECTRON_ONLY_NAMES = new Set([
   "Electron",
@@ -189,10 +190,14 @@ describe("/api/doctor", () => {
       const elapsed = Date.now() - start;
 
       expect(res.statusCode).toBe(200);
-      // Must complete well under the old 3 s curl timeout. The full
-      // doctor run includes binary-detection checks that can take ~1 s
-      // on slow CI; we just assert no self-curl deadlock (< 3 s).
-      expect(elapsed).toBeLessThan(3000);
+      // Wall-clock is a WEAK proxy for the deadlock: a real self-curl deadlock
+      // and a healthy-but-loaded run both exceed a tight bound, so a 3 s limit
+      // cannot discriminate between them — it only flaked (observed 3098 ms on
+      // a busy host while the deadlock was absent). The DEADLOCK signal is the
+      // `Dashboard server` row asserted below: a self-curl that deadlocks
+      // reports a timeout/error row, never "ok". This bound is kept only to
+      // catch an outright hang, so it is set well clear of scheduler noise.
+      expect(elapsed).toBeLessThan(15_000);
 
       // The server check row should say "running" / "ok" since we are
       // processing this request inside the running server.
@@ -293,13 +298,13 @@ describe("/api/doctor", () => {
     expect(stale).toBeUndefined();
   });
 
-  it("emits the legacy advisory row when the detector reports present", async () => {
+  it("emits the legacy advisory row when the detector reports an orphaned dir", async () => {
     app = await makeApp(() =>
       fakeDeps({
         detectLegacyManagedDir: () => ({
           present: true,
+          orphaned: true,
           path: "/fake/home/.pi-dashboard",
-          pkgCount: 3,
           sizeMb: 17,
         }),
       }),

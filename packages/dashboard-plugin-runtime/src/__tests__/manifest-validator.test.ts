@@ -38,6 +38,14 @@ describe("validateManifest — valid cases", () => {
     expect(m.fixture).toBe(true);
   });
 
+  it("accepts a composer-panel claim (change: make-grammar-fully-plugin-contained)", () => {
+    const m = validateManifest({
+      ...validManifest,
+      claims: [{ slot: "composer-panel", component: "GrammarPanel" }],
+    });
+    expect(m.claims[0].slot).toBe("composer-panel");
+  });
+
   it("accepts settings-section claim without tab (defaults handled downstream)", () => {
     const m = validateManifest({
       ...validManifest,
@@ -75,17 +83,27 @@ describe("validateManifest — invalid cases", () => {
     }
   });
 
-  it("throws on unknown tab value for settings-section", () => {
-    try {
+  // `tab` is inert since plugin-settings-pages (design D3), so a value outside
+  // the enumerated set is no longer a load failure. Kept here (in the
+  // invalid-cases block it used to fail in) as the regression sentinel.
+  // (test-plan #E12)
+  it("still rejects a non-string tab", () => {
+    // The VALUE is inert, but `tab` is copied onto the normalized claim, so the
+    // TYPE still has to hold. (plugin-settings-pages)
+    expect(() =>
       validateManifest({
         ...validManifest,
-        claims: [{ slot: "settings-section", tab: "nonexistent" }],
-      });
-      expect.fail("should have thrown");
-    } catch (e) {
-      expect(e).toBeInstanceOf(ManifestValidationError);
-      expect((e as ManifestValidationError).reason).toContain("nonexistent");
-    }
+        claims: [{ slot: "settings-section", tab: 42 }],
+      }),
+    ).toThrow(ManifestValidationError);
+  });
+
+  it("accepts an unknown tab value for settings-section", () => {
+    const manifest = validateManifest({
+      ...validManifest,
+      claims: [{ slot: "settings-section", tab: "nonexistent" }],
+    });
+    expect(manifest.claims[0].tab).toBe("nonexistent");
   });
 
   it("throws on duplicate tool-renderer claims for same toolName", () => {
@@ -214,5 +232,43 @@ describe("validateManifest — shell-overlay-route depth (fix-plugin-and-scoped-
     expect(() => validateManifest(overlay({ depth: 2, parentPath: "folder/x" }))).toThrow(
       ManifestValidationError,
     );
+  });
+});
+
+describe("validateManifest — shell-overlay-route presentation (add-route-backed-overlay-dialogs)", () => {
+  const overlay = (extra: Record<string, unknown>) => ({
+    ...validManifest,
+    claims: [
+      { slot: "shell-overlay-route", component: "Foo", path: "/foo/:id", depth: 1, ...extra },
+    ],
+  });
+
+  it("passes through presentation: \"dialog\"", () => {
+    expect(validateManifest(overlay({ presentation: "dialog" })).claims[0].presentation).toBe(
+      "dialog",
+    );
+  });
+
+  it("passes through presentation: \"page\"", () => {
+    expect(validateManifest(overlay({ presentation: "page" })).claims[0].presentation).toBe("page");
+  });
+
+  it("omits presentation when absent (the shell applies the dialog default at render)", () => {
+    expect(validateManifest(overlay({})).claims[0].presentation).toBeUndefined();
+  });
+
+  it("REJECTS an unrecognised presentation instead of warn-and-defaulting", () => {
+    // Fatal on purpose: a typo silently falling back to "dialog" would hand the
+    // author exactly the behaviour they wrote the field to opt OUT of. The
+    // `depth` field's warn-and-default precedent is the argument FOR this — a
+    // non-fatal warning let four claims ship with broken back navigation.
+    expect(() => validateManifest(overlay({ presentation: "modal" }))).toThrow(
+      ManifestValidationError,
+    );
+    expect(() => validateManifest(overlay({ presentation: "modal" }))).toThrow(/"page" or "dialog"/);
+  });
+
+  it("REJECTS a non-string presentation rather than coercing", () => {
+    expect(() => validateManifest(overlay({ presentation: 42 }))).toThrow(ManifestValidationError);
   });
 });

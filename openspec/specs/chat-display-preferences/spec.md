@@ -10,11 +10,15 @@ opt-out so non-technical users can hide noise without learning what
 "thinking" or "tool result" means first. `ask_user` is non-hidable.
 
 See change: configurable-chat-display.
+
 ## Requirements
+
 ### Requirement: Global display preferences SHALL gate chat-view elements
-The dashboard MUST persist a `DisplayPrefs` object in `preferences.json` controlling which chat-view elements render. The schema SHALL include boolean flags for `tokenStatsBar`, `contextUsageBar`, `reasoning`, `toolResults`, `turnMetadata`, `debugTools`, plus a `toolCalls` sub-object with booleans `read`, `bash`, `edit`, `agent`, `generic`. The schema SHALL also include a numeric `reasoningAutoCollapseMs` controlling how long a live-streamed reasoning block stays expanded after it completes before auto-collapsing.
+The dashboard MUST persist a `DisplayPrefs` object in `preferences.json` controlling which chat-view elements render. The schema SHALL include boolean flags for `tokenStatsBar`, `contextUsageBar`, `reasoning`, `toolResults`, `turnMetadata`, `debugTools`, plus a `toolCalls` sub-object with booleans `read`, `bash`, `edit`, `agent`, `generic`, plus a `customEventGroups` sub-object mapping custom event group ids to booleans. The schema SHALL also include a numeric `reasoningAutoCollapseMs` controlling how long a live-streamed reasoning block stays expanded after it completes before auto-collapsing.
 
 `reasoningAutoCollapseMs` SHALL default to `30000` (30 seconds). A value of `0` SHALL mean "never auto-collapse" — a live-streamed reasoning block stays expanded until the user collapses it. The value SHALL only affect live-streamed reasoning blocks; replayed blocks are unaffected.
+
+`customEventGroups` SHALL be an open keyspace keyed by the group ids defined in the custom event groups configuration. A group id absent from the object SHALL resolve to that group's configured `default` visibility, so a preferences file that predates a group never hides it implicitly.
 
 #### Scenario: Reasoning hidden when disabled
 - **GIVEN** global `displayPrefs.reasoning = false`
@@ -39,6 +43,12 @@ The dashboard MUST persist a `DisplayPrefs` object in `preferences.json` control
 - **THEN** the stored and broadcast `reasoningAutoCollapseMs` SHALL retain its prior value
 - **AND** SHALL NOT be reset to `undefined`
 
+#### Scenario: Unknown group id falls back to its configured default
+- **GIVEN** a stored `customEventGroups` object that has no key for a configured group
+- **WHEN** effective visibility for that group is computed
+- **THEN** the group's configured `default` SHALL be used
+- **AND** the group SHALL NOT be treated as hidden merely because the key is absent
+
 ### Requirement: Per-session overrides SHALL deep-merge over global prefs
 Per-session `displayPrefsOverride` SHALL deep-merge over the global `DisplayPrefs` via `mergeDisplayPrefs`. Scalar and numeric fields present in the override SHALL win over the global value; absent fields SHALL fall through to global. `reasoningAutoCollapseMs` SHALL follow the same rule, and an override value of `0` SHALL be preserved (not coerced to the default).
 
@@ -59,7 +69,7 @@ Per-session `displayPrefsOverride` SHALL deep-merge over the global `DisplayPref
 The server SHALL expose:
 
 - `GET /api/preferences/display` returning the current `DisplayPrefs` or HTTP 200 with `displayPrefs: undefined` when never seeded.
-- `PATCH /api/preferences/display` accepting `Partial<DisplayPrefs>` and deep-merging into the stored prefs (toolCalls merged field-by-field).
+- `PATCH /api/preferences/display` accepting `Partial<DisplayPrefs>` and deep-merging into the stored prefs (`toolCalls` and `customEventGroups` merged field-by-field).
 
 On any successful PATCH, the server MUST broadcast `display_prefs_updated { prefs: DisplayPrefs }` to every connected browser socket. Connected clients MUST update their local store on receipt without page reload.
 
@@ -67,7 +77,7 @@ The server MUST ALSO send a `display_prefs_updated { prefs }` snapshot to each b
 
 A browser-to-server WS message `setSessionDisplayPrefs { sessionId, override }` SHALL update the per-session override. `override: null` clears it.
 
-The server SHALL broadcast `session_updated` with `updates.displayPrefsOverride: null` (not `undefined`) so the field survives JSON serialization. The client's `getSessionOverride` SHALL normalize `null` to `undefined` before returning to consumers.
+The server SHALL broadcast `session_updated` with `updates.displayPrefsOverride: null` (not `undefined`) so the field survives JSON serialization. The client's `getSessionOverride` SHALL normalize `null` to `undefined` before returning to consumers, so a cleared session merges as pure global prefs and its "modified" indicator turns off without a page reload.
 
 #### Scenario: PATCH broadcasts to other tabs
 - **GIVEN** two browser tabs A and B connected to the same server
@@ -93,10 +103,23 @@ The server SHALL broadcast `session_updated` with `updates.displayPrefsOverride:
 - **AND** `JSON.stringify` does not drop the field
 - **AND** all connected browsers apply the clear
 
+#### Scenario: Client normalizes cleared override to undefined
+- **GIVEN** a session whose in-memory record carries `displayPrefsOverride: null` after applying a clearing `session_updated` broadcast
+- **WHEN** a consumer reads the override via `getSessionOverride(sessionId)`
+- **THEN** the returned value SHALL be `undefined`, not `null`
+- **AND** `useDisplayPrefs` SHALL merge to pure global prefs (no override applied)
+- **AND** the `ChatViewMenu` "modified" pill SHALL NOT render for that session
+
 #### Scenario: PATCH deep-merges toolCalls
 - **GIVEN** stored `toolCalls = { read:true, bash:true, edit:true, agent:true, generic:true }`
 - **WHEN** a PATCH body of `{ toolCalls: { bash: false } }` is applied
 - **THEN** stored `toolCalls.bash = false` and every other `toolCalls.*` field is unchanged
+
+#### Scenario: PATCH deep-merges customEventGroups
+- **GIVEN** stored `customEventGroups = { memory:false, search:true, subagents:true }`
+- **WHEN** a PATCH body of `{ customEventGroups: { search: false } }` is applied
+- **THEN** stored `customEventGroups.search = false` and every other `customEventGroups.*` field is unchanged
+- **AND** the merge SHALL NOT drop keys for groups absent from the PATCH body
 
 ### Requirement: First-launch SHALL prompt the user to choose a preset
 
@@ -251,3 +274,177 @@ The per-session display-preferences popover (the "⚙ View" `ChatViewMenu`) SHAL
 - **THEN** the global `reserveProcessLineAtIdle` SHALL be patched
 - **AND** the per-session chat-view menu SHALL expose the same control as an override, marked when it differs from global
 
+### Requirement: Notify minimum-level display preference
+
+`DisplayPrefs` SHALL include a field `notifyMinLevel` of type
+`"all" | "success" | "warnings" | "errors"` controlling the minimum
+`ctx.ui.notify` level that renders as a chat row. It SHALL be part of all three
+presets and of the sparse merge, exactly like other top-level `DisplayPrefs`
+fields.
+
+The severity ladder SHALL be `info < success < warning < error`. `success`
+SHALL rank ABOVE `info` — a success notify reports an outcome, whereas info is
+chatter — so `"success"` means "outcomes and problems, no chatter". This
+ordering is a deliberate product decision and SHALL be documented at the type
+definition.
+
+The axis SHALL NOT include an "off" value. `"errors"` is its floor: an
+`error`-level notify SHALL render at every setting.
+
+Neither write path validates the value: `PATCH /api/preferences/display` merges
+the partial as stored, the per-session override is persisted as received, and
+the preferences file is a documented hand-editable surface. The predicate SHALL
+therefore treat an unrecognized `notifyMinLevel` value as `"all"`, so that no
+stored value can suppress an `error` notify.
+
+`shared` SHALL export a single predicate that decides visibility of one row
+against one `notifyMinLevel`. Both chat-view gate sites SHALL consume that one
+predicate rather than re-deriving the comparison. Because `shared` cannot import
+the client row type, the predicate SHALL accept a structural row shape covering
+only the discriminator fields, and each gate site SHALL adapt its local object
+to that shape rather than re-implementing the check against its own field names.
+
+#### Scenario: Field present in every preset
+- **GIVEN** the `DISPLAY_PRESETS` map
+- **WHEN** any preset is read
+- **THEN** it SHALL define `notifyMinLevel`
+- **AND** `simple`, `standard` and `everything` SHALL all default it to `"all"`
+
+#### Scenario: Level ranking places success above info
+- **GIVEN** `notifyMinLevel = "success"`
+- **WHEN** visibility is evaluated for each level
+- **THEN** `success`, `warning` and `error` SHALL be visible
+- **AND** `info` SHALL be hidden
+
+#### Scenario: Errors survive the strictest setting
+- **GIVEN** `notifyMinLevel = "errors"`
+- **WHEN** visibility is evaluated for an `error`-level notify
+- **THEN** it SHALL be visible
+- **AND** no value of `notifyMinLevel` SHALL exist that hides it
+
+#### Scenario: Unrecognized minimum-level value fails open
+- **GIVEN** a persisted or overridden `notifyMinLevel` that is not one of `all`, `success`, `warnings`, `errors`
+- **WHEN** visibility is evaluated for notify rows at every level
+- **THEN** the floor SHALL be treated as `"all"`
+- **AND** every notify row SHALL be visible, including `error`
+- **AND** the comparison SHALL NOT yield `false` for all rows via an undefined rank
+
+#### Scenario: Unrecognized level normalizes to info
+- **GIVEN** a notify row whose `params.level` is absent or is not one of `info`, `success`, `warning`, `error`
+- **WHEN** visibility is evaluated
+- **THEN** the level SHALL be treated as `info`, matching `normalizeNotifyLevel`
+
+#### Scenario: Per-session override wins over global
+- **GIVEN** global prefs with `notifyMinLevel: "all"`
+- **AND** a per-session override with `notifyMinLevel: "errors"`
+- **WHEN** `mergeDisplayPrefs(global, override)` is evaluated
+- **THEN** the effective value SHALL be `"errors"`
+
+#### Scenario: Absent override falls back to global
+- **GIVEN** global prefs with `notifyMinLevel: "warnings"`
+- **AND** a per-session override that omits `notifyMinLevel`
+- **WHEN** `mergeDisplayPrefs(global, override)` is evaluated
+- **THEN** the effective value SHALL be `"warnings"`
+
+#### Scenario: Legacy preferences file is backfilled
+- **GIVEN** a persisted `preferences.json` whose `displayPrefs` predates the field and has no `notifyMinLevel`
+- **WHEN** the preferences store loads it
+- **THEN** `notifyMinLevel` SHALL be set to `"all"` before it reaches any client
+- **AND** the client SHALL never observe `notifyMinLevel` as `undefined`
+
+#### Scenario: Partial PATCH preserves the field
+- **GIVEN** a stored `notifyMinLevel` value
+- **WHEN** a `PATCH /api/preferences/display` updates a different display field and omits `notifyMinLevel`
+- **THEN** the stored and broadcast `notifyMinLevel` SHALL retain its prior value
+- **AND** SHALL NOT be reset to `undefined`
+
+#### Scenario: Configurable from both settings surfaces
+- **GIVEN** the global Settings panel
+- **WHEN** the user changes the notify-level control
+- **THEN** the global `notifyMinLevel` SHALL be patched
+- **AND** the per-session chat-view menu SHALL expose the same 4-value control as an override, marked when it differs from global
+
+### Requirement: Notify rows SHALL be hidable; blocking asks SHALL NOT
+
+The rule that inline interactive-UI rows always render SHALL be narrowed to
+**blocking** interactive rows. A `ctx.ui.notify` row is fire-and-forget —
+nothing in the session waits on it — and SHALL be gated by `notifyMinLevel`.
+
+A row that solicits an answer (`ask_user`, `select`, `confirm`, `input`, and any
+future prompt kind) SHALL remain non-hidable at every value of every display
+preference, because hiding an unanswered ask stalls the session with no visible
+cause.
+
+The gate SHALL identify a notify row by its own discriminator, and SHALL NOT
+identify it by `role === "interactiveUi"` nor by the presence of a level field.
+The predicate SHALL fail open: a row it cannot positively classify as a notify
+SHALL render.
+
+#### Scenario: A blocking ask renders at the strictest setting
+- **GIVEN** `notifyMinLevel = "errors"`
+- **WHEN** the chat view renders an unanswered `ask_user`, `select`, `confirm` or `input` row
+- **THEN** the row SHALL render
+- **AND** the session SHALL remain answerable
+
+#### Scenario: Unclassifiable interactive row renders
+- **GIVEN** an `interactiveUi` row that the notify predicate does not positively identify as a notify
+- **WHEN** visibility is evaluated at any `notifyMinLevel`
+- **THEN** the row SHALL render
+
+### Requirement: reasoningInlineFlow and customEventGroups display preferences
+`DisplayPrefs` SHALL include `reasoningInlineFlow: boolean` and `customEventGroups: Record<string, boolean>`. `reasoningInlineFlow` SHALL default to `false` in every preset (`simple`, `standard`, `everything`) and in the legacy-backfill path. `customEventGroups` SHALL default to an object seeding each configured group id with that group's configured `default` visibility, so out-of-the-box behavior matches the shipped configuration.
+
+The `customEntryFallback` boolean is REMOVED from `DisplayPrefs`; the catch-all `other` group entry in `customEventGroups` replaces it.
+
+The legacy defaults SHALL be injected at every `DisplayPrefs` construction site for persisted prefs — the server's per-field backfill (`backfillDisplayPrefs`) and the `setDisplayPrefs` base/merged literals — not only in `mergeDisplayPrefs`, because a legacy file without the fields must resolve to the defaults (a missing `customEventGroups` backfill would leave every group gate `undefined` and hide custom rows for existing users). `mergeDisplayPrefs` SHALL resolve `reasoningInlineFlow` as a plain top-level arm (override value when present, else global), and SHALL resolve `customEventGroups` by shallow field-by-field merge, exactly as it resolves `toolCalls` — an override key present wins for that group id only, and every group id absent from the override falls through to the global value. Existing persisted preferences files and per-session overrides without the new fields SHALL load unchanged and resolve to the defaults.
+
+#### Scenario: Defaults preserve current behavior
+- **WHEN** a preferences file predates the new fields (or a fresh preset is applied)
+- **THEN** the effective prefs SHALL resolve `reasoningInlineFlow` to `false`
+- **AND** `customEventGroups` SHALL resolve each configured group to its configured `default`
+- **AND** a legacy global file without the fields SHALL resolve them via the server backfill (not stay `undefined`)
+
+#### Scenario: Per-session override wins
+- **WHEN** a per-session override sets `reasoningInlineFlow`
+- **THEN** `mergeDisplayPrefs` SHALL return the override value for that field and the global value for every other field
+
+#### Scenario: Per-session override merges customEventGroups field-by-field
+- **GIVEN** global `customEventGroups = { memory:false, search:true }`
+- **AND** a per-session override `{ customEventGroups: { memory: true } }`
+- **WHEN** effective prefs are computed
+- **THEN** the result SHALL have `customEventGroups.memory = true` and `customEventGroups.search = true`
+- **AND** the override SHALL NOT replace the whole object
+
+#### Scenario: PATCH round-trips the new fields
+- **WHEN** a client PATCHes `/api/preferences/display` with the new fields (globally or as a per-session override)
+- **THEN** the fields SHALL persist, broadcast via `display_prefs_updated`, and be included in the connect snapshot
+
+### Requirement: customEntryFallback SHALL migrate once to the other group
+On upgrade, any persisted `customEntryFallback` value SHALL be migrated to `customEventGroups.other` and the legacy
+field removed, so a user who had already hidden custom chat entries does not have them reappear. The migration SHALL be
+applied to the global `DisplayPrefs` and to every per-session `displayPrefsOverride` that carries the legacy field. The
+migration SHALL be idempotent — once the legacy field is absent, no further action.
+
+#### Scenario: Hidden custom entries stay hidden across upgrade
+- **GIVEN** a persisted global `displayPrefs.customEntryFallback === false`
+- **WHEN** the preferences store loads after upgrade
+- **THEN** `customEventGroups.other` SHALL be `false`
+- **AND** `customEntryFallback` SHALL no longer be present in the stored prefs
+
+#### Scenario: Per-session override carrying the legacy field migrates too
+- **GIVEN** a session whose `displayPrefsOverride` contains `customEntryFallback: false`
+- **WHEN** the migration runs
+- **THEN** that override SHALL carry `customEventGroups: { other: false }`
+- **AND** SHALL no longer carry `customEntryFallback`
+
+#### Scenario: Default-valued legacy field does not force an explicit key
+- **GIVEN** a persisted `customEntryFallback === true` (the legacy default)
+- **WHEN** the migration runs
+- **THEN** the resulting effective visibility of the `other` group SHALL be visible
+- **AND** the legacy field SHALL be removed
+
+#### Scenario: Migration is idempotent
+- **GIVEN** preferences that have already been migrated
+- **WHEN** the preferences store loads again
+- **THEN** no further migration SHALL occur
+- **AND** an explicit user choice for `customEventGroups.other` SHALL NOT be overwritten
