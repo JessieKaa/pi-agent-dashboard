@@ -23,10 +23,29 @@ beforeAll(() => {
   });
 });
 
+/**
+ * Model the container's scroll geometry. `scrollTop` is defined as a CLAMPING
+ * accessor because the browser clamps every write to [0, scrollHeight −
+ * clientHeight] — and that clamp is load-bearing for the bottom-pin tests: the
+ * pin writes `scrollTop = scrollHeight` (an overshoot by clientHeight), and the
+ * clamped value it actually lands on is what `handleScroll` later compares
+ * against. A plain data property would let programmatic writes overshoot and
+ * silently hide any defect about "where the pin really landed".
+ */
 function setScrollPosition(el: Element, scrollTop: number, scrollHeight: number, clientHeight: number) {
-  Object.defineProperty(el, "scrollTop", { value: scrollTop, writable: true, configurable: true });
   Object.defineProperty(el, "scrollHeight", { value: scrollHeight, writable: true, configurable: true });
   Object.defineProperty(el, "clientHeight", { value: clientHeight, writable: true, configurable: true });
+  const maxTop = () => Math.max((el as HTMLElement).scrollHeight - (el as HTMLElement).clientHeight, 0);
+  let current = Math.min(Math.max(scrollTop, 0), maxTop());
+  Object.defineProperty(el, "scrollTop", {
+    configurable: true,
+    get() {
+      return current;
+    },
+    set(v: number) {
+      current = Math.min(Math.max(v, 0), maxTop());
+    },
+  });
 }
 
 function getScrollContainer(container: HTMLElement): HTMLElement {
@@ -110,7 +129,10 @@ describe("ChatView sticky scroll", () => {
     await flushRaf();
 
     const scrollEl = getScrollContainer(container);
-    // Escape
+    // Escape: a real gesture + position move. The wheel clears the
+    // programmatic-write tag the mount pin left, so the position can release
+    // the follow — exactly what a wheel-up in the browser does.
+    fireEvent.wheel(scrollEl, { deltaY: -100 });
     setScrollPosition(scrollEl, 0, 1000, 400);
     fireEvent.scroll(scrollEl);
     expect(container.querySelector('[data-testid="scroll-to-bottom"]')).not.toBeNull();
@@ -120,15 +142,15 @@ describe("ChatView sticky scroll", () => {
     fireEvent.scroll(scrollEl);
     expect(container.querySelector('[data-testid="scroll-to-bottom"]')).toBeNull();
 
-    // New content should now be chased again
-    setScrollPosition(scrollEl, 950, 1500, 400);
+    // New content should now be chased again (clamped max = 1500 − 400).
+    setScrollPosition(scrollEl, 1100, 1500, 400);
     rerender(
       <ThemeProvider>
         <ChatView state={stateWith(50)} toolContext={defaultToolContext} />
       </ThemeProvider>,
     );
 
-    expect(scrollEl.scrollTop).toBe(1500);
+    expect(scrollEl.scrollTop).toBe(1100);
   });
 
   it("one click on scroll-to-bottom survives mid-flight height growth (virtualized rows measuring in)", async () => {
@@ -146,7 +168,10 @@ describe("ChatView sticky scroll", () => {
     await flushRaf();
 
     const scrollEl = getScrollContainer(container);
-    // User is far up the transcript — button visible.
+    // User is far up the transcript — button visible. (Wheel first: a real
+    // gesture, so the position is guaranteed to release any tag a pin left
+    // behind instead of depending on wall-clock proximity to the mount window.)
+    fireEvent.wheel(scrollEl, { deltaY: -100 });
     setScrollPosition(scrollEl, 0, 2000, 400);
     fireEvent.scroll(scrollEl);
     expect(container.querySelector('[data-testid="scroll-to-bottom"]')).not.toBeNull();
@@ -162,14 +187,15 @@ describe("ChatView sticky scroll", () => {
     // The single click must keep the descent latched: button stays hidden…
     expect(container.querySelector('[data-testid="scroll-to-bottom"]')).toBeNull();
 
-    // …and the sticky pin must still chase the (grown) bottom on next content.
+    // …and the sticky pin must still chase the (grown) bottom on next content
+    // (clamped max = 3000 − 400).
     setScrollPosition(scrollEl, 900, 3000, 400);
     rerender(
       <ThemeProvider>
         <ChatView state={stateWith(51)} toolContext={defaultToolContext} />
       </ThemeProvider>,
     );
-    expect(scrollEl.scrollTop).toBe(3000);
+    expect(scrollEl.scrollTop).toBe(2600);
   });
 
   it("user wheel input cancels an in-flight scroll-to-bottom descent", async () => {
@@ -181,6 +207,7 @@ describe("ChatView sticky scroll", () => {
     await flushRaf();
 
     const scrollEl = getScrollContainer(container);
+    fireEvent.wheel(scrollEl, { deltaY: -100 });
     setScrollPosition(scrollEl, 0, 2000, 400);
     fireEvent.scroll(scrollEl);
     fireEvent.click(container.querySelector('[data-testid="scroll-to-bottom"]')!);
@@ -192,6 +219,92 @@ describe("ChatView sticky scroll", () => {
 
     // Escape respected: button re-appears, no forced pin.
     expect(container.querySelector('[data-testid="scroll-to-bottom"]')).not.toBeNull();
+  });
+
+  it("keeps following after a measurement clamps the bottom-pin (no gesture, scrollTop frozen)", async () => {
+    // Trace shape from the live defect (session lands mid-conversation on
+    // mobile): the stick effect pins el.scrollTop = el.scrollHeight, a row
+    // below the viewport measures in before the induced scroll event
+    // dispatches, so that event reads nearBottom=false while scrollTop still
+    // equals the value our own write achieved. No user gesture is involved —
+    // clearing the follow here stranded the view wherever growth stopped.
+    // See change: fix-ux-degradation-long-session.
+    const { container, rerender } = render(
+      <ThemeProvider>
+        <ChatView state={stateWith(50)} toolContext={defaultToolContext} />
+      </ThemeProvider>,
+    );
+    await flushRaf();
+
+    const scrollEl = getScrollContainer(container);
+    // User is at the bottom → follow armed (clamped max = 2400 − 400).
+    setScrollPosition(scrollEl, 2000, 2400, 400);
+    fireEvent.scroll(scrollEl);
+    expect(container.querySelector('[data-testid="scroll-to-bottom"]')).toBeNull();
+
+    // Content arrives: the stick effect pins to the bottom, landing clamped at
+    // the max (2400 − 400 = 2000).
+    rerender(
+      <ThemeProvider>
+        <ChatView state={stateWith(51)} toolContext={defaultToolContext} />
+      </ThemeProvider>,
+    );
+    expect(scrollEl.scrollTop).toBe(2000);
+
+    // A measurement grows scrollHeight AFTER the pin wrote, WITHOUT moving the
+    // view — then the pin's own scroll event dispatches: nearBottom is false
+    // (2600 − 2000 − 400 = 200), scrollTop still equals the pinned value.
+    setScrollPosition(scrollEl, 2000, 2600, 400);
+    fireEvent.scroll(scrollEl);
+
+    // The clamp must not surface the escape affordance nor clear the follow.
+    expect(container.querySelector('[data-testid="scroll-to-bottom"]')).toBeNull();
+
+    // …and the next growth is chased to the new bottom (clamped max = 3000 − 400).
+    setScrollPosition(scrollEl, 2000, 3000, 400);
+    rerender(
+      <ThemeProvider>
+        <ChatView state={stateWith(52)} toolContext={defaultToolContext} />
+      </ThemeProvider>,
+    );
+    expect(scrollEl.scrollTop).toBe(2600);
+  });
+
+  it("still releases the pin when the view moves above the pinned position without a wheel/touch gesture", async () => {
+    // Mirror guard: a scrollbar drag or keyboard scroll moves scrollTop
+    // directly — no wheel/touch listener fires, so only the position can
+    // reveal that the user left the bottom. Landing below the value the pin
+    // achieved must release the follow exactly like the else-branch always did.
+    const { container, rerender } = render(
+      <ThemeProvider>
+        <ChatView state={stateWith(50)} toolContext={defaultToolContext} />
+      </ThemeProvider>,
+    );
+    await flushRaf();
+
+    const scrollEl = getScrollContainer(container);
+    setScrollPosition(scrollEl, 2000, 2400, 400);
+    fireEvent.scroll(scrollEl);
+    rerender(
+      <ThemeProvider>
+        <ChatView state={stateWith(51)} toolContext={defaultToolContext} />
+      </ThemeProvider>,
+    );
+    expect(scrollEl.scrollTop).toBe(2000); // pinned, clamped to max
+
+    // The user drags the scrollbar up while the pin's window is still open.
+    setScrollPosition(scrollEl, 1200, 2600, 400);
+    fireEvent.scroll(scrollEl);
+    expect(container.querySelector('[data-testid="scroll-to-bottom"]')).not.toBeNull();
+
+    // Later growth must NOT yank the view back down.
+    setScrollPosition(scrollEl, 1200, 3000, 400);
+    rerender(
+      <ThemeProvider>
+        <ChatView state={stateWith(52)} toolContext={defaultToolContext} />
+      </ThemeProvider>,
+    );
+    expect(scrollEl.scrollTop).toBe(1200);
   });
 });
 
@@ -248,7 +361,7 @@ describe("ChatView scroll-to-top", () => {
 
     // A scroll event still reporting near-bottom must NOT re-arm the pin
     // (ascendingRef branch holds stickToBottomRef false).
-    setScrollPosition(scrollEl, 950, 1000, 400);
+    setScrollPosition(scrollEl, 600, 1000, 400);
     fireEvent.scroll(scrollEl);
 
     // More streaming content arrives with grown height. Because follow is
@@ -256,12 +369,12 @@ describe("ChatView scroll-to-top", () => {
     const before = scrollEl.scrollTop;
     const more = stateWith(60);
     more.streamingText = "still typing…";
-    setScrollPosition(scrollEl, 950, 2000, 400);
+    setScrollPosition(scrollEl, 600, 2000, 400);
     rerender(
       <ThemeProvider>
         <ChatView state={more} toolContext={defaultToolContext} />
       </ThemeProvider>,
     );
-    expect(scrollEl.scrollTop).toBe(before); // not yanked to scrollHeight (2000)
+    expect(scrollEl.scrollTop).toBe(before); // not yanked to the grown bottom (1600)
   });
 });

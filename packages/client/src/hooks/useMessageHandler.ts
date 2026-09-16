@@ -68,6 +68,7 @@ import {
   publishSessionEvents,
 } from "@blackbelt-technology/dashboard-plugin-runtime";
 import { applyPluginConfigUpdate, getPluginConfig } from "@blackbelt-technology/dashboard-plugin-runtime/context";
+import { scrollDebugLog } from "../lib/util/scroll-debug.js";
 
 export interface MessageHandlerSetters {
   setSessions: React.Dispatch<React.SetStateAction<Map<string, DashboardSession>>>;
@@ -1047,6 +1048,7 @@ export function useMessageHandler(
         // See change: fix-replay-duplicates-tool-and-flushed-rows.
         const maxSeq = maxSeqMapRef.current.get(msg.sessionId) ?? 0;
         const shouldReset = firstSeq != null && (firstSeq === 1 || firstSeq <= maxSeq);
+        scrollDebugLog("replay:batch", { sessionId: msg.sessionId, n: msg.events.length, firstSeq, lastSeq: msg.events.length > 0 ? msg.events[msg.events.length - 1].seq : null, isLast: msg.isLast === true, shouldReset, hasWindow: !!msg.historyWindow, window: msg.historyWindow ?? null });
         if (msg.events.length > 0) {
           const queued = replayQueueRef.current.get(msg.sessionId);
           const batch = { events: msg.events, shouldReset };

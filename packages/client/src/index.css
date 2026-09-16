@@ -628,6 +628,27 @@ mark.markdown-search-highlight-active {
   animation: flow-edge-dash 0.8s linear infinite;
 }
 
+/* ── Pause ALL animations while the UI is idle ────────────────
+   useIdleFx (App) toggles `fx-idle` 5s after the last input. A visible but
+   untouched dashboard otherwise keeps SOME infinite animation running at all
+   times — the selected card's neon trio, and (whenever any session streams or
+   is unread) that card's stripes + status-dot pulse. Measured idle windows:
+   1423 ms of GPU-main activity per 14.6 s with just the trio (~10% of a core),
+   and 3268 ms per 13.3 s with only a BACKGROUND streaming card's stripes and
+   pulses on-screen (switching away from a streaming session keeps its card
+   animating — same cost as watching it). One tiny animation costs as much as
+   the three giant neon layers: the cost is per-frame pipeline overhead, not
+   raster size, so no amount of layer tuning helps — only stopping the
+   animation lets the compositor idle. Freezing everything is safe: every
+   animated element keeps a static color (stripes/dots static yellow/cyan)
+   that conveys the same state WITHOUT motion; tool-group/progress animations
+   are liveness cues that resume within one frame on the first input.
+   Same wildcard technique as `app-hidden` (see below).
+   See changes: pause-decorative-fx-when-idle, throttle-idle-ui-animations. */
+:root.fx-idle *,
+:root.fx-idle *::before,
+:root.fx-idle *::after { animation-play-state: paused !important; }
+
 /* ── Pause all animations while the window is hidden ──────────
    App.tsx (useAppHidden) toggles `app-hidden` on the document root from
    `document.visibilityState`. Freezing the compositor stops continuous

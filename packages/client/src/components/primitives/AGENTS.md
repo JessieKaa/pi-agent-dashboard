@@ -5,7 +5,7 @@ Files in this directory. One row per source file. See change: fold-oversized-age
 | File | Purpose |
 |------|---------|
 | `ActionButton.tsx` | `<ActionButton action options pendingLabel>` thin wrapper over `useAsyncAction.bind`. → see `ActionButton.tsx.AGENTS.md` |
-| `CopyButton.tsx` | Clipboard copy button with copied-state check icon. Exports `CopyButton`. Calls `navigator.clipboard.writeText`; resets state after 1500ms. Fails silently when Clipboard API unavailable. Optional `testId` prop (See change: redesign-directory-card). |
+| `CopyButton.tsx` | Clipboard copy button with copied-state check icon. Exports `CopyButton`. Routes through shared `copyText` (`lib/util/clipboard.ts`): `navigator.clipboard.writeText` when available, else hidden-textarea + `execCommand("copy")` fallback; ✓ only on success (mdiCheck for 1500ms), failure silent. Optional `testId` prop (See change: redesign-directory-card). See change: fix-ux-degradation-long-session. |
 | `DialogPortal.tsx` | Re-export shim. Forwards to `@blackbelt-technology/pi-dashboard-client-utils/DialogPortal`. Symbol moved in change `complete-flows-plugin-migration` (Layer 0). |
 | `ErrorBoundary.tsx` | Generic React error boundary. Exports `ErrorBoundary`. Catches render errors via `getDerivedStateFromError`;… → see `ErrorBoundary.tsx.AGENTS.md` |
 | `InlineMessage.tsx` | Shared severity-styled inline surface. Exports `InlineMessage`, `Severity` (`error`/`warning`/`info`/`success`). Colors from `--severity-*` tokens only. → see `InlineMessage.tsx.AGENTS.md` |

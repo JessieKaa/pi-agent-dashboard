@@ -5,8 +5,8 @@ import { SessionAssetsProvider } from "../../lib/session/SessionAssetsContext.js
 import { extractFrontmatter, formatRelativeDate, inferType } from "../preview/FrontmatterProperties.js";
 import { isFencedBlockComplete, MarkdownContent, tableToMarkdown, tableToTsv } from "../preview/MarkdownContent.js";
 import { ThemeProvider } from "../settings/ThemeProvider.js";
-import type { ToolContext } from "../tool-renderers/types.js";
 import { makeToolContext, withDefaultFileLink } from "../tool-renderers/make-tool-context.js";
+import type { ToolContext } from "../tool-renderers/types.js";
 
 // vi.hoisted so the mock (also hoisted) can reference the spy without a TDZ.
 const { openLiveTarget } = vi.hoisted(() => ({ openLiveTarget: vi.fn() }));
@@ -934,5 +934,51 @@ describe("D4b: linkification survives at every real context builder", () => {
     );
     expect(container.querySelector("button")).toBeNull();
     expect(container.textContent).toContain("/Users/me/app.ts");
+  });
+});
+
+// A fresh equivalent context must preserve rendered DOM nodes and browser selections.
+describe("MarkdownContent — DOM identity survives equivalent context churn", () => {
+  it("keeps the paragraph DOM node when only the context object identity changes", () => {
+    const content = "The quick brown fox mentions /Users/me/app.ts in prose.";
+    const { container, rerender } = render(
+      <ThemeProvider><MarkdownContent content={content} context={makeToolContext({ cwd: "/Users/me/repo" })} /></ThemeProvider>,
+    );
+    const before = container.querySelector("p");
+    expect(before).not.toBeNull();
+    rerender(
+      <ThemeProvider><MarkdownContent content={content} context={makeToolContext({ cwd: "/Users/me/repo" })} /></ThemeProvider>,
+    );
+    const after = container.querySelector("p");
+    expect(after).toBe(before);
+  });
+
+  it("keeps the inline-code DOM node when only the context object identity changes", () => {
+    const content = "see `packages/client/src/FileLink.tsx` here";
+    const { container, rerender } = render(
+      <ThemeProvider><MarkdownContent content={content} context={makeToolContext({ cwd: "/Users/me/repo" })} /></ThemeProvider>,
+    );
+    const before = container.querySelector("code");
+    expect(before).not.toBeNull();
+    rerender(
+      <ThemeProvider><MarkdownContent content={content} context={makeToolContext({ cwd: "/Users/me/repo" })} /></ThemeProvider>,
+    );
+    expect(container.querySelector("code")).toBe(before);
+  });
+
+  it("keeps link and table DOM nodes when only the context object identity changes", () => {
+    const content = "[dashboard](https://example.com)\n\n| A | B |\n| - | - |\n| 1 | 2 |";
+    const { container, rerender } = render(
+      <ThemeProvider><MarkdownContent content={content} context={makeToolContext({ cwd: "/Users/me/repo" })} /></ThemeProvider>,
+    );
+    const beforeLink = container.querySelector("a");
+    const beforeTable = container.querySelector("table");
+    expect(beforeLink).not.toBeNull();
+    expect(beforeTable).not.toBeNull();
+    rerender(
+      <ThemeProvider><MarkdownContent content={content} context={makeToolContext({ cwd: "/Users/me/repo" })} /></ThemeProvider>,
+    );
+    expect(container.querySelector("a")).toBe(beforeLink);
+    expect(container.querySelector("table")).toBe(beforeTable);
   });
 });

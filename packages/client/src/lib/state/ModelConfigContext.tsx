@@ -52,6 +52,24 @@ const ModelConfigContext = createContext<ModelConfigValue | undefined>(undefined
 
 export const ModelConfigProvider = ModelConfigContext.Provider;
 
+type SessionModelConfigSnapshot = Pick<ModelConfigValue, "model" | "thinkingLevel">;
+
+/**
+ * Resolve the selected session's model controls from the server-owned session
+ * snapshot first. Replay state is only a compatibility fallback: its durable
+ * event cache does not contain standalone thinking-level changes, so it can
+ * hold an older value after a page reload.
+ */
+export function resolveSessionModelConfig(
+  replayState: SessionModelConfigSnapshot,
+  session: SessionModelConfigSnapshot | undefined,
+): SessionModelConfigSnapshot {
+  return {
+    model: session?.model ?? replayState.model,
+    thinkingLevel: session?.thinkingLevel ?? replayState.thinkingLevel,
+  };
+}
+
 /**
  * Read the run-config context. Throws when rendered outside the provider so a
  * missing mount site fails loudly rather than rendering a degraded row.

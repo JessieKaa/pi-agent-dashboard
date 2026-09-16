@@ -56,6 +56,7 @@ import { WorktreeSpawnDialog } from "./components/worktree/WorktreeSpawnDialog.j
 import { useAppHidden } from "./hooks/useAppHidden.js";
 import { useContentViews } from "./hooks/useContentViews.js";
 import { useDocumentTitle } from "./hooks/useDocumentTitle.js";
+import { useIdleFx } from "./hooks/useIdleFx.js";
 import { selectInflightBashTools } from "./hooks/useInflightBashTools.js";
 import { useInstallPrompt } from "./hooks/useInstallPrompt.js";
 import { useLaunchSource } from "./hooks/useLaunchSource.js";
@@ -115,9 +116,10 @@ import { rehydrateSession } from "./lib/replay/rehydrate-session.js";
 import { deriveServerKey, replayCache } from "./lib/replay/replay-cache.js";
 import { createReplayPersister } from "./lib/replay/replay-persist.js";
 import { clearDraft } from "./lib/state/draft-store.js";
-import { ModelConfigProvider, type ModelConfigValue } from "./lib/state/ModelConfigContext.js";
+import { ModelConfigProvider, type ModelConfigValue, resolveSessionModelConfig } from "./lib/state/ModelConfigContext.js";
 import { clearRecoveryOffer } from "./lib/state/recovery-offer-bus.js";
 import { decodeFolderPath, encodeFolderPath } from "./lib/util/folder-encoding.js";
+import { scrollDebugLog } from "./lib/util/scroll-debug.js";
 
 // Stable tracker facade for the depth-aware back action
 // (change: fix-mobile-back-depth-aware).
@@ -334,6 +336,10 @@ export default function App() {
   // backgrounded, so the renderer + GPU stop continuous compositing.
   // See change: throttle-idle-ui-animations.
   useAppHidden();
+  // Pause the decorative selected-card FX after 5s without input, so a
+  // watched-but-untouched dashboard stops driving compositor frames.
+  // See change: pause-decorative-fx-when-idle.
+  useIdleFx();
   const [wsUrl, setWsUrl] = useState(getInitialWsUrl);
   const { send, onMessage, status } = useWebSocket(wsUrl);
   // Worktree-init bus needs a way to send subscribe/unsubscribe
@@ -1105,6 +1111,7 @@ export default function App() {
           lastSeq,
           historyWindow: { messages: 200, ...(firstSeq != null ? { firstSeq } : {}) },
         });
+        scrollDebugLog("subscribe:send", { sessionId: sid, lastSeq, firstSeq: firstSeq ?? null });
         // Enter LOADING. Covers warm (in-memory replay / reconnect re-subscribe)
         // and cold (disk-load) paths uniformly, since the warm path never sends
         // an empty `isLast:false` start marker.
@@ -1247,21 +1254,22 @@ export default function App() {
   // change: pluginize-flows-via-registry.
 
   const selectedSession = selectedId ? sessions.get(selectedId) : undefined;
+  const selectedModelConfig = resolveSessionModelConfig(selectedState, selectedSession);
   // Shared navigation to Settings → Providers — the model-selector empty-state
   // recovery link, consumed both directly (composer) and via ModelConfig (the
   // shell-bound `ui:model-selector` primitive). See change: open-empty-model-selector.
   const openProviderSettings = useCallback(() => navigate("/settings/providers"), [navigate]);
-  // Neutral model config for the selected session — sourced from
-  // `selectedState.model`/`thinkingLevel`, `modelsMap`, and `favoriteModels`;
-  // setters emit the existing browser messages. Consumed by the OpenSpec launch
+  // Neutral model config for the selected session — sourced from the server
+  // session snapshot with replay state as a legacy fallback, plus `modelsMap`
+  // and `favoriteModels`; setters emit the existing browser messages. Consumed by the OpenSpec launch
   // dialogs AND by the shell-bound `ui:model-selector` primitive.
   // See changes: openspec-dialog-model-effort-selector,
   // upgrade-model-selector-primitives (design D2).
   const modelConfig = useMemo<ModelConfigValue>(
     () => ({
-      model: selectedState.model ?? selectedSession?.model,
+      model: selectedModelConfig.model,
       models: selectedId ? modelsMap.get(selectedId) : undefined,
-      thinkingLevel: selectedState.thinkingLevel ?? selectedSession?.thinkingLevel,
+      thinkingLevel: selectedModelConfig.thinkingLevel,
       favorites: favoriteModels,
       setModel: (label) => {
         const slashIdx = label.indexOf("/");
@@ -1280,7 +1288,7 @@ export default function App() {
       openProviderSettings,
       notify: (message) => showToast(message, "info"),
     }),
-    [selectedId, selectedState.model, selectedState.thinkingLevel, selectedSession?.model, selectedSession?.thinkingLevel, modelsMap, favoriteModels, send, showToast, openProviderSettings],
+    [selectedId, selectedModelConfig.model, selectedModelConfig.thinkingLevel, modelsMap, favoriteModels, send, showToast, openProviderSettings],
   );
   // Per-cwd OpenSpec workflow config — drives which action buttons render.
   // See change: redesign-session-card-and-composer (config-driven-workflow).
@@ -1290,15 +1298,14 @@ export default function App() {
     ?? piResourcesCwd ?? folderSettingsCwd ?? null;
   useDocumentTitle(selectedSession, folderTitleCwd ?? undefined);
   const selectedCwd = selectedSession?.cwd;
-  // Built via `makeToolContext` so the `fileLink` renderer is attached — a
-  // hand-built literal here silently loses file-mention linkification with no
-  // type error. See change: cleanup-import-cycles (D4b).
+  // Keep unrelated sessions' state updates from changing this context.
+  const selectedSubagents = selectedState.subagents;
   const toolContext: ToolContext = useMemo(() => makeToolContext({
     cwd: selectedCwd,
     sessionId: selectedId,
-    session: selectedId ? sessionStates.get(selectedId) : undefined,
+    session: selectedId ? { ...createInitialState(), subagents: selectedSubagents } : undefined,
     send,
-  }), [selectedCwd, selectedId, sessionStates, send]);
+  }), [selectedCwd, selectedId, selectedSubagents, send]);
 
   const contextUsageMap = useMemo(
     () => buildContextUsageMap(sessionStates, sessions),
@@ -2048,13 +2055,13 @@ export default function App() {
             }}
             onOpenInlineTerminal={selectedId && selectedCwd ? () => handleOpenInlineTerminal(selectedId, selectedCwd) : undefined}
             sessionMessages={selectedState.messages}
-            model={selectedState.model ?? selectedSession?.model}
+            model={selectedModelConfig.model}
             models={modelsMap.get(selectedId)}
             favorites={favoriteModels}
             onToggleFavorite={(label, makeFavorite) =>
               send({ type: makeFavorite ? "favorite_model" : "unfavorite_model", label })
             }
-            thinkingLevel={selectedState.thinkingLevel ?? selectedSession?.thinkingLevel}
+            thinkingLevel={selectedModelConfig.thinkingLevel}
             onSelectModel={(modelStr) => {
               const slashIdx = modelStr.indexOf("/");
               if (slashIdx > 0) {
@@ -2402,13 +2409,22 @@ export default function App() {
       hasPiResourceRoute: hasPiResourceRouteFlag,
     });
     return apiProvider(
-      <div className="bg-[var(--bg-primary)] text-[var(--text-primary)]">
+      /* Viewport-bounded root: the in-flow banners below (plugin staleness,
+         connection) stack ABOVE the shell, so the root must carry the
+         `100dvh` + `overflow-hidden` bound and let the shell flex into the
+         remainder. Without this the banners added their height ON TOP of a
+         `100dvh` shell and made the document itself scrollable — entering a
+         session scrolled the whole shell up, out from under its own header.
+         See change: fix-ux-degradation-long-session. */
+      <div className="flex flex-col h-[100dvh] overflow-hidden bg-[var(--bg-primary)] text-[var(--text-primary)]">
         <PluginStalenessBanner />
         <ConnectionStatusBanner
           status={status}
           currentServerHost={currentServerHost}
           inFlightSwitch={inFlightSwitchKey !== null}
         />
+        {/* Remaining overlays are viewport-anchored or fixed-inset — outside
+            the flex flow, so they cannot stretch the root. */}
         <Toast messages={toastMessages} onDismiss={dismissToast} />
         <WorktreeInitStack />
         <SpawnErrorToastHost />

@@ -3,7 +3,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SidebarState } from "../../hooks/useSidebarState.js";
 import { ResizableSidebar } from "../shell/ResizableSidebar.js";
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  document.body.style.cursor = "";
+  document.body.style.userSelect = "";
+});
 
 function makeSidebar(overrides: Partial<SidebarState> = {}): SidebarState {
   return {
@@ -141,5 +145,38 @@ describe("ResizableSidebar", () => {
       </ResizableSidebar>,
     );
     expect(screen.getByTestId("drag-handle")).toBeTruthy();
+  });
+
+  it("sets body drag styles on mousedown and clears them on mouseup", () => {
+    render(
+      <ResizableSidebar sidebar={makeSidebar()}>
+        <div>Content</div>
+      </ResizableSidebar>,
+    );
+    fireEvent.mouseDown(screen.getByTestId("drag-handle"));
+    expect(document.body.style.cursor).toBe("col-resize");
+    expect(document.body.style.userSelect).toBe("none");
+
+    fireEvent.mouseUp(document, { clientX: 400 });
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+  });
+
+  it("REGRESSION: unmount mid-drag clears the body drag styles", () => {
+    // fix-ux-degradation-long-session (D1): unmounting while dragging (e.g. a
+    // breakpoint flip or collapse mid-drag) used to leave `user-select: none`
+    // on the body forever, killing text selection/copy until refresh.
+    const { unmount } = render(
+      <ResizableSidebar sidebar={makeSidebar()}>
+        <div>Content</div>
+      </ResizableSidebar>,
+    );
+    fireEvent.mouseDown(screen.getByTestId("drag-handle"));
+    expect(document.body.style.userSelect).toBe("none");
+
+    unmount();
+
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
   });
 });

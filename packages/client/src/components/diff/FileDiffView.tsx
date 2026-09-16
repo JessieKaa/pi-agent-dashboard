@@ -7,6 +7,7 @@ import { mdiArrowLeft, mdiFileTreeOutline, mdiRefresh } from "@mdi/js";
 import { Icon } from "@mdi/react";
 import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useBodyDragStyle } from "../../hooks/useBodyDragStyle.js";
 import { useMobile } from "../../hooks/useMobile.js";
 import { useSessionDiff } from "../../hooks/useSessionDiff.js";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
@@ -156,6 +157,7 @@ function ResizableTreePanel({ children }: { children: React.ReactNode }) {
   const [width, setWidth] = useState(DEFAULT_TREE_WIDTH);
   const dragging = useRef(false);
   const panelRef = useRef<HTMLDivElement>(null);
+  const { beginBodyDrag, endBodyDrag } = useBodyDragStyle();
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
@@ -169,8 +171,7 @@ function ResizableTreePanel({ children }: { children: React.ReactNode }) {
     const handleMouseUp = (e: MouseEvent) => {
       if (!dragging.current) return;
       dragging.current = false;
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
+      endBodyDrag();
       const rect = panelRef.current?.parentElement?.getBoundingClientRect();
       const newWidth = e.clientX - (rect?.left ?? 0);
       setWidth(Math.max(MIN_TREE_WIDTH, Math.min(MAX_TREE_WIDTH, newWidth)));
@@ -182,14 +183,13 @@ function ResizableTreePanel({ children }: { children: React.ReactNode }) {
       document.removeEventListener("mousemove", handleMouseMove);
       document.removeEventListener("mouseup", handleMouseUp);
     };
-  }, []);
+  }, [endBodyDrag]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     dragging.current = true;
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-  }, []);
+    beginBodyDrag("col-resize");
+  }, [beginBodyDrag]);
 
   return (
     <div

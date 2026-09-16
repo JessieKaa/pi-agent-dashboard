@@ -1,6 +1,7 @@
 import { mdiCheck } from "@mdi/js";
 import { Icon } from "@mdi/react";
 import React, { type ReactNode, useCallback, useState } from "react";
+import { copyText } from "../../lib/util/clipboard.js";
 
 interface Props {
   getText: () => string;
@@ -14,12 +15,13 @@ export function CopyButton({ getText, icon, title, testId }: Props) {
   const [copied, setCopied] = useState(false);
 
   const handleClick = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(getText());
+    // `copyText` falls back to a hidden textarea + execCommand when the
+    // Clipboard API is unavailable (plain-http tunnels); only a true result
+    // shows the ✓. A genuine failure stays silent. See change:
+    // fix-ux-degradation-long-session.
+    if (await copyText(getText())) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard API unavailable — fail silently
     }
   }, [getText]);
 

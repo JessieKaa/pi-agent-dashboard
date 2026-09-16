@@ -240,7 +240,11 @@ function OpenSpecRunConfigRowView({
               placeholder={i18nT("openspec.sessionModel", undefined, "session model")}
               disabled={modelsUnavailable}
             />
-            <ThinkingLevelSelector current={level} onSelect={onSelectLevel} />
+            <ThinkingLevelSelector
+              current={level}
+              onSelect={onSelectLevel}
+              supportedLevels={models?.find((m) => `${m.provider}/${m.id}` === model)?.supportedThinkingLevels}
+            />
           </fieldset>
         </PopoverBoundaryProvider>
       </div>

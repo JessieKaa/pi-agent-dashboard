@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library
 import type React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ModelConfigValue } from "../../lib/state/ModelConfigContext.js";
-import { useModelConfig } from "../../lib/state/ModelConfigContext.js";
+import { resolveSessionModelConfig, useModelConfig } from "../../lib/state/ModelConfigContext.js";
 import { makeRunConfig, RunConfigHarness } from "../../test-support/runConfigHarness.js";
 import { useOpenSpecRunConfigRow } from "../openspec/useOpenSpecRunConfigRow.js";
 
@@ -42,6 +42,24 @@ function selectModel(label: string) {
 }
 
 describe("useModelConfig context", () => {
+  it("prefers the authoritative session snapshot over stale replay state", () => {
+    expect(
+      resolveSessionModelConfig(
+        { model: "cached/old", thinkingLevel: "xhigh" },
+        { model: "live/current", thinkingLevel: "low" },
+      ),
+    ).toEqual({ model: "live/current", thinkingLevel: "low" });
+  });
+
+  it("falls back to replay state for legacy session snapshots", () => {
+    expect(
+      resolveSessionModelConfig(
+        { model: "cached/model", thinkingLevel: "medium" },
+        undefined,
+      ),
+    ).toEqual({ model: "cached/model", thinkingLevel: "medium" });
+  });
+
   it("throws when used outside the provider", () => {
     expect(() => renderHook(() => useModelConfig())).toThrow(/ModelConfigProvider/);
   });
@@ -65,6 +83,23 @@ describe("run-config row", () => {
     );
     expect(screen.getByTestId("thinking-level-button").textContent).toContain("high");
     expect(value.refreshModels).toHaveBeenCalledOnce();
+  });
+
+  it("filters thinking options by the selected session model", () => {
+    const value = makeRunConfig({
+      models: [{
+        provider: "anthropic",
+        id: "claude-sonnet-4-6",
+        supportedThinkingLevels: ["off", "low"],
+      }],
+    });
+    renderHost(value, { onSend: vi.fn() });
+    fireEvent.click(screen.getByTestId("thinking-level-button"));
+    const dropdown = screen.getByTestId("thinking-level-dropdown");
+    expect(dropdown.textContent).toContain("off");
+    expect(dropdown.textContent).toContain("low");
+    expect(dropdown.textContent).not.toContain("medium");
+    expect(dropdown.textContent).not.toContain("high");
   });
 
   it("shows the disclosure only once a control differs from the session", () => {

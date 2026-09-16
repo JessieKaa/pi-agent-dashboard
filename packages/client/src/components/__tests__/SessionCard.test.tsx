@@ -104,6 +104,28 @@ describe("SessionCard", () => {
     expect(card.className).toContain("border-blue-500/60");
   });
 
+  it("should render the decorative FX layers with their idle-pause class names", () => {
+    // The `:root.fx-idle` CSS (see change: pause-decorative-fx-when-idle) keys
+    // on these EXACT class names; a rename here would silently stop pausing
+    // the idle animations.
+    const session = makeSession();
+    const { container } = render(
+      <SessionCard session={session} {...defaultProps} selectedId="test-session" />
+    );
+    // `card-glow-fx-outer` ALSO carries `card-glow-fx` (shared base styles),
+    // so the glow query matches both layers.
+    expect(container.querySelectorAll(".card-glow-fx").length).toBe(2);
+    expect(container.querySelectorAll(".card-glow-fx-outer").length).toBe(1);
+    expect(container.querySelectorAll(".card-ring-fx").length).toBe(1);
+  });
+
+  it("should not render the decorative FX layers on an unselected card", () => {
+    const session = makeSession();
+    const { container } = render(<SessionCard session={session} {...defaultProps} />);
+    expect(container.querySelector(".card-glow-fx")).toBeNull();
+    expect(container.querySelector(".card-ring-fx")).toBeNull();
+  });
+
   it("should call onSelect when clicked", () => {
     const onSelect = vi.fn();
     const session = makeSession();

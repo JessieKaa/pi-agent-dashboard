@@ -89,6 +89,22 @@ export function selectSupersededHealTargets(
 }
 
 /**
+ * Pure scan: every `${sessionId}:${toolCallId}` key for a row still present in
+ * the session states. Used to prune the per-row diagnostic maps — a key of an
+ * absent row can never be consulted again, because both selectors only read
+ * keys of rows that still exist.
+ */
+export function selectActiveToolKeys(sessionStates: Map<string, SessionState>): Set<string> {
+  const keys = new Set<string>();
+  for (const [sessionId, state] of sessionStates) {
+    for (const toolCallId of state.toolCalls.keys()) {
+      keys.add(`${sessionId}:${toolCallId}`);
+    }
+  }
+  return keys;
+}
+
+/**
  * Pure scan: every `status:"running"` tool row across all sessions whose
  * `startedAt` is older than `staleMs`. `skip(key)` excludes rows already
  * in-flight or recently probed (re-arm window). Keyed by `sessionId:toolCallId`.
@@ -179,8 +195,23 @@ export function useStaleToolReconcile(
       }
     };
 
+    // Prune keys whose row no longer exists (resolved, reset, or session
+    // removed) — otherwise both maps grow with every tool call ever seen for
+    // the lifetime of a long session. See change:
+    // fix-ux-degradation-long-session.
+    const pruneInactiveKeys = (keys: Map<string, unknown>, active: Set<string>) => {
+      for (const key of keys.keys()) {
+        if (!active.has(key)) keys.delete(key);
+      }
+    };
+
     const tick = () => {
       const now = Date.now();
+
+      const active = selectActiveToolKeys(statesRef.current);
+      pruneInactiveKeys(lastAttemptRef.current, active);
+      pruneInactiveKeys(count404Ref.current, active);
+
       const skip = (key: string) => {
         if (inFlightRef.current.has(key)) return true;
         const last = lastAttemptRef.current.get(key);

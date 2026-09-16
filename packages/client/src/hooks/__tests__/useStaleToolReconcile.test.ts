@@ -16,6 +16,7 @@ import {
   RECONCILE_POLL_MS,
   STALE_TOOL_MS,
   SUPERSEDE_MIN_404,
+  selectActiveToolKeys,
   selectStaleRunningTools,
   selectSupersededHealTargets,
   synthesizeToolEndEvent,
@@ -149,6 +150,31 @@ function useHarness(initial: Map<string, SessionState>) {
   return states;
 }
 
+describe("selectActiveToolKeys", () => {
+  it("collects keys of all rows across sessions (running and terminal alike)", () => {
+    const a = runningToolState("t1", 0);
+    const b = runningToolState("other", 0);
+    b.toolCalls.get("other")!.status = "complete";
+    const states = new Map([
+      ["s1", a],
+      ["s2", b],
+    ]);
+    expect(selectActiveToolKeys(states)).toEqual(new Set(["s1:t1", "s2:other"]));
+  });
+
+  it("omits keys of rows removed from the maps", () => {
+    const s = runningToolState("t1", 0);
+    const states = new Map([["s1", s]]);
+    expect(selectActiveToolKeys(states).has("s1:t1")).toBe(true);
+    s.toolCalls.delete("t1");
+    expect(selectActiveToolKeys(states).has("s1:t1")).toBe(false);
+  });
+
+  it("returns an empty set for empty states", () => {
+    expect(selectActiveToolKeys(new Map())).toEqual(new Set());
+  });
+});
+
 describe("useStaleToolReconcile hook", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -258,6 +284,51 @@ describe("useStaleToolReconcile hook", () => {
       await vi.advanceTimersByTimeAsync(RECONCILE_POLL_MS);
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("REGRESSION: a row re-created after removal is probed without the old re-arm window", async () => {
+    // fix-ux-degradation-long-session (D3): the diagnostic maps used to keep
+    // keys forever, so a row removed (reset) and re-created by a replay under
+    // the SAME toolCallId inherited the previous lifetime's re-arm window,
+    // delaying its probe by up to RECONCILE_REARM_MS. The per-tick prune drops
+    // the absent row's key, so the fresh lifetime probes immediately.
+    vi.setSystemTime(STALE_TOOL_MS + 100);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: async () => ({ error: "evicted" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const initial = new Map([["s1", runningToolState("t1", 0)]]);
+    const { result, rerender } = renderHook(() => useHarness(initial));
+
+    // Tick 1: the stale row is probed; a re-arm entry is recorded for s1:t1.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RECONCILE_POLL_MS + 1);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Reset: the row disappears. The next tick prunes its diagnostic key.
+    act(() => {
+      result.current.get("s1")!.toolCalls.delete("t1");
+      rerender();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RECONCILE_POLL_MS);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Replay re-adds the row with the same toolCallId — a fresh lifetime, whose
+    // probe must NOT wait out the previous lifetime's re-arm window.
+    act(() => {
+      result.current.set("s1", runningToolState("t1", 0));
+      rerender();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RECONCILE_POLL_MS);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -38,6 +38,7 @@ import { REPLAY_PILL_DELAY_MS } from "../../lib/replay/loading-history.js";
 import { formatMessageTime } from "../../lib/util/format.js";
 import { buildTurnSummaries, type TurnSummary } from "../../lib/util/lineDelta.js";
 import { isOutOfCwd, normalizeUnderCwd } from "../../lib/util/normalize-path.js";
+import { scrollDebugLog } from "../../lib/util/scroll-debug.js";
 import { ChangeSummaryBlock } from "../diff/ChangeSummaryBlock.js";
 import { getInteractiveRenderer } from "../interactive-renderers/registry.js";
 import { FilePreviewHost, FilePreviewProvider } from "../preview/FilePreviewContext.js";
@@ -345,6 +346,20 @@ function hasMermaid(content: string): boolean {
 
 const SCROLL_THRESHOLD = 50;
 
+/**
+ * A scroll event whose position is the bottom-pin's own write AFTER a
+ * measurement clamped it: the view still sits at (or below) the value the pin
+ * achieved, the content is taller than it was at write time, and the pin landed
+ * on real content. Only that shape is a clamp and nothing else — see the
+ * `pin-bottom` branch in `handleScroll` for the full reasoning, and the switch
+ * to browser-faithful clamping in `ChatView.scroll-race.test.tsx` for why
+ * `top` is the write's ACHIEVED value, not its target.
+ * See change: fix-ux-degradation-long-session.
+ */
+function isPinnedBottomClamp(snapshot: { top: number; height: number } | null, el: { scrollTop: number; scrollHeight: number }): boolean {
+  return snapshot !== null && snapshot.height > 0 && el.scrollTop >= snapshot.top - 1 && el.scrollHeight > snapshot.height;
+}
+
 // Retained-row ceiling for an active selection (change:
 // preserve-chat-selection-during-churn, D3). The `rangeExtractor` keeps up to
 // this many selection-intersecting rows mounted; past it the view actively
@@ -419,10 +434,18 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
    *    started during that window and the walk stalls until they scroll again.
    *
    * Callers that ARE intent (`scrollToTop`) must stamp FIRST, then set the flag.
-   * See change: add-tail-only-replay-window (D7).
+   *
+   * `reason` tags the write for `handleScroll` via `lastProgrammaticScrollRef`:
+   * `"pin-bottom"` for the bottom-pin writers, `"jump"` (default) for every
+   * other relocating write. Cleared by real user input only, never by the
+   * handler — a suppressed event must not consume the tag, or the clamp event
+   * from the same write would fall through to the position rules it exists to
+   * correct. See change: add-tail-only-replay-window (D7),
+   * fix-ux-degradation-long-session.
    */
-  const stampProgrammaticScroll = useCallback((invalidateIntent = true) => {
+  const stampProgrammaticScroll = useCallback((invalidateIntent = true, reason: "pin-bottom" | "jump" = "jump") => {
     programmaticScrollUntilRef.current = Date.now() + SETTLE_MS;
+    lastProgrammaticScrollRef.current = reason;
     if (invalidateIntent) pendingUserIntentRef.current = false;
   }, []);
   /**
@@ -721,6 +744,51 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
   // cancelled by real user input (wheel / touch). See change:
   // virtualize-chat-transcript-tanstack (scroll-to-bottom regression fix).
   const descendingRef = useRef(false);
+  // The writer of the most recent programmatic scroll, kept alongside the
+  // suppression window so `handleScroll` can tell WHICH write produced the
+  // event it is processing.
+  //
+  // Needed because the pin write and a measurement interleave in a way the
+  // position-based checks cannot see. `el.scrollTop = el.scrollHeight` scrolls
+  // to the maximum that exists AT WRITE TIME, but rows below the viewport keep
+  // measuring in, so the induced scroll event can arrive AFTER `scrollHeight`
+  // grew: it reads nearBottom=false (delta = (new max - clamped scrollTop) +
+  // clientHeight, hundreds of px on mobile) even though the write was a correct
+  // pin to the then-current bottom. With no gesture involved, handleScroll's
+  // else-branch then cleared stickToBottomRef and the follow died — the view
+  // parked wherever growth stopped, mid-transcript, for the rest of replay.
+  //
+  // Cleared by REAL user input only (the wheel / touch handler). A writer
+  // clears it just before every write and tags itself, so a genuine gesture
+  // landing between a programmatic event and our handler is still honoured:
+  //   null         → no programmatic write pending; position rules apply
+  //   "pin-bottom" → a follow re-pin that landed at the then-current bottom
+  //                  (`el.scrollTop = el.scrollHeight` in the follow effect or
+  //                  the virtualizer onChange). Resolved against
+  //                  `pinnedSnapshotRef`.
+  //   "jump"       → scrollToBottom / scrollToTurn / restore-anchor / correction:
+  //                  another writer's event is just as non-user as the pin's,
+  //                  so leave the refs untouched entirely.
+  // See change: fix-ux-degradation-long-session.
+  const lastProgrammaticScrollRef = useRef<"pin-bottom" | "jump" | null>(null);
+  // The most recent bottom-pin write: the `scrollTop` it ACHIEVED (the write is
+  // clamped to the then-current maximum) and the `scrollHeight` at write time.
+  // `handleScroll` compares against both to separate the two ways a pin event
+  // can read `nearBottom = false`:
+  //   top ≈ snapshot.top, height > snapshot.height → measurement clamp: content
+  //     grew below after our write; the write itself was correct. HOLD.
+  //   anything else (view moved up, no growth) → the user (scrollbar drag,
+  //     keyboard) moved the view; no gesture listener sees those paths, so
+  //     position is the only signal. RELEASE.
+  // The `height > 0` requirement matters: a pin that landed on an EMPTY
+  // container (pre-measure mount) is not evidence of anything, and holding for
+  // the first rows measuring in would swallow a genuine escape.
+  // Cleared ONLY by real user input (the wheel/touch handler). Never on session
+  // switch: every restore branch stamps its own tag, and the hold gate needs
+  // the tag to read "pin-bottom" — a stale snapshot behind another writer's tag
+  // can never fire, and a restore that ends pinned overwrites it anyway.
+  // See change: fix-ux-degradation-long-session.
+  const pinnedSnapshotRef = useRef<{ top: number; height: number } | null>(null);
   // True while a scroll-to-TOP ascent is in flight (Decision 3, change:
   // fix-chat-scroll-to-top-estimate-drift). `scrollToIndex(0)` is BOUNDED
   // (maxAttempts=10) and a late async image-load remeasure can bump the view
@@ -1123,14 +1191,16 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
       if (!el) return;
       const grew = el.scrollHeight !== lastScrollHeightRef.current;
       lastScrollHeightRef.current = el.scrollHeight;
+      scrollDebugLog("pin:onchange", { sessionId, grew, stick: stickToBottomRef.current, selecting: isSelectingRef.current, splice: spliceSuppressRef.current, scrollTop: Math.round(el.scrollTop), scrollHeight: el.scrollHeight, clientHeight: el.clientHeight });
       // Suspend the bottom-pin while a transcript selection is held (D2) so the
       // selected row is not scrolled out of its overscan band. stickToBottomRef
       // is NOT cleared — follow resumes on collapse.
       // A backfill splice grows the content from ABOVE the reading position, so
       // any user inside the near-bottom band would be yanked to the bottom (D6).
       if (grew && stickToBottomRef.current && !isSelectingRef.current && !spliceSuppressRef.current) {
-        stampProgrammaticScroll();
+        stampProgrammaticScroll(true, "pin-bottom");
         el.scrollTop = el.scrollHeight;
+        pinnedSnapshotRef.current = { top: el.scrollTop, height: el.scrollHeight };
       }
       // Ascending: re-target index 0 whenever a measurement grows the total
       // size (an above-viewport row mounting/measuring, INCLUDING the async
@@ -1261,13 +1331,19 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
     [],
   );
 
-  // Real user input (wheel / touch) cancels an in-flight descent so the user
-  // can always escape mid-flight.
+  // Real user input (wheel / touch) is the ONLY thing that clears the
+  // programmatic-write tag: a gesture in progress must never be mistaken for
+  // the aftermath of our own write.
   const cancelDescent = useCallback(() => {
     descendingRef.current = false;
     // Real user input also escapes an in-flight scroll-to-top ascent so the
     // onChange re-issue cannot fight the user scrolling back down.
     ascendingRef.current = false;
+    lastProgrammaticScrollRef.current = null;
+    // Drop the pin snapshot too, so the next event can never be measured
+    // against a pin the user has already overridden with a gesture we saw but
+    // whose scroll event has not arrived yet.
+    pinnedSnapshotRef.current = null;
   }, []);
 
   const handleScroll = useCallback(() => {
@@ -1275,7 +1351,35 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
     if (!el) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_THRESHOLD;
     const nearTop = el.scrollTop <= SCROLL_THRESHOLD;
-    if (descendingRef.current) {
+    // Any event inside the suppression window is programmatic by definition
+    // (see `programmaticScrollUntilRef`). Classify by writer so the position
+    // rules below never run against an artificial position.
+    const suppressed = Date.now() < programmaticScrollUntilRef.current;
+    if (suppressed && lastProgrammaticScrollRef.current === "jump") {
+      // A relocating write (scrollToBottom / scrollToTurn / restore /
+      // correction) owns this event. Moving the refs at all would fight the
+      // writer — in particular, `scrollToBottom` on phone is an instant write
+      // whose single event lands inside the window, and a position rule here
+      // could clear the pin the write just ended at. Button state included:
+      // leave it to the writer.
+    } else if (
+      lastProgrammaticScrollRef.current === "pin-bottom" && isPinnedBottomClamp(pinnedSnapshotRef.current, el)
+    ) {
+      // The bottom-pin wrote to the then-current maximum, but a measurement can
+      // land after the write and before this event, so `nearBottom` may read
+      // false on a correct pin (see `lastProgrammaticScrollRef` and
+      // `isPinnedBottomClamp`). The clamp holds the follow; anything else falls
+      // through to the position rules below.
+      if (nearBottom) stickToBottomRef.current = true;
+      // Button state is deliberately untouched: flipping it here is exactly the
+      // escape affordance the spec forbids mid-replay ("the floating
+      // scroll-to-bottom button SHALL NOT appear").
+      //
+      // NOT gated on the suppression window: the growth gate is self-limiting
+      // (a user cannot grow the transcript), and a window-gated version
+      // classified events by wall-clock proximity to the last pin — exactly the
+      // kind of timing dependence nothing here can test deterministically.
+    } else if (descendingRef.current) {
       // In-flight descent: hold the pin through intermediate (not-yet-bottom)
       // scroll events; clear the latch on arrival.
       if (nearBottom) descendingRef.current = false;
@@ -1304,6 +1408,7 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
         offset: anchor ? el.scrollTop - anchor.start : el.scrollTop,
         nearBottom,
       });
+      scrollDebugLog("save:handleScroll", { sessionId, nearBottom, suppressed, tag: lastProgrammaticScrollRef.current, pinned: pinnedSnapshotRef.current?.top ?? null, stick: stickToBottomRef.current, scrollTop: Math.round(el.scrollTop), scrollHeight: el.scrollHeight, clientHeight: el.clientHeight, anchorRowId: anchor ? String(anchor.key) : null });
     }
     /**
      * Trigger bookkeeping ONLY — this never evaluates the predicate. An edge
@@ -1378,6 +1483,9 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
       // Restore incoming session scroll state in virtual coordinates.
       const saved = sessionId ? scrollStateMap.get(sessionId) : undefined;
       if (saved && !saved.nearBottom && saved.anchorRowId) {
+        // Restoring the saved reading position instead of the bottom — the
+        // candidate behind "lands mid-conversation on every re-entry".
+        // See change: fix-ux-degradation-long-session.
         // Scroll-locked: resolve the saved row id → current index, scroll it to
         // the top, then re-apply the intra-row offset once the row measures.
         descendingRef.current = false;
@@ -1385,6 +1493,7 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
         setShowScrollButton(true);
         const anchorId = saved.anchorRowId;
         const idx = displayRows.findIndex((r, i) => virtualRowKey(r, i) === anchorId);
+        scrollDebugLog("restore:branch", { sessionId, anchorId, offset: saved.offset, idx, rows: displayRows.length });
         if (idx >= 0) {
           // A session restored to the TOP drives `scrollTop → 0` on first
           // paint. Unstamped, that is an unlatched ascent and a silent
@@ -1398,6 +1507,11 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
             if (el) el.scrollTop += off;
           });
         } else {
+          // Anchor row not present in this render: the old fallback lands at
+          // `scrollHeight ≈ 0` (empty transcript) and stickToBottom stays OFF,
+          // so the replay fills below a viewport paralysed mid-stream.
+          // See change: fix-ux-degradation-long-session.
+          scrollDebugLog("restore:anchor-missing", { sessionId, anchorId, rows: displayRows.length });
           stampProgrammaticScroll();
           scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight);
         }
@@ -1405,8 +1519,14 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
         // Near bottom or first visit: scroll to end and follow new content.
         stickToBottomRef.current = true;
         setShowScrollButton(false);
+        // Stamped as a JUMP, not a pin: the write relocates the view, so its
+        // induced events are ignored entirely rather than judged against a
+        // snapshot — a measurement landing before the first onChange grow-pin
+        // must not be able to clear the follow. The onChange re-pin (which does
+        // record a snapshot) takes over on the next measurement.
         stampProgrammaticScroll();
         scrollRef.current?.scrollTo(0, scrollRef.current!.scrollHeight);
+        scrollDebugLog("restore:bottom-branch", { sessionId, saved, rows: displayRows.length, scrollHeight: scrollRef.current?.scrollHeight });
       }
     }
   }, [sessionId]);
@@ -1437,14 +1557,17 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
     // this effect on the → false edge so follow resumes with no new content.
     if (isSelecting || isSelectingRef.current) {
       wasSelectingRef.current = true;
+      scrollDebugLog("pin:stick-effect-skip-selecting", { sessionId });
       return;
     }
     const resumedFromSelection = wasSelectingRef.current;
     wasSelectingRef.current = false;
     if (resumedFromSelection && el) lastScrollHeightRef.current = el.scrollHeight;
+    scrollDebugLog("pin:stick-effect", { sessionId, stick: stickToBottomRef.current, selecting: isSelecting || isSelectingRef.current, el: !!el });
     if (stickToBottomRef.current && el) {
-      stampProgrammaticScroll();
+      stampProgrammaticScroll(true, "pin-bottom");
       el.scrollTop = el.scrollHeight;
+      pinnedSnapshotRef.current = { top: el.scrollTop, height: el.scrollHeight };
       lastScrollHeightRef.current = el.scrollHeight;
     }
   }, [state.messages.length, state.streamingText, state.pendingPrompt, state.streamingThinking, pendingSteering, isSelecting]);

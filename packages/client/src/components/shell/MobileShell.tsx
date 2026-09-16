@@ -14,6 +14,12 @@ interface Props {
  * Two-panel mobile shell with slide transitions and swipe-back.
  * Both panels stay mounted; CSS transform slides between them.
  * Depth 2 (preview) swaps content within the detail panel — no extra slide.
+ *
+ * Fills its flex PARENT rather than claiming the viewport (`h-[100dvh]`): the
+ * App's mobile root owns the viewport-bounded height and stacks the in-flow
+ * banners above this shell. Claiming 100dvh here made document height
+ * `banner + 100dvh`, so any visible banner below the root made the page
+ * itself scrollable. See change: fix-ux-degradation-long-session.
  */
 export function MobileShell({ depth, listPanel, detailPanel, onBack }: Props) {
   const showDetail = depth >= 1;
@@ -39,7 +45,9 @@ export function MobileShell({ depth, listPanel, detailPanel, onBack }: Props) {
   const transitionClass = swipeState.swiping ? "" : "transition-transform duration-300 ease-out";
 
   return (
-    <div ref={containerRef} className="relative w-screen h-[100dvh] overflow-hidden bg-[var(--bg-primary)]">
+    <div ref={containerRef} className="relative w-full flex-1 min-h-0 overflow-hidden bg-[var(--bg-primary)]">
+      {/* Panels span the container below the banners, so the safe area the
+          composer reserves stays clear of the banner strip. */}
       {/* Panel 0: Session list */}
       <div
         className={`absolute inset-0 ${transitionClass} overflow-y-auto`}
