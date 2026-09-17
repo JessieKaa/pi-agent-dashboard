@@ -183,6 +183,45 @@ describe("viteDashboardPluginsPlugin — served-artifact declaration (P0)", () =
     expect(metadata?.pluginRegistryHash).toBe(embedded?.[1]);
   });
 
+  it("embeds the runtime staleness hash, including server-only plugins without a client entry", async () => {
+    // Regression: `mcp-server` has no `client` field. Import generation skips
+    // it, but the server's `/api/health.bundleHash` (discoverPlugins minus
+    // fixtures) includes it — if the embedded hash were computed over the
+    // import entries, the staleness banner would show in production forever.
+    writePlugin("server-only-plugin", {
+      id: "server-only",
+      displayName: "Server Only",
+      claims: [],
+    });
+    writePlugin("alpha-plugin", {
+      id: "alpha",
+      displayName: "Alpha",
+      client: "./dist/client/index.js",
+      claims: [{ slot: "session-card-badge", component: "AlphaBadge" }],
+    });
+
+    const { registryContent, metadata } = await invokePluginBuild(true);
+    const embedded = registryContent.match(
+      /export const PLUGIN_REGISTRY_HASH = "([0-9a-f]{64})"/,
+    );
+    expect(embedded, "generated registry must embed a 64-char hash").not.toBeNull();
+
+    const { discoverPlugins, pluginRegistryHash, clearDiscoveryCache: clear } = await import(
+      "../server/loader.js"
+    );
+    clear();
+    const runtimeSet = discoverPlugins(tmpDir).filter(p => p.manifest.fixture !== true);
+    const runtimeHash = pluginRegistryHash(runtimeSet);
+
+    expect(metadata?.pluginRegistryHash).toBe(runtimeHash);
+    expect(embedded?.[1]).toBe(runtimeHash);
+    // Guard the exact regression: dropping the client-less plugin changes the
+    // hash — i.e. the assertion above is not vacuously true.
+    expect(pluginRegistryHash(runtimeSet.filter(p => p.manifest.id !== "server-only"))).not.toBe(
+      runtimeHash,
+    );
+  });
+
   it("writes no declaration on a dev serve (no configResolved build)", async () => {
     writePlugin("dev-plugin", {
       id: "dev",
