@@ -1,3 +1,8 @@
+// Type-only (erased at emit), so this module keeps its zero-runtime-dependency
+// character. `HostPressure` is defined beside the thresholds that produce it so
+// the verdict is not described twice. See change: fix-false-unresponsive-badge.
+import type { HostPressure } from "./host-pressure.js";
+
 /**
  * The auto-namer's enumerated durable state set: carried across an extension
  * reload as VALUES (never the namer object, whose closures would hold a stale
@@ -48,13 +53,42 @@ export type LifecyclePolicy = "ephemeral" | "durable";
 export type SessionStatus = "active" | "idle" | "streaming" | "ended";
 
 /**
- * Per-session git-worktree state. Populated by the bridge's VCS probe when
- * `git rev-parse --git-common-dir` resolves outside `--show-toplevel` (the
- * canonical signal that this cwd is a worktree, not the main checkout).
- * Absent (or `undefined`) for plain checkouts — clients MUST treat absence
- * as "not a worktree". Used by the dashboard to (a) group worktree
- * sessions under their parent repo, (b) render the WORKSPACE-subcard
- * worktree pill.
+ * Why a session reached `status: "ended"`. One vocabulary, reused by
+ * `DashboardSession.closedReason` and the persisted `.meta.json` liveness
+ * marker — never a third attribution field beside `movedTo`.
+ *
+ *   - `manual`       — the user asked for the close (shutdown / force-kill).
+ *   - `process_gone` — the session's process was established to be ABSENT: a
+ *                      pid probed gone at grace expiry, or the zombie-
+ *                      normalization check. A REMOTE-origin pid is never probed
+ *                      (foreign PID namespace) and reads `unknown` instead.
+ *   - `spawn_failed` — pi could not be started / restarted.
+ *   - `unknown`      — a real terminal state whose cause could not be
+ *                      established. A member, never an absence: "we do not
+ *                      know" is a different fact from "never examined".
+ *
+ * `isRecoveryCandidate` excludes only `manual`; every other value (and an
+ * absent reason) passes through unchanged. See change:
+ * stop-discarding-known-session-state.
+ */
+export type ClosedReason = "manual" | "process_gone" | "spawn_failed" | "unknown";
+
+/**
+ * Per-session git-worktree state. Populated by the bridge's VCS probe when the
+ * shared checkout-root resolution reports the cwd as a LINKED WORKTREE — its
+ * `git rev-parse --git-dir` differs from its `--git-common-dir` — AND a
+ * plausible main checkout resolves for it. Absent (or `undefined`) otherwise,
+ * which now covers a submodule, a `--separate-git-dir` checkout, a bare
+ * repository, and a worktree of a bare hub (a linked worktree whose repository
+ * has no working tree to name). Clients MUST treat absence as "not a
+ * worktree". Used by the dashboard to (a) group worktree sessions under their
+ * parent repo, (b) render the WORKSPACE-subcard worktree pill.
+ *
+ * `mainPath` is the RESOLVED main checkout, never `dirname(--git-common-dir)`:
+ * that derivation names a real checkout only when the git dir happens to sit
+ * inside one, and otherwise yields a nonexistent `…/.git/modules/<name>` path
+ * or a real but unrelated directory. It never contains a `.git` path segment.
+ * See change: add-git-checkout-root-resolver.
  *
  * `base` is post-create metadata, set by the server when a session is
  * spawned via the dashboard's worktree dialog and persisted to
@@ -149,6 +183,20 @@ export interface DashboardSession {
    * See change: add-pi-gateway-transport-identity (tasks 11.7, 11.8).
    */
   originDeviceId?: string;
+  /**
+   * How much of a REMOTE-origin session's transcript this dashboard actually
+   * holds. Set on hydration; absent for every local session.
+   *
+   *   - `complete`   — the origin's file was transferred to its end.
+   *   - `incomplete` — a transfer happened and stopped early; more existed.
+   *   - `absent`     — no transfer ever happened; nothing is missing.
+   *
+   * Three values, not a boolean, because the empty screen a user is looking at
+   * has two different causes and they call for opposite responses. A partial
+   * transfer presented as the whole conversation is the failure this prevents.
+   * See change: serve-retained-remote-transcripts (task 2.2).
+   */
+  retainedTranscript?: "complete" | "incomplete" | "absent";
   /**
    * Set when this session left for another dashboard instance (D11, task 9.3).
    *
@@ -327,6 +375,14 @@ export interface DashboardSession {
   sessionDir?: string;
   hidden?: boolean;
   /**
+   * Archive state (ended-only) mirrored from `SessionMeta`. Archived sessions
+   * are non-resident: never in `sessions_snapshot`, `GET /api/sessions` or
+   * `session_added`/`session_updated`. See change: archive-sessions-lazy-load.
+   */
+  archived?: boolean;
+  archivedAt?: number;
+  restoredAt?: number;
+  /**
    * User-owned, free-form tags mirrored from `SessionMeta.tags`. Bridges
    * SHALL NOT send this — it is dashboard-owned, set via `set_session_tags`.
    * See change: add-session-tags.
@@ -342,7 +398,7 @@ export interface DashboardSession {
    */
   live?: boolean;
   liveEpoch?: number;
-  closedReason?: string;
+  closedReason?: ClosedReason;
   /** Set at cold-start restore when the scanned session is a recovery
    *  candidate. See change: reopen-sessions-after-shutdown. */
   recoveryCandidate?: boolean;
@@ -374,6 +430,18 @@ export interface DashboardSession {
     /** Timestamp when metrics were last received */
     updatedAt: number;
   };
+  /**
+   * Server-derived bridge-silence verdict, pushed ONLY on a state transition
+   * (`host-pressure-tracker.ts`). `undefined` = the server has said nothing yet
+   * (unknown, NOT healthy); explicit `null` = recovered, clear the badge.
+   * `since` is the server receipt time of the last frame, so the card can count
+   * elapsed silence locally without any extra traffic.
+   *
+   * The browser MUST NOT derive this from `processMetrics.updatedAt`: that field
+   * only ever arrives in the connect snapshot and then freezes, which read every
+   * live session as unresponsive. See change: fix-false-unresponsive-badge.
+   */
+  hostPressure?: HostPressure | null;
   /** Extension-declared UI modules (Phase 1: management-modal slot). */
   uiModules?: ExtensionUiModule[];
   /** Cached row data per `view.dataEvent` for table/grid views. Per-event item cap is enforced server-side. */
@@ -440,6 +508,24 @@ export interface DashboardSession {
    * See change: add-goals-folder-page.
    */
   goalId?: string;
+  /**
+   * Core-owned cold-start recovery opt-out, mirror of `SessionMeta.recover`.
+   * Absent ⇒ recoverable (`true`). Resolved from an owning plugin's lifecycle
+   * declaration `{ recover }` through the generic session-ownership seam; core
+   * never reads a plugin name or the owner `pluginRef` to set it. Persisted to
+   * `.meta.json` only when `false` (the single additive byte an opted-out
+   * owned session gains). See change: detach-automation-goal-from-core.
+   */
+  recover?: boolean;
+  /**
+   * Core-owned socket-close finalization flag. When `true`, the gateway
+   * finalizes the session immediately on socket close (no reconnect grace)
+   * instead of branching on a plugin name. Resolved from an owning plugin's
+   * lifecycle declaration `{ finalizeOnSocketClose }`. In-memory only — NOT
+   * persisted to `.meta.json` (only matters while a live socket is open), so
+   * it adds no on-disk byte. See change: detach-automation-goal-from-core.
+   */
+  finalizeOnSocketClose?: boolean;
 }
 
 // ── Extension UI System (Phase 1: management-modal slot) ───────────

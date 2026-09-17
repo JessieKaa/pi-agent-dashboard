@@ -55,9 +55,9 @@ function props(over: Partial<React.ComponentProps<typeof OpenSpecBoardView>> = {
     groupsState: { groups, assignments: {}, changeOrder: {} },
     onBack: vi.fn(), onRefresh: vi.fn(), onReadArtifact: vi.fn(), onNavigateToSession: vi.fn(),
     onOpenSpecs: vi.fn(), onOpenArchive: vi.fn(), onSpawnSession: vi.fn(), onSpawnAttachedWorktree: vi.fn(),
-    onResumeSession: vi.fn(), onHideSession: vi.fn(), onUnhideSession: vi.fn(), onSendPrompt: vi.fn(),
+    onResumeSession: vi.fn(), onArchiveSession: vi.fn(), onSendPrompt: vi.fn(),
     onAttachProposal: vi.fn(), onDetachProposal: vi.fn(), onBulkArchive: vi.fn(),
-    isGitRepo: true, gitWorktreeEnabled: true,
+    worktreeAvailability: { available: true },
     ...over,
   };
 }

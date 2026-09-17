@@ -5,24 +5,34 @@
  * in switch statements were dead-code eliminated by esbuild because the message
  * types were not in the ServerToBrowserMessage union.
  */
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import type {
-  ServerToBrowserMessage,
-  BrowserToServerMessage,
-  BrowserPromptRequestMessage,
-  BrowserPromptDismissMessage,
-  BrowserPromptCancelMessage,
-  BrowserExtUiDecoratorMessage,
-  BrowserAssetRegisterMessage,
-  BrowserNotifyMessage,
-  RecoveryDismissMessage,
-  BatchQuestion,
   BatchAnswer,
+  BatchQuestion,
+  BrowserAssetRegisterMessage,
+  BrowserExtUiDecoratorMessage,
+  BrowserNotifyMessage,
+  BrowserPromptCancelMessage,
+  BrowserPromptDismissMessage,
+  BrowserPromptRequestMessage,
+  BrowserRelayFrameMessage,
+  BrowserRelayInputMessage,
+  BrowserRelayStatusMessage,
+  BrowserRelaySubscribeMessage,
+  BrowserRelayUnsubscribeMessage,
+  BrowserToServerMessage,
+  OpenSpecGetMessage,
+  OpenSpecGetResultMessage,
+  RecoveryDismissMessage,
+  ServerToBrowserMessage,
+  SessionsPageMessage,
+  SessionsPageResultMessage,
+  SessionsSnapshotMessage,
 } from "../browser-protocol.js";
 import type {
+  AssetRegisterMessage,
   ExtensionToServerMessage,
   ExtUiDecoratorMessage,
-  AssetRegisterMessage,
   NotifyMessage,
 } from "../protocol.js";
 import type { DecoratorDescriptor } from "../types.js";
@@ -53,6 +63,28 @@ type _NotifyInBrowserUnion   = AssertExtends<BrowserNotifyMessage, ServerToBrows
 // fix-recovery-offer-dismiss-and-phantom-reopen: recovery_dismiss must live in
 // the browser→server union so the server's switch arm survives esbuild.
 type _RecoveryDismissInBrowserToServerUnion = AssertExtends<RecoveryDismissMessage, BrowserToServerMessage>;
+// add-browser-relay (test-plan #E29): the three viewer actions must be in the
+// browser→server union and the two server pushes in the server→browser union,
+// or esbuild strips the switch arms in production builds.
+type _RelaySubscribeInBrowserToServer = AssertExtends<BrowserRelaySubscribeMessage, BrowserToServerMessage>;
+type _RelayUnsubscribeInBrowserToServer = AssertExtends<BrowserRelayUnsubscribeMessage, BrowserToServerMessage>;
+type _RelayInputInBrowserToServer = AssertExtends<BrowserRelayInputMessage, BrowserToServerMessage>;
+type _RelayFrameInServerToBrowser = AssertExtends<BrowserRelayFrameMessage, ServerToBrowserMessage>;
+type _RelayStatusInServerToBrowser = AssertExtends<BrowserRelayStatusMessage, ServerToBrowserMessage>;
+// Frame/status must NEVER carry the relay guid or a profile token — a
+// type-level `never` check makes adding one a compile error (spec F2).
+type _FrameHasNoSecretKeys = AssertTrue<
+  Extract<keyof BrowserRelayFrameMessage, "guid" | "token"> extends never ? true : never
+>;
+type _StatusHasNoSecretKeys = AssertTrue<
+  Extract<keyof BrowserRelayStatusMessage, "guid" | "token"> extends never ? true : never
+>;
+type _FrameHasNoGuidField = AssertTrue<
+  "guid" extends keyof BrowserRelayFrameMessage ? never : true
+>;
+type _StatusHasNoTokenField = AssertTrue<
+  "token" extends keyof BrowserRelayStatusMessage ? never : true
+>;
 
 // Runtime verification that the type discriminants are reachable in a switch
 function extractPromptType(msg: ServerToBrowserMessage): string | null {
@@ -285,5 +317,125 @@ describe("asset_register is a member of both protocol unions", () => {
     expect(msg.type).toBe("asset_register");
     expect(msg.hash).toBe("abc1234567890123");
     expect(msg.mimeType).toBe("image/svg+xml");
+  });
+});
+
+// fix-connect-snapshot-frame-loss: the four new messages must be members of the
+// unions (else esbuild strips the server dispatch / client reducer arms) and the
+// snapshot must carry `endedTotals`.
+type _OpenSpecGetInUnion = AssertExtends<OpenSpecGetMessage, BrowserToServerMessage>;
+type _SessionsPageInUnion = AssertExtends<SessionsPageMessage, BrowserToServerMessage>;
+type _OpenSpecGetResultInUnion = AssertExtends<OpenSpecGetResultMessage, ServerToBrowserMessage>;
+type _SessionsPageResultInUnion = AssertExtends<SessionsPageResultMessage, ServerToBrowserMessage>;
+
+function extractOpenSpecGetRequestId(msg: BrowserToServerMessage): string | null {
+  switch (msg.type) {
+    case "openspec_get": return msg.requestId;
+    default: return null;
+  }
+}
+function extractSessionsPageOffset(msg: BrowserToServerMessage): number | null {
+  switch (msg.type) {
+    case "sessions_page": return msg.offset;
+    default: return null;
+  }
+}
+function extractOpenSpecGetResultFinal(msg: ServerToBrowserMessage): boolean | null {
+  switch (msg.type) {
+    case "openspec_get_result": return msg.final;
+    default: return null;
+  }
+}
+function extractSessionsSnapshotEndedTotals(msg: ServerToBrowserMessage): Record<string, number> | null {
+  switch (msg.type) {
+    case "sessions_snapshot": return msg.endedTotals;
+    default: return null;
+  }
+}
+
+describe("fix-connect-snapshot-frame-loss protocol types (E28)", () => {
+  it("openspec_get narrows with requestId + cwd", () => {
+    const msg: OpenSpecGetMessage = { type: "openspec_get", requestId: "r1", cwd: "/a" };
+    expect(extractOpenSpecGetRequestId(msg)).toBe("r1");
+  });
+
+  it("sessions_page narrows with cwd + offset", () => {
+    const msg: SessionsPageMessage = { type: "sessions_page", cwd: "/a", offset: 50 };
+    expect(extractSessionsPageOffset(msg)).toBe(50);
+  });
+
+  it("openspec_get_result narrows with data + final", () => {
+    const msg: OpenSpecGetResultMessage = {
+      type: "openspec_get_result",
+      requestId: "r1",
+      cwd: "/a",
+      data: { initialized: false, pending: true, changes: [] },
+      final: false,
+    };
+    expect(extractOpenSpecGetResultFinal(msg)).toBe(false);
+  });
+
+  it("sessions_snapshot narrows with endedTotals", () => {
+    const msg: SessionsSnapshotMessage = {
+      type: "sessions_snapshot",
+      sessions: [],
+      orders: {},
+      endedTotals: { "/a": 3 },
+      archivedCountByCwd: {},
+    };
+    expect(extractSessionsSnapshotEndedTotals(msg)).toEqual({ "/a": 3 });
+  });
+
+  it("rejects a missing requestId / offset at compile time", () => {
+    // @ts-expect-error requestId is required on openspec_get
+    const noRequestId: OpenSpecGetMessage = { type: "openspec_get", cwd: "/a" };
+    // @ts-expect-error offset is required on sessions_page
+    const noOffset: SessionsPageMessage = { type: "sessions_page", cwd: "/a" };
+    expect(noRequestId.cwd).toBe("/a");
+    expect(noOffset.cwd).toBe("/a");
+  });
+});
+
+// add-browser-relay (test-plan #E29): the relay viewer payloads are broadcast /
+// per-socket wire messages, so a leaked secret would be a real exfiltration
+// path, not a type nicety. Serialize representative payloads and assert the
+// guid and token strings never appear.
+describe("browser relay payloads never carry secrets (E29)", () => {
+  const GUID = "0123456789abcdef0123456789abcdef";
+  const TOKEN = "s3cr3t-pairing-token";
+
+  it("serialized frame holds no guid or token", () => {
+    const frame: BrowserRelayFrameMessage = {
+      type: "browser_relay_frame",
+      instanceId: "inst-1",
+      tabId: 7,
+      jpegBase64: "AAAA",
+      metadata: { deviceWidth: 1280, deviceHeight: 800, timestamp: 1 },
+    };
+    const json = JSON.stringify(frame);
+    expect(json).not.toContain(GUID);
+    expect(json).not.toContain(TOKEN);
+    expect(json).not.toContain("guid");
+    expect(json).not.toContain("token");
+  });
+
+  it("serialized status holds no guid or token", () => {
+    const status: BrowserRelayStatusMessage = {
+      type: "browser_relay_status",
+      auditSeq: 4,
+      instances: [
+        {
+          instanceId: "inst-1",
+          profileDirectory: "Default",
+          state: "connected",
+          tabs: [{ tabId: 7, title: "t", url: "https://a.test/", state: "live" }],
+        },
+      ],
+    };
+    const json = JSON.stringify(status);
+    expect(json).not.toContain(GUID);
+    expect(json).not.toContain(TOKEN);
+    expect(json).not.toContain("guid");
+    expect(json).not.toContain("token");
   });
 });

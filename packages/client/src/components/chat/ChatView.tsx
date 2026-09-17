@@ -5,7 +5,7 @@ import {
   isNotifyRowVisible,
   toolCallPrefKey,
 } from "@blackbelt-technology/pi-dashboard-shared/display-prefs.js";
-import { mdiAlertCircleOutline, mdiCheck, mdiChevronDown, mdiChevronUp, mdiClose, mdiContentCopy, mdiLoading, mdiSourceFork, mdiTextBox } from "@mdi/js";
+import { mdiAlertCircleOutline, mdiCheck, mdiChevronDown, mdiChevronUp, mdiClose, mdiCommentQuestionOutline, mdiContentCopy, mdiLoading, mdiSourceFork, mdiTextBox } from "@mdi/js";
 import { Icon } from "@mdi/react";
 import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
 import React, { forwardRef, lazy, Suspense, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -34,7 +34,13 @@ import {
 import { derivePendingFreeFloating } from "../../lib/chat/pending-free-floating.js";
 import { computeAnchorCorrection } from "../../lib/chat/selection-anchor.js";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
+import {
+  CHAT_TRANSCRIPT_BOUND,
+  CHAT_TRANSCRIPT_FLOOR,
+  CHAT_TRANSCRIPT_WEIGHT,
+} from "../../lib/layout/chat-pane-row-class.js";
 import { REPLAY_PILL_DELAY_MS } from "../../lib/replay/loading-history.js";
+import { promptDesyncGatesFromState, usePromptDesync } from "../../lib/session/prompt-desync.js";
 import { formatMessageTime } from "../../lib/util/format.js";
 import { buildTurnSummaries, type TurnSummary } from "../../lib/util/lineDelta.js";
 import { isOutOfCwd, normalizeUnderCwd } from "../../lib/util/normalize-path.js";
@@ -79,9 +85,30 @@ interface Props {
   // cancel-pending callback was always a shadow-only lie. See change:
   // honest-mid-turn-queue-surface.
   onRespondToUi?: (requestId: string, result?: unknown, cancelled?: boolean) => void;
+  /**
+   * Fire a pending-prompt resync (`prompt_resync_request`) for this session.
+   * Provided by the shell; the same single callback the refresh coordinator
+   * uses. When omitted (embedded surface), the desync affordance never
+   * renders — no dead button.
+   * See change: fix-pending-prompt-lost-on-replay (D10).
+   */
+  onPromptResync?: (sessionId: string) => void;
   onAbort?: () => void;
   onForceKill?: () => void;
   onForkFromMessage?: (entryId: string) => void;
+  /**
+   * Re-send the preserved text of a pending prompt that failed because the
+   * browser could not transmit it. Rendered as the marked exit (Nielsen #3) on
+   * the connection-attributed failed arm.
+   * See change: stop-discarding-known-session-state.
+   */
+  onRetryPendingPrompt?: () => void;
+  /**
+   * Start a fresh session in the same folder for an ended session that has no
+   * saved transcript (the "Fork instead" exit). See change:
+   * stop-discarding-known-session-state (task 2.3a).
+   */
+  onForkPendingPrompt?: () => void;
   /**
    * Close a live inline terminal card (sends close_inline_terminal). The
    * parent binds the owning sessionId. See change: add-inline-terminal-card.
@@ -106,6 +133,15 @@ interface Props {
   loadingHistory?: boolean;
   historyWindow?: import("@blackbelt-technology/pi-dashboard-shared/browser-protocol.js").HistoryWindowMetadata;
   onLoadFullHistory?: () => void;
+  /**
+   * How much of a REMOTE-origin session's transcript this dashboard holds.
+   * Only `"incomplete"` renders anything: the transfer stopped early, so what
+   * is on screen is NOT the whole conversation and saying nothing would let it
+   * read as if it were. `"absent"` has nothing missing (the ordinary empty
+   * state is the truth), `"complete"` is whole, and `undefined` is every local
+   * session. See change: serve-retained-remote-transcripts (task 2.2).
+   */
+  retainedTranscript?: "complete" | "incomplete" | "absent";
   /**
    * Selected session's "replay in flight" flag. Unlike `loadingHistory` it
    * stays true until the TERMINAL replay batch lands, so it covers the window
@@ -385,7 +421,15 @@ export interface ChatViewHandle {
   scrollToTurn: (turnIndex: number) => void;
 }
 
-const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sessionId, state, toolContext: suppliedToolContext, onRespondToUi, onAbort, onForceKill, onForkFromMessage, onCloseInlineTerminal, pendingSteering, loadingHistory, historyWindow, onLoadFullHistory, replayInFlight, historyGap, onLoadEarlier, historySpliceRev, onCollapseStreamingThinking }, ref) {
+const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sessionId, state, toolContext: suppliedToolContext, onRespondToUi, onPromptResync, onAbort, onForceKill, onForkFromMessage, onRetryPendingPrompt, onForkPendingPrompt, onCloseInlineTerminal, pendingSteering, loadingHistory, historyWindow, onLoadFullHistory, retainedTranscript, replayInFlight, historyGap, onLoadEarlier, historySpliceRev, onCollapseStreamingThinking }, ref) {
+  // `ToolContext` is a published surface (re-exported from `chat-embed`), so an
+  // external embedder builds one by hand and would carry no `fileLink` —
+  // silently losing file-mention linkification with no type error. Merge a
+  // default here, ONCE, and pass the merged value to every consumer below.
+  //
+  // `useMemo` is required, not cosmetic: `MarkdownContent` is `React.memo`'d, so
+  // an inline merge would hand it a fresh `context` reference on every render
+  // and defeat the memo. See change: cleanup-import-cycles (D4b).
   const toolContext = useMemo(() => withDefaultFileLink(suppliedToolContext), [suppliedToolContext]);
   const [pillForSession, setPillForSession] = useState<string | null>(null);
   const showReplayPill = pillForSession !== null && pillForSession === sessionId;
@@ -411,6 +455,16 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
     };
   }, [replayInFlight, sessionId]);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Pending-prompt desync affordance (design D10): the session reports
+  // `ask_user` but no dialog renders, not ended, no replay in flight, held
+  // past the 5 s grace. Disappears the moment a dialog renders — a `pending`
+  // interactive request flips the selector off.
+  // See change: fix-pending-prompt-lost-on-replay.
+  const promptDesync = usePromptDesync(promptDesyncGatesFromState(state, !!replayInFlight), sessionId);
+  // Embedded surfaces without the shell's resync sender (or without a session
+  // id to target) never see the pill — no dead control.
+  const showPromptDesyncAffordance =
+    promptDesync && onPromptResync !== undefined && sessionId !== undefined;
   /**
    * ONE suppression window shared by EVERY programmatic `scrollTop` /
    * `scrollToIndex` writer in this file, rather than a list of per-writer refs.
@@ -1688,7 +1742,13 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
     // Key by sessionId so switching sessions (ChatView is reused, not remounted)
     // resets the hoisted preview — a preview open in session A never leaks into B.
     <FilePreviewProvider key={sessionId}>
-    <div className="flex-1 relative overflow-hidden flex flex-col">
+    <div
+      style={{
+        flex: `${CHAT_TRANSCRIPT_WEIGHT} ${CHAT_TRANSCRIPT_WEIGHT} ${CHAT_TRANSCRIPT_FLOOR}px`,
+        minHeight: `${CHAT_TRANSCRIPT_BOUND}px`,
+      }}
+      className="relative overflow-hidden flex flex-col"
+    >
     {/* overflowAnchor:"none" is load-bearing: TanStack's built-in above-viewport
         correction (resizeItem) drives scroll compensation itself, so browser
         scroll-anchoring must stay OFF (it would double-move). Do NOT add
@@ -2143,8 +2203,8 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
                      retry; never the emerald success tick.
                      See change: fix-optimistic-prompt-stuck-sending. */
                   <>
-                    <Icon path={mdiAlertCircleOutline} size={0.7} className="text-red-400" />
-                    <span className="text-[10px] text-red-400/80 font-medium" data-testid="pending-prompt-failed">not sent</span>
+                    <Icon path={mdiAlertCircleOutline} size={0.7} className="text-[var(--severity-error-fg)]" />
+                    <span className="text-[10px] text-[var(--severity-error-fg)]/80 font-medium" data-testid="pending-prompt-failed">not sent</span>
                   </>
                 ) : (
                   <>
@@ -2154,7 +2214,67 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
                 )}
               </div>
             </div>
+            {state.pendingPrompt.status === "failed" && state.pendingPrompt.failureCause && (
+              /* Cause + marked exit on a divider row under the preserved text.
+                 Error conveyed by icon + text + border, never colour alone
+                 (WCAG 1.4.1). See change: stop-discarding-known-session-state. */
+              <div className="flex items-center gap-2 mt-1.5 pt-1.5 border-t border-[var(--severity-error-border)] text-[11.5px] text-[var(--severity-error-fg)]">
+                <span aria-hidden className="shrink-0 leading-none">⚠</span>
+                <span className="flex-1">
+                  {state.pendingPrompt.failureCause === "connection"
+                    ? i18nT(
+                        "session.promptNotSentConnection",
+                        undefined,
+                        "Dashboard is offline — your prompt never left this browser.",
+                      )
+                    : i18nT(
+                        "session.promptNotSentNoSessionFile",
+                        undefined,
+                        "This session has no saved transcript, so it can't be resumed.",
+                      )}
+                </span>
+                {state.pendingPrompt.failureCause === "connection"
+                  ? onRetryPendingPrompt && (
+                      <button
+                        type="button"
+                        onClick={onRetryPendingPrompt}
+                        className="shrink-0 rounded-md border border-[var(--severity-error-border)] px-2.5 py-1 text-[11px] font-semibold text-[var(--severity-error-fg)] hover:bg-[var(--severity-error-bg)] min-h-[36px] pointer-coarse:min-h-[44px]"
+                      >
+                        {i18nT("session.promptRetry", undefined, "Retry")}
+                      </button>
+                    )
+                  : onForkPendingPrompt && (
+                      <button
+                        type="button"
+                        onClick={onForkPendingPrompt}
+                        className="shrink-0 rounded-md border border-[var(--severity-error-border)] px-2.5 py-1 text-[11px] font-semibold text-[var(--severity-error-fg)] hover:bg-[var(--severity-error-bg)] min-h-[36px] pointer-coarse:min-h-[44px]"
+                      >
+                        {i18nT("session.promptForkInstead", undefined, "Fork instead")}
+                      </button>
+                    )}
+              </div>
+            )}
           </div>
+        </div>
+      )}
+
+      {/*
+        A retained REMOTE transcript that stopped mid-transfer. Rendered
+        REGARDLESS of whether the transcript is empty — a partial transfer that
+        delivered some messages is the more dangerous case, because it looks
+        complete. See change: serve-retained-remote-transcripts (task 2.2).
+      */}
+      {retainedTranscript === "incomplete" && (
+        <div
+          role="status"
+          data-testid="retained-transcript-incomplete"
+          className="mx-4 my-2 rounded-md border border-warning/40 bg-warning/20 px-3 py-2 text-xs text-warning"
+        >
+          {i18nT(
+            "session.retainedTranscriptIncomplete",
+            undefined,
+            "Only part of this remote session's history reached this dashboard. Earlier messages may be missing.",
+          )}
         </div>
       )}
 
@@ -2246,6 +2366,28 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
           </span>
         </div>
       </>
+    )}
+    {showPromptDesyncAffordance && (
+      <button
+        type="button"
+        data-testid="prompt-desync-resync"
+        onClick={() => {
+          if (sessionId) onPromptResync(sessionId);
+        }}
+        className="absolute bottom-16 left-1/2 -translate-x-1/2 z-overlay flex items-center gap-1.5 rounded-full bg-[var(--bg-surface)] border border-[var(--border-strong)] px-3 py-1 shadow-lg hover:bg-[var(--bg-tertiary)] transition-colors"
+      >
+        {/* Pending-prompt desync affordance (design D10): the agent is blocked
+            on an answer this view does not render. Activation fires the SAME
+            single resync callback the refresh uses — no duplicate send path.
+            Never coexists with the replay pill: the selector requires no
+            replay in flight, so it safely claims the pill's `bottom-16` slot
+            (the scroll-to-bottom button stays at `bottom-4`, layout-separated).
+            See change: fix-pending-prompt-lost-on-replay. */}
+        <Icon path={mdiCommentQuestionOutline} size={0.7} className="text-[var(--text-primary)]" />
+        <span className="text-[11px] text-[var(--text-primary)]">
+          {i18nT("status.promptDesyncResync", undefined, "Waiting for your answer — resync")}
+        </span>
+      </button>
     )}
     {showScrollTopButton && (
       <button

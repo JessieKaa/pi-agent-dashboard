@@ -10,8 +10,75 @@ see [`docs/release-process.md`](docs/release-process.md).
 
 ## [Unreleased]
 
+### Added
+
+- **`composer-context-group` plugin slot** (react-only, `many`) renders labelled context groups inside the chat composer's session-action strip, after the Git group and before the Status group. Contributions are read-only and stay fully visible while a session streams (unlike the gated Status group). The runtime exports a `ComposerContextGroup({ label, children, testId? })` primitive. The quota plugin is the first claimant: its meter moved out of the composer's `content-inline-footer` into the strip, showing one chip per enabled provider with every window inline and the session's model provider ringed. See change: move-quota-to-context-strip.
+
 ### Changed
 
+- **dashboard-plugin-runtime**: `ServerContextDeps` gains five REQUIRED members (`mintSpawnToken`, `renameSession`, `assignSessionRef`, `networkGuard`, `onShutdown`) and `PluginSpawnOptions` gains `spawnToken`/`resume`/`initialPrompt` — implementors of `createServerPluginContext` (custom hosts, injected test contexts) must add them. See change: relocate-goal-product-to-plugin.
+
+### Security
+
+- **DNS-rebinding defence for the dashboard's own origin (issue #637), report-only
+  by default.** Admission previously trusted any request whose `Origin` host
+  equalled its `Host` header; a page at a name that re-resolves to `127.0.0.1`
+  forges exactly that, and because it is same-origin with the dashboard its
+  plain GETs carry no `Origin` at all. A new `Host`-header gate on the dashboard
+  listener now checks every HTTP request and every WebSocket upgrade — including
+  `Origin`-less ones — against the hostnames the dashboard can justify answering
+  on: loopback, any IP literal, the bind address, `*.local`, `publicBaseUrls`
+  hosts (legacy `pairing.publicBaseUrls` included), `cors.allowedOrigins` hosts,
+  live tunnel hosts, and a new top-level `allowedHosts` list. Matching is on the
+  hostname only (port ignored). 
+  **Report-only first:** the gate ships in `report` mode — a refused `Host` logs
+  `[host-gate] would-refuse host=…` and the request proceeds — so nothing breaks
+  on day one. Switch it to `enforce` from **Settings ▸ Security ▸ Allowed
+  hostnames**, or with `PI_DASHBOARD_HOST_GATE=enforce` (env overrides config).
+  Before flipping, review the new section's **Recent refusals** list (or `grep
+  -F '[host-gate] would-refuse' server.log`) and add any legitimate name to
+  `allowedHosts` — typically an internal reverse-proxy name that was never
+  registered as a public base URL. In `enforce`, a refused browser navigation
+  gets a static HTML page (no JS) and a refused `fetch` gets
+  `403 {error:"host_not_allowed"}`.
+- **Cross-site requests can no longer reach the dashboard (issue #625).** Any
+  web page you visited could open `ws://127.0.0.1:8000/ws`, receive the session
+  snapshot broadcast and spawn a terminal, and could blind-POST every
+  `/api/*` route with your ambient trust (CORS hid the *response*, never the
+  *request*). Three gates now close that: the WebSocket upgrade handler refuses
+  an untrusted `Origin` before any other admission branch (so a refused dial
+  cannot even consume a ticket), a `onRequest` hook refuses untrusted-`Origin`
+  mutations on `/api/*` and `POST /auth/logout` with `403 {"error":"untrusted
+  origin"}`, and the pi gateway refuses any TCP upgrade that carries an
+  `Origin` at all (bridges never send one). Refusals log one line each:
+  `[ws-gate]`, `[csrf-gate]`, `[pi-gateway]`.
+  **Unaffected:** header-less local clients (the `pi-dashboard` CLI, `curl`, the
+  bridge, the skill), loopback and tunnel browser origins, pages served at a
+  hostname/LAN address the dashboard itself answers on, `pi-dashboard.dev`
+  pairing, and live-preview HMR (the sandboxed `Origin: null` iframe keeps its
+  `/live/:id` carve-out).
+  **Action required in one case:** a zrok share you started BY HAND (`zrok share
+  public`, not the dashboard's own tunnel) is no longer covered by the
+  `*.share.zrok.io` wildcard for admission — zrok shares are free and
+  self-service, so a stranger's share would otherwise be same-site to yours.
+  Add that share's origin to `cors.allowedOrigins` in
+  `~/.pi/dashboard/config.json`; it applies without a restart.
+  See change: fix-ws-origin-cswsh.
+
+### Changed
+
+- **pi is now pinned at `0.85.1`, and `piCompatibility.minimum` moved with it —
+  a HARD BREAK for pi < 0.85.1.** Every user on pi 0.78.x–0.84.x flips from
+  working to hard-blocked: the dashboard shows the red "below minimum" advisory
+  and a below-floor install becomes unselectable in the runtime picker.
+  **Upgrade action:** `npm install -g @earendil-works/pi-coding-agent@0.85.1`.
+  Why: 0.85.1 raises pi's Anthropic client `user-agent` to `claude-cli/2.1.251`,
+  which unblocks `claude-fable-5-1` on Claude Pro/Max OAuth subscriptions (the
+  older UA returned HTTP 400 `claude_code_version_too_old`); the 0.85 line
+  carries zero upstream breaking changes and does not move the Node floor.
+  Because exactly one pi runtime is now supported, the bridge drops its dead
+  floor-pi `agent_settled` synthesis path and the now-unreachable client
+  fallback. See change: update-pi-core-0-85-adopt-apis.
 - **Custom chat entries are now gated per group, not by one switch.** The
   single "Custom entries in chat" toggle is replaced by `customEventGroups`:
   one toggle per group in Settings ▸ Chat display and the session View popover,
@@ -58,6 +125,23 @@ see [`docs/release-process.md`](docs/release-process.md).
   broad-support floor (`piCompatibility.minimum`) stays at `0.78.0`. The only
   upstream breaking change in the range (0.84.3 renamed the pi-ai-internal
   `GoogleThinkingLevel` type) has no consumer in this repo.
+
+### Removed
+
+- **The dashboard stops recommending the upstream
+  `@blackbelt-technology/pi-model-proxy` extension.** It is gone from the
+  recommended-extensions manifest, the pi-core package list (Update All /
+  `GET /api/pi-core/status`), and the Settings ▸ Model Proxy coexistence
+  banner; the `docs/migration/from-pi-model-proxy.md` guide is deleted.
+  **Breaking for plugin manifests:** the closed service-probe name
+  `pi-model-proxy` is renamed to `model-proxy` and now reports whether the
+  dashboard's own `/v1/*` routes were mounted at boot (no HTTP), instead of
+  probing the upstream's `:9876`. A manifest still declaring
+  `pi-model-proxy` reports `error: "unknown service name"`. The
+  `dashboard-plugin-runtime` server barrel drops `detectPiModelProxy`,
+  `ProxyDetection`, `PROXY_MODEL_PREFERENCE`, `pickProxyDefaultModel`,
+  `PROXY_MODELS_URL`, and `RequirementProbeDeps.fetchImpl` — none had
+  callers. See change: remove-pi-model-proxy-upstream-references.
 
 ### Fixed
 

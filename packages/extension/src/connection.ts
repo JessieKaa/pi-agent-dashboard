@@ -20,6 +20,42 @@ export interface ConnectionMigrationRecord {
   reason: string;
 }
 
+/**
+ * State captured at the instant the liveness watchdog decided to force-close.
+ * See `ConnectionManagerOptions.onWatchdogFire`.
+ */
+export interface WatchdogFireInfo {
+  /** Age of the last received frame. Cannot alone distinguish a silent peer from a blocked loop — see `maxTickDriftMs`. */
+  silentForMs: number;
+  /** The configured threshold, so the ratio is readable without knowing config. */
+  watchdogTimeout: number;
+  /** Socket readyState before teardown — 1 (OPEN) means we hung up on a live socket. */
+  readyState: number;
+  /**
+   * Depth of the PARSED-frame dispatch queue. Non-zero means frames were read
+   * and parsed but their handlers had not run — slow dispatch. NOT a probe for
+   * a blocked event loop: a blocked loop never parses, so this stays 0 while
+   * `silentForMs` overshoots.
+   */
+  inboundQueueDepth: number;
+  /**
+   * Worst observed lateness of the watchdog's OWN 15s check tick, since the
+   * watchdog started. This is a DIRECT measurement of event-loop blocking,
+   * not an inference from `silentForMs`:
+   *
+   *   drift ~0 + silence at threshold  → the server really stopped sending
+   *   drift large                      → our loop was blocked; the silence is
+   *                                      partly our own starvation, and acks
+   *                                      may have been pending unread
+   *
+   * Without it the two are indistinguishable, because a blocked loop produces
+   * the same `silentForMs` as a silent peer.
+   */
+  maxTickDriftMs: number;
+  /** Cumulative inbound frames refused for a full queue. */
+  refusedInbound: number;
+}
+
 export interface ConnectionManagerOptions {
   url: string;
   WebSocketImpl?: any;
@@ -65,6 +101,25 @@ export interface ConnectionManagerOptions {
   maxInboundQueue?: number;
   /** Server liveness watchdog: force reconnect after this many ms without any received message. Default 60000. Set 0 to disable. */
   watchdogTimeout?: number;
+  /**
+   * Fired immediately BEFORE the watchdog force-closes a socket.
+   *
+   * A watchdog close is indistinguishable from a network drop in server.log —
+   * both surface as `connection closed` followed by a re-register — so a
+   * reconnect storm cannot be attributed without this. `maxTickDriftMs` is the
+   * load-bearing field: near zero means the peer really did go quiet, while a
+   * large value means THIS loop stalled — a different failure with a different
+   * fix. `silentForMs` cannot separate them, because a blocked loop and a
+   * silent peer produce the same number.
+   *
+   * Only reached after the deferred re-check has confirmed the silence, so a
+   * report here means the peer stayed quiet across a full loop turn — not that
+   * the reads were merely pending.
+   *
+   * Runs synchronously before teardown: an exception is swallowed, but a slow
+   * callback delays the close by its own runtime. Keep it cheap.
+   */
+  onWatchdogFire?: (info: WatchdogFireInfo) => void;
   onMessage?: (data: unknown) => void | Promise<void>;
   /**
    * Fired on EVERY open, including the first — unlike `onReconnect`, which
@@ -74,6 +129,22 @@ export interface ConnectionManagerOptions {
    */
   onOpen?: () => void;
   onReconnect?: () => void;
+  /**
+   * Fired after the buffered frames queued during a drop have been flushed
+   * onto the freshly opened socket. Paired with `onReconnect`: it deliberately
+   * skips the first open, where there is no drop to heal from.
+   *
+   * `onopen` fires `onReconnect()` BEFORE the flush, so anything sent from
+   * there OVERTAKES a buffered real event. A status correction sent that early
+   * would settle the session to `idle` first, and the buffered real
+   * `agent_end` would then arrive with `before.status === "idle"` — the
+   * `streaming→idle` edge `isUnreadTrigger` needs is gone and the unread
+   * stripe is silently lost. Ordering is pinned by construction here rather
+   * than by comment.
+   *
+   * See change: fix-stuck-streaming-status-latch (design D8).
+   */
+  onPostFlush?: () => void;
   /**
    * Fired when the server terminally refuses this bridge's registration for a
    * session id (another live bridge already serves it). Reconnection is NOT
@@ -128,6 +199,7 @@ export class ConnectionManager {
   private onMessage?: (data: unknown) => void | Promise<void>;
   private onOpen?: () => void;
   private onReconnect?: () => void;
+  private onPostFlush?: () => void;
   private onRegisterRejected?: (sessionId: string, reason: string) => void;
   private getSessionIdForReports?: () => string | undefined;
   private dropReportWindowStart = 0;
@@ -261,6 +333,10 @@ export class ConnectionManager {
 
   private lastMessageAt = 0;
   private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private onWatchdogFire?: (info: WatchdogFireInfo) => void;
+  private watchdogLastTickAt = 0;
+  private watchdogMaxTickDrift = 0;
+  private watchdogRecheckPending = false;
   private watchdogTimeout: number;
 
   /**
@@ -327,9 +403,11 @@ export class ConnectionManager {
       "watchdogTimeout",
       0,
     );
+    this.onWatchdogFire = options.onWatchdogFire;
     this.onMessage = options.onMessage;
     this.onOpen = options.onOpen;
     this.onReconnect = options.onReconnect;
+    this.onPostFlush = options.onPostFlush;
     this.onRegisterRejected = options.onRegisterRejected;
     this.getSessionIdForReports = options.getSessionId;
     this.onMigrationEvent = options.onMigrationEvent;
@@ -783,7 +861,8 @@ export class ConnectionManager {
       }
 
       // Notify reconnect if this isn't the first connection
-      if (this.hasConnectedBefore) {
+      const isReconnect = this.hasConnectedBefore;
+      if (isReconnect) {
         this.onReconnect?.();
       }
       this.hasConnectedBefore = true;
@@ -794,6 +873,12 @@ export class ConnectionManager {
       this.buffer = [];
       for (const data of buffered) {
         this.ws?.send(data);
+      }
+
+      // Strictly after the flush — see the `onPostFlush` doc comment. Paired
+      // with `onReconnect`, so it skips the first open for the same reason.
+      if (isReconnect) {
+        this.onPostFlush?.();
       }
     };
 
@@ -855,12 +940,62 @@ export class ConnectionManager {
   private startWatchdog(): void {
     this.stopWatchdog();
     if (this.watchdogTimeout <= 0) return;
+    this.watchdogLastTickAt = Date.now();
+    this.watchdogMaxTickDrift = 0;
     this.watchdogTimer = setInterval(() => {
-      if (this.ws && this.lastMessageAt > 0 && Date.now() - this.lastMessageAt >= this.watchdogTimeout) {
+      // Lateness of THIS tick against its own schedule. A starved loop cannot
+      // report its own starvation any other way — every other signal here is
+      // downstream of the same blocked loop.
+      const now = Date.now();
+      const drift = now - this.watchdogLastTickAt - ConnectionManager.WATCHDOG_CHECK_INTERVAL;
+      this.watchdogLastTickAt = now;
+      if (drift > this.watchdogMaxTickDrift) this.watchdogMaxTickDrift = drift;
+
+      if (!this.isSilentPastThreshold()) return;
+
+      // Do NOT believe the silence yet. If the loop was blocked inside an I/O
+      // callback, it wraps to the TIMERS phase before it can re-enter poll, so
+      // frames that would refresh `lastMessageAt` are still unread in the
+      // socket buffer and this tick would force-close a live connection.
+      // A 0ms timer re-enters the timers phase only AFTER the loop has passed
+      // through poll, so a peer that is still sending gets to prove it first.
+      // (`setImmediate` would do the same, but vitest's fake timers never run
+      // it, which would make this defect untestable at the unit level.)
+      // Measured: a 1.5s block inside onMessage force-closed a peer that had
+      // never stopped sending.
+      if (this.watchdogRecheckPending) return;
+      this.watchdogRecheckPending = true;
+      setTimeout(() => {
+        this.watchdogRecheckPending = false;
+        // The watchdog may have been stopped while we waited.
+        if (!this.watchdogTimer) return;
+        if (!this.isSilentPastThreshold()) return;
+
+        // Report BEFORE tearing down: `this.ws` is nulled by handleDisconnect,
+        // so readyState is only observable here.
+        try {
+          this.onWatchdogFire?.({
+            silentForMs: Date.now() - this.lastMessageAt,
+            watchdogTimeout: this.watchdogTimeout,
+            readyState: this.ws?.readyState ?? -1,
+            inboundQueueDepth: this.inboundQueue.length,
+            refusedInbound: this.droppedInboundCount,
+            maxTickDriftMs: this.watchdogMaxTickDrift,
+          });
+        } catch {
+          // Diagnostics are best-effort; never block the reconnect they explain.
+        }
         // Server has gone silent — force close to trigger reconnect
         this.handleDisconnect();
-      }
+      }, 0);
     }, ConnectionManager.WATCHDOG_CHECK_INTERVAL);
+  }
+
+  /** Inbound silence has passed the configured threshold on a live socket. */
+  private isSilentPastThreshold(): boolean {
+    return (
+      !!this.ws && this.lastMessageAt > 0 && Date.now() - this.lastMessageAt >= this.watchdogTimeout
+    );
   }
 
   private stopWatchdog(): void {

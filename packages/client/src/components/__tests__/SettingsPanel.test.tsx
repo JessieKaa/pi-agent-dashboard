@@ -1,5 +1,9 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  ModelConfigProvider,
+  type ModelConfigValue,
+} from "../../lib/state/ModelConfigContext.js";
 import { SettingsPanel } from "../settings/SettingsPanel.js";
 
 // Worktree auto-init preference is fetched/persisted through git-api, not
@@ -549,10 +553,14 @@ describe("SettingsPanel", () => {
     await waitFor(() => screen.getByTestId("preferred-models-editor"));
 
     // Open the "Add model" selector and pick the one available model.
+    // The TRIGGER stays inside the editor, but the open panel is portaled to
+    // the layer root — its rows are only reachable from `screen`. Exactly one
+    // dropdown is open at a time, so the query is unambiguous.
+    // See change: fix-composer-popover-layering.
     const editor = screen.getByTestId("preferred-models-editor");
     fireEvent.click(within(editor).getByTestId("model-selector-button"));
-    await waitFor(() => within(editor).getByTestId("model-row"));
-    fireEvent.click(within(editor).getByTestId("model-row"));
+    await waitFor(() => screen.getByTestId("model-row"));
+    fireEvent.click(screen.getByTestId("model-row"));
 
     fireEvent.click(screen.getAllByTestId("save-btn")[0]);
 
@@ -596,10 +604,11 @@ describe("SettingsPanel", () => {
     const editor = screen.getByTestId("model-aliases-editor");
     fireEvent.click(within(editor).getByTestId("add-alias-button"));
     fireEvent.change(within(editor).getByTestId("alias-key-0"), { target: { value: "claude" } });
-    // Pick the alias target from the ModelSelector.
+    // Pick the alias target from the ModelSelector (panel is portaled — rows
+    // resolve from `screen`). See change: fix-composer-popover-layering.
     fireEvent.click(within(editor).getByTestId("model-selector-button"));
-    await waitFor(() => within(editor).getByTestId("model-row"));
-    fireEvent.click(within(editor).getByTestId("model-row"));
+    await waitFor(() => screen.getByTestId("model-row"));
+    fireEvent.click(screen.getByTestId("model-row"));
 
     fireEvent.click(screen.getAllByTestId("save-btn")[0]);
 
@@ -763,10 +772,13 @@ describe("SettingsPanel default thinking level", () => {
     { provider: "anthropic", id: "claude", supportedThinkingLevels: ["off", "low", "medium"] },
   ];
 
+  // The trigger lives inside the selector container; the open dropdown is
+  // portaled to the layer root, so it resolves from `screen`, not `within`.
+  // See change: fix-composer-popover-layering.
   function openThinkingDropdown() {
     const selector = screen.getByTestId("thinking-level-selector");
     fireEvent.click(within(selector).getByTestId("thinking-level-button"));
-    return within(selector).getByTestId("thinking-level-dropdown");
+    return screen.getByTestId("thinking-level-dropdown");
   }
 
   beforeEach(() => {
@@ -1171,8 +1183,10 @@ describe("SettingsPanel model catalogue", () => {
     await waitFor(() => screen.getByTestId("preferred-models-editor"));
     const editor = screen.getByTestId("preferred-models-editor");
     fireEvent.click(within(editor).getByTestId("model-selector-button"));
-    await waitFor(() => within(editor).getByTestId("model-row"));
-    const proxyLabels = within(editor).getAllByTestId("model-row").map((r) => r.textContent ?? "");
+    await waitFor(() => screen.getByTestId("model-row"));
+    // Portaled panel — rows resolve from `screen`; only the proxy editor's
+    // dropdown is open. See change: fix-composer-popover-layering.
+    const proxyLabels = screen.getAllByTestId("model-row").map((r) => r.textContent ?? "");
     expect(proxyLabels.some((l) => l.includes("gpt-5"))).toBe(true);
     expect(proxyLabels.some((l) => l.includes("claude-4"))).toBe(false);
   });
@@ -1284,7 +1298,8 @@ describe("SettingsPanel model catalogue", () => {
     const editor = await screen.findByTestId("preferred-models-editor");
     fireEvent.click(within(editor).getByTestId("model-selector-button"));
     await waitFor(() => {
-      const labels = within(editor).getAllByTestId("model-row").map((r) => r.textContent ?? "");
+      // Portaled panel — see change: fix-composer-popover-layering.
+      const labels = screen.getAllByTestId("model-row").map((r) => r.textContent ?? "");
       expect(labels.some((l) => l.includes("r1-model"))).toBe(true);
       expect(labels.some((l) => l.includes("r2-model"))).toBe(false);
     });
@@ -1328,5 +1343,130 @@ describe("SettingsPanel model catalogue", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: /Remove/ }));
     await waitFor(() => expect(catalogueCalls(fetchMock)).toBe(2));
+  });
+});
+
+// Sessions Default Model picker inherits favorites from the model-config
+// context with no call-site wiring. See change: model-picker-everywhere-favorites
+// (test-plan F1; design D1 — the Settings pickers already sit inside the provider).
+describe("SettingsPanel default model favorites (model-picker-everywhere-favorites)", () => {
+  const MODELS = [
+    { provider: "anthropic", id: "a" },
+    { provider: "anthropic", id: "b" },
+  ];
+
+  function ctxValue(over: Partial<ModelConfigValue> = {}): ModelConfigValue {
+    return {
+      setModel: () => {},
+      setThinkingLevel: () => {},
+      toggleFavorite: () => {},
+      refreshModels: () => {},
+      openProviderSettings: () => {},
+      notify: () => {},
+      ...over,
+    };
+  }
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    fetchAutoInitWorktreePref.mockResolvedValue(false);
+    setAutoInitWorktreePref.mockResolvedValue(true);
+    setPath("/settings/sessions");
+  });
+  afterEach(() => cleanup());
+
+  it("F1: Sessions Default Model picker shows + toggles context favorites with no props", async () => {
+    global.fetch = mockFetchConfig();
+    const toggle = vi.fn();
+    render(
+      <ModelConfigProvider value={ctxValue({ favorites: ["anthropic/a"], toggleFavorite: toggle })}>
+        <SettingsPanel availableModels={MODELS} />
+      </ModelConfigProvider>,
+    );
+    await waitFor(() => screen.getByText("Default model"));
+
+    fireEvent.click(screen.getByTestId("model-selector-button"));
+    const rows = screen.getAllByTestId("model-row");
+    const aRow = rows.find((r) => r.textContent?.trim() === "anthropic/a")!;
+    expect(within(aRow).getByTestId("model-fav-toggle").getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(within(aRow).getByTestId("model-fav-toggle"));
+    expect(toggle).toHaveBeenCalledWith("anthropic/a", false);
+  });
+});
+
+// ── archive-sessions-lazy-load: Sessions page archive fields ─────────────
+// #E33 BVA: archiveAfterDays -1 → error + Save disabled; 0 and 14 ok;
+// sweep interval 0 → error, 1 ok; Save carries sessionList.archiveAfterDays.
+// See change: archive-sessions-lazy-load.
+describe("SettingsPanel — archive fields (archive-sessions-lazy-load)", () => {
+  it("renders the archive fields with defaults 30 / 60 when sessionList config is absent", async () => {
+    global.fetch = mockFetchConfig();
+    setPath("/settings/sessions");
+
+    render(<SettingsPanel />);
+    await waitFor(() => screen.getByText("Archive after"));
+
+    expect(screen.getByDisplayValue("30")).toBeTruthy();
+    expect(screen.getByDisplayValue("60")).toBeTruthy();
+  });
+
+  it("E33: archiveAfterDays -1 shows an error and disables Save; 0 and 14 are valid", async () => {
+    global.fetch = mockFetchConfig();
+    setPath("/settings/sessions");
+
+    render(<SettingsPanel />);
+    await waitFor(() => screen.getByText("Archive after"));
+
+    const input = screen.getByDisplayValue("30");
+    fireEvent.change(input, { target: { value: "-1" } });
+    expect(screen.getByTestId("archive-after-days-error")).toBeTruthy();
+    expect((screen.getByTestId("save-btn") as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.change(input, { target: { value: "0" } });
+    expect(screen.queryByTestId("archive-after-days-error")).toBeNull();
+    expect((screen.getByTestId("save-btn") as HTMLButtonElement).disabled).toBe(false);
+
+    fireEvent.change(input, { target: { value: "14" } });
+    expect(screen.queryByTestId("archive-after-days-error")).toBeNull();
+  });
+
+  it("E33: sweep interval 0 shows an error; 1 is valid; Save persists sessionList.archiveAfterDays=14", async () => {
+    let putBody: any = undefined;
+    global.fetch = vi.fn().mockImplementation((url: string, options?: any) => {
+      if (url === "/api/config" && !options?.method) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ success: true, data: mockConfig }) });
+      }
+      if (url === "/api/providers") {
+        return Promise.resolve({ ok: false, json: () => Promise.resolve(null) });
+      }
+      if (url === "/api/config" && options?.method === "PUT") {
+        putBody = JSON.parse(options.body);
+        return Promise.resolve({ json: () => Promise.resolve({ success: true }) });
+      }
+      return Promise.resolve({ ok: false, json: () => Promise.resolve(null) });
+    });
+    setPath("/settings/sessions");
+
+    render(<SettingsPanel />);
+    await waitFor(() => screen.getByText("Archive after"));
+
+    const daysInput = screen.getByDisplayValue("30");
+    const sweepInput = screen.getByDisplayValue("60");
+
+    fireEvent.change(sweepInput, { target: { value: "0" } });
+    expect(screen.getByTestId("archive-sweep-interval-error")).toBeTruthy();
+    expect((screen.getByTestId("save-btn") as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.change(sweepInput, { target: { value: "1" } });
+    expect(screen.queryByTestId("archive-sweep-interval-error")).toBeNull();
+
+    fireEvent.change(daysInput, { target: { value: "14" } });
+    await waitFor(() => screen.getByTestId("save-btn"));
+    fireEvent.click(screen.getByTestId("save-btn"));
+
+    await waitFor(() => expect(putBody).toBeDefined());
+    expect(putBody.sessionList).toBeDefined();
+    expect(putBody.sessionList.archiveAfterDays).toBe(14);
+    expect(putBody.sessionList.archiveSweepIntervalMinutes).toBe(1);
   });
 });

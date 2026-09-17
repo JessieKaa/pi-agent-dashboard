@@ -1,6 +1,6 @@
 import type { DashboardEvent } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import { describe, expect, it } from "vitest";
-import { extractSessionUpdates } from "../session/event-status-extraction.js";
+import { extractSessionUpdates, reconcileAgentLiveness } from "../session/event-status-extraction.js";
 
 function makeEvent(eventType: string, data: Record<string, unknown> = {}): DashboardEvent {
   return { eventType, timestamp: Date.now(), data: { type: eventType, ...data } };
@@ -86,6 +86,44 @@ describe("extractSessionUpdates — compaction signal", () => {
   });
 
   it("clears the flag on an ABORTED session_compact_failed too", () => {
+    expect(
+      extractSessionUpdates(makeEvent("session_compact_failed", { reason: "manual", aborted: true })),
+    ).toEqual({ compacting: false });
+  });
+
+  // E9 (change: replay-compaction-boundary). A reconnect whose replay carries
+  // an OLD compaction entry clears the latch early (design D6, an accepted
+  // trade-off). The exposure is bounded only because the REAL session_compact
+  // re-clears at the end — so pin the whole sequence's convergence, not just
+  // the single-event mapping above.
+  it("converges to compacting:false across before → replayed compact → real compact", () => {
+    const fold = (events: DashboardEvent[]): Record<string, unknown> =>
+      events.reduce<Record<string, unknown>>(
+        (state, e) => ({ ...state, ...(extractSessionUpdates(e) ?? {}) }),
+        {},
+      );
+    const before = makeEvent("session_before_compact");
+    const replayed = makeEvent("session_compact");
+    const real = makeEvent("session_compact");
+
+    expect(fold([before])).toEqual({ compacting: true });
+    // Transient early clear — asserted so the trade-off is recorded, not hidden.
+    expect(fold([before, replayed])).toEqual({ compacting: false });
+    // Self-healing: never left stuck true.
+    expect(fold([before, replayed, real]).compacting).toBe(false);
+  });
+
+  // X1 (change: update-pi-core-0-85-adopt-apis, design §8): pi 0.85.1 abort
+  // genuinely CANCELS an in-progress manual compaction (pi#8920). The audit's
+  // answer is that the abort path STILL emits `session_compact_failed` — pi's
+  // `AgentSession.compact()` catch calls
+  // `_emitSessionCompactFailed({reason:"manual", aborted:true})` — so the
+  // latch does not strand and no defensive timeout is added. This pins the
+  // full set→clear sequence.
+  it("X1: an aborted manual compaction clears the latch (no strand)", () => {
+    expect(extractSessionUpdates(makeEvent("session_before_compact"))).toEqual({
+      compacting: true,
+    });
     expect(
       extractSessionUpdates(makeEvent("session_compact_failed", { reason: "manual", aborted: true })),
     ).toEqual({ compacting: false });
@@ -202,5 +240,48 @@ describe("extractSessionUpdates — hasPendingPrompt fold", () => {
       expect(extractSessionUpdates(event, false)).toEqual(expected[i]);
       expect(extractSessionUpdates(event)).toEqual(expected[i]);
     }
+  });
+});
+
+/**
+ * Decision table over the full `status` × `agentRunning` domain.
+ * See change: fix-stuck-streaming-status-latch (design D9, test-plan #E1–#E8).
+ */
+describe("reconcileAgentLiveness", () => {
+  it("settles a latched streaming session when the agent is not running (#E1)", () => {
+    expect(reconcileAgentLiveness("streaming", false)).toEqual({
+      status: "idle",
+      currentTool: null,
+    });
+  });
+
+  it("corrects idle → streaming without touching currentTool (#E2)", () => {
+    const updates = reconcileAgentLiveness("idle", true);
+    expect(updates).toEqual({ status: "streaming" });
+    expect(updates && "currentTool" in updates).toBe(false);
+  });
+
+  it("corrects active → streaming (#E3)", () => {
+    expect(reconcileAgentLiveness("active", true)).toEqual({ status: "streaming" });
+  });
+
+  it("is inert for active + not running — the routine resting state (#E4)", () => {
+    expect(reconcileAgentLiveness("active", false)).toBeNull();
+  });
+
+  it("never resurrects an ended session (#E5)", () => {
+    expect(reconcileAgentLiveness("ended", true)).toBeNull();
+  });
+
+  it("is inert for ended + not running (#E6)", () => {
+    expect(reconcileAgentLiveness("ended", false)).toBeNull();
+  });
+
+  it("is inert when streaming agrees with a running agent (#E7)", () => {
+    expect(reconcileAgentLiveness("streaming", true)).toBeNull();
+  });
+
+  it("is inert when idle agrees with a stopped agent (#E8)", () => {
+    expect(reconcileAgentLiveness("idle", false)).toBeNull();
   });
 });

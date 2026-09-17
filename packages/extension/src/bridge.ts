@@ -17,11 +17,11 @@ import type {
 } from "@blackbelt-technology/pi-dashboard-shared/protocol.js";
 import { rendezvousEndpoint } from "@blackbelt-technology/pi-dashboard-shared/rendezvous.js";
 import { isDashboardRunning } from "@blackbelt-technology/pi-dashboard-shared/server-identity.js";
+import { decideTranscriptRequest } from "@blackbelt-technology/pi-dashboard-shared/transcript-request-guard.js";
 import type { FlowInfo, ImageContent } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Loader } from "@earendil-works/pi-tui";
 import { AbortLatch } from "./abort-latch.js";
-import { floorRetryReconcileDelay, markFloorSettle, nativeAgentSettledSupported, settleFollowUp, synthesizeAgentSettledEvent } from "./agent-settled.js";
 import { isUnderArtifactRoot, resolveArtifactRoots } from "./artifact-roots.js";
 import {
   MAX_PER_MESSAGE_BYTES as ATTACH_MAX_PER_MESSAGE_BYTES,
@@ -44,7 +44,7 @@ import {
   validateImages,
 } from "./command-handler.js";
 import { buildSessionContextText, runForkSubagentDraft } from "./commit-draft-agent.js";
-import { ConnectionManager } from "./connection.js";
+import { ConnectionManager, type WatchdogFireInfo } from "./connection.js";
 import { toCustomEntryForward, toCustomMessageForward } from "./custom-entry-forward.js";
 import { registerDashboardContextInjector } from "./dashboard-context-injector.js";
 import { DashboardDefaultAdapter } from "./dashboard-default-adapter.js";
@@ -65,12 +65,14 @@ import { flipHasUI } from "./hasui-flip.js";
 import { healthUrlForInstance, probeEndpointReachability, verifyInstanceIdentity } from "./instance-verification.js";
 import { localTokenHeaders } from "./local-token-header.js";
 import { inlineMessageText, type ReadFileOutcome } from "./markdown-image-inliner.js";
+import { handleMcpTokenMinted, MCP_TOKEN_ENV_VAR } from "./mcp-token-delivery.js";
 import { COALESCE_WINDOW_MS, type MessageKey, MessageUpdateCoalescer } from "./message-update-coalescer.js";
 import { reportRefresh } from "./model-refresh.js";
-import { resetReconnectCaches as _resetReconnectCaches, sendCwdMissingIfChanged as _sendCwdMissingIfChanged, sendGitInfoIfChanged as _sendGitInfoIfChanged, sendModelUpdateIfChanged as _sendModelUpdateIfChanged, sendPiVersionIfChanged as _sendPiVersionIfChanged, sendSessionNameIfChanged as _sendSessionNameIfChanged, defaultReadPiVersion } from "./model-tracker.js";
+import { resetReconnectCaches as _resetReconnectCaches, sendCwdMissingIfChanged as _sendCwdMissingIfChanged, sendGitInfoIfChanged as _sendGitInfoIfChanged, sendModelUpdateIfChanged as _sendModelUpdateIfChanged, sendPiVersionIfChanged as _sendPiVersionIfChanged, sendSessionNameIfChanged as _sendSessionNameIfChanged } from "./model-tracker.js";
 import { decodeMultiselectAnswer } from "./multiselect-decode.js";
 import { createNotifyProxy } from "./notify-proxy.js";
 import { provisionOpenspecCli } from "./openspec-cli-shim.js";
+import { emitPendingPrompts } from "./pending-prompt-emitter.js";
 import { readPiRetrySettings } from "./pi-retry-settings.js";
 import { collectMetrics, startMetricsMonitor, stopMetricsMonitor } from "./process-metrics.js";
 import { getOwnPgid, scanChildProcesses } from "./process-scanner.js";
@@ -91,10 +93,11 @@ import { detectSessionSource } from "./source-detector.js";
 import { flushBufferedSubagentFrames, serveSubagentResync } from "./subagent-forward-sites.js";
 import { SubagentFrameBuffer } from "./subagent-frame-buffer.js";
 import { stripForForward } from "./subagent-frame-strip.js";
+import { FanoutAdmissionGate, resolveAdmissionConfig } from "./subagent-fanout-admission.js";
+import { SaturationSampler } from "./subagent-saturation.js";
 import { isSubagentTick, SubagentTickThrottle } from "./subagent-tick-throttle.js";
 import { inlineToolResultImages } from "./tool-result-image-inliner.js";
 import { readTranscriptChunk, type TranscriptCursor } from "./transcript-backfill.js";
-import { decideTranscriptRequest } from "./transcript-request-guard.js";
 import { createTransportDiagnostics } from "./transport-diagnostics.js";
 import { createTuiPromptAdapter } from "./tui-prompt-adapter.js";
 import { classifyTurnActionability } from "./turn-actionability.js";
@@ -105,6 +108,21 @@ import { buildVisibilityRegisterFields } from "./visibility-intent.js";
 
 const HEARTBEAT_INTERVAL = 15_000;
 const RELOAD_HANDOFF_TTL = 5_000;
+
+/**
+ * Formats the state behind a watchdog force-close for `server.log`.
+ *
+ * Shared by the primary connection and the `/dashboard-connect` move target:
+ * after a move the target IS the live connection, so omitting it there would
+ * silence exactly the socket under observation.
+ */
+function formatWatchdogFire(w: WatchdogFireInfo): string {
+  return (
+    `silent=${w.silentForMs}ms threshold=${w.watchdogTimeout}ms ` +
+    `readyState=${w.readyState} inboundQueue=${w.inboundQueueDepth} ` +
+    `refusedInbound=${w.refusedInbound} maxTickDrift=${w.maxTickDriftMs}ms`
+  );
+}
 const GIT_POLL_INTERVAL = 30_000;
 // Platform-aware process scan cadence. Windows keeps the original 10 s /
 // 30 s floor because PowerShell Get-CimInstance is expensive and can flash consoles;
@@ -375,16 +393,6 @@ function initBridge(pi: ExtensionAPI) {
   // when the trust handler runs. For a fresh headless spawn this IS the
   // dashboard-provided spawn cwd. See change: adopt-pi-074-080-features (A.3).
   const activationCwd = process.cwd();
-
-  // Does the running pi emit `agent_settled` natively (≥ 0.80.4)? Read once at
-  // activation. Floor pi → the bridge synthesizes a settle after each
-  // `agent_end`. Read failure → false → synthesize (safe default: the
-  // dashboard still gets exactly one terminal settle). See change:
-  // adopt-pi-074-080-features (A.1).
-  let piEmitsNativeSettled = false;
-  try {
-    piEmitsNativeSettled = nativeAgentSettledSupported(defaultReadPiVersion());
-  } catch { /* unknown version → synthesize */ }
 
   let promptBus: PromptBus | undefined;
 
@@ -1063,6 +1071,14 @@ function initBridge(pi: ExtensionAPI) {
     // by file mode or the local token and mint nothing.
     // See change: add-pi-gateway-transport-identity (D10b).
     prepareConnect: () => prepareRemoteUpgrade(dashboardUrl),
+    // Attribute every force-close. `record` flushes through the live socket
+    // when one is still OPEN (the callback runs BEFORE teardown) and falls
+    // back to the buffer otherwise, so the report survives either way.
+    onWatchdogFire: (w) => {
+      const detail = formatWatchdogFire(w);
+      console.log(`[dashboard] watchdog force-close ${detail}`);
+      transportDiagnostics.record({ event: "watchdog_force_close", detail });
+    },
     // Routing field for a drop report — the reporting bridge's OWN session,
     // never the id the dropped message named.
     // See change: fix-spawn-correlation-ttl-coupling (D6).
@@ -1133,6 +1149,26 @@ function initBridge(pi: ExtensionAPI) {
         return;
       }
       // Legacy extension_ui_response removed — now handled by prompt_response → promptBus.respond()
+      if (msg.type === "mcp_token_minted") {
+        // D5: the minted MCP bearer arrives on the session-private lane. The
+        // delivery module assigns it to this process's env and triggers the
+        // D6 recovery seam; it has NO pi dependency, so the plaintext can
+        // never reach pi.events (F4) or a log line (X5).
+        handleMcpTokenMinted(msg as { type: "mcp_token_minted"; token?: unknown }, {
+          assignEnv: (token) => {
+            process.env[MCP_TOKEN_ENV_VAR] = token;
+          },
+          reconnect: () => {
+            // D6 recovery trigger. Shipped pi-mcp-adapter (≤ 2.31) exposes no
+            // programmatic reconnect for a config-defined entry; recovery
+            // completes via the adapter's lazyConnect on the entry's next
+            // use, presenting the fresh env per request. See
+            // mcp-token-delivery.ts and the change's design record.
+          },
+          log: console,
+        });
+        return;
+      }
       // Reload auth credentials when dashboard notifies of changes
       if (msg.type === "credentials_updated") {
         try {
@@ -1388,6 +1424,21 @@ function initBridge(pi: ExtensionAPI) {
         }
         return;
       }
+      // Prompt resync (fix B, extension half): a browser asked the bridge to
+      // re-emit every prompt it is still awaiting an answer for — the bus's
+      // pending set is the source of truth, NOT the server's derived registry
+      // (D6). Each frame echoes the requester token so the server unicasts it
+      // back to the asking browser as a critical frame. Empty pending set →
+      // zero frames, no error (E10); a malformed token degrades to tokenless.
+      // See change: fix-pending-prompt-lost-on-replay (design D5/D6/D7).
+      if (msg.type === "prompt_resync_request") {
+        const echoId = (msg as { requestId?: unknown }).requestId;
+        const token = typeof echoId === "string" && echoId.length > 0 ? echoId : undefined;
+        if (promptBus) {
+          emitPendingPrompts(promptBus, (m) => connection.send(m as any), sessionId, token);
+        }
+        return;
+      }
       if (msg.type === "flow_control" && pi.events) {
         if (msg.action === "abort") {
           pi.events.emit("flow:abort", {});
@@ -1492,25 +1543,11 @@ function initBridge(pi: ExtensionAPI) {
       flushPendingSubagentFrames();
       // Re-send pending PromptBus requests so dashboard dialogs survive browser refresh.
       // Synchronous within this tick to prevent TUI respond() from interleaving.
-      // Client-side dedup by requestId prevents double-rendering.
+      // Client-side dedup by requestId prevents double-rendering. Shared with the
+      // prompt_resync_request handler so the two frames cannot drift (D7).
+      // See change: fix-pending-prompt-lost-on-replay.
       if (promptBus) {
-        for (const { request, component, placement } of promptBus.getPendingRequests()) {
-          connection.send({
-            type: "prompt_request" as any,
-            sessionId,
-            promptId: request.id,
-            prompt: {
-              type: request.type,
-              question: request.question,
-              options: request.options,
-              defaultValue: request.defaultValue,
-              pipeline: request.pipeline,
-              metadata: request.metadata,
-            },
-            component,
-            placement,
-          });
-        }
+        emitPendingPrompts(promptBus, (m) => connection.send(m as any), sessionId);
       }
       connection.send({ type: "replay_complete", sessionId });
       // If agent is mid-turn, send synthetic agent_start so server sets status to "streaming"
@@ -1522,6 +1559,23 @@ function initBridge(pi: ExtensionAPI) {
       // synchronous and re-runs the listener stack each call.
       // See change: add-extension-ui-modal.
       refreshUiModules(uiModulesBridgeCtx);
+    }),
+    // The idle half of the reconnect heal. The `agent_start` above re-asserts
+    // `streaming` when mid-turn; without this branch a `streaming` latched by
+    // an `agent_end` lost in the drop is never corrected.
+    //
+    // Spelled as a heartbeat, NOT a synthetic `agent_end`: that event carries
+    // run-boundary side effects (unread stamping, card reordering, OpenSpec
+    // proposal clearing) a correction must not fire (design D3).
+    //
+    // Sent from the POST-FLUSH hook so a real buffered `agent_end` is still
+    // processed first and still stamps unread (design D8).
+    //
+    // See change: fix-stuck-streaming-status-latch.
+    onPostFlush: safe(() => {
+      if (!isActive()) return; // Stale listener guard
+      if (getBridgeState().isAgentStreaming) return;
+      connection.send({ type: "session_heartbeat", sessionId, agentRunning: false });
     }),
   });
 
@@ -1853,6 +1907,13 @@ function initBridge(pi: ExtensionAPI) {
             headers: localTokenHeaders(url),
             getSessionId: () => sessionId,
             onMessage: (data) => handler(data),
+            // The move REBINDS `connection` to this manager, so without this
+            // every post-move force-close would be silent again.
+            onWatchdogFire: (w) => {
+              const detail = formatWatchdogFire(w);
+              console.log(`[dashboard] watchdog force-close (move target) ${detail}`);
+              transportDiagnostics.record({ event: "watchdog_force_close", detail });
+            },
             // On the FIRST open, not just reconnects: this is where the
             // provisional registration is announced, and a send before the
             // socket is live would be silently dropped.
@@ -2091,7 +2152,8 @@ function initBridge(pi: ExtensionAPI) {
     "session_compact_failed",
     // pi >= 0.84.4. Brackets a BLOCKING `ctx.ui` prompt so the dashboard can
     // tell "agent working" apart from "pi parked waiting on a user prompt".
-    // Subscribing below the floor is inert: older pi simply never emits them.
+    // The 0.85.1 lockstep floor guarantees both events; the subscription is
+    // unconditional (no version gate, not merely inert below an old floor).
     "ui_prompt_start",
     "ui_prompt_end",
   ] as const;
@@ -2116,7 +2178,6 @@ function initBridge(pi: ExtensionAPI) {
       // Flush parked text before every non-update event. This keeps a final
       // snapshot ahead of message_end and other lifecycle boundaries.
       if (eventType !== "message_update") updateCoalescer.flush();
-      let floorRetryWaiting: { attempt: number; delayMs: number } | undefined;
       // Track agent streaming state (survives reconnect/reload)
       if (eventType === "agent_start") {
         getBridgeState().isAgentStreaming = true;
@@ -2143,12 +2204,12 @@ function initBridge(pi: ExtensionAPI) {
         }
       }
       if (eventType === "agent_settled") {
-        // Terminal settle (native pi ≥ 0.80.4, fires once after the run loop).
-        // Clear streaming. This is the SOLE terminal signal for a retry chain:
-        // close it with auto_retry_end BEFORE forwarding the settle. On floor
-        // pi this branch never fires from a real event — the synth path below
-        // fires it after agent_end, and this handler re-runs for that synth.
-        // See changes: adopt-pi-074-080-features (A.1), retry-forever-with-stop-control.
+        // Terminal settle (native pi, guaranteed at the 0.85.1 lockstep floor;
+        // fires once after the run loop). Clear streaming. This is the SOLE
+        // terminal signal for a retry chain: close it with auto_retry_end
+        // BEFORE forwarding the settle. The floor-pi synthesis path was
+        // retired with agent-settled.ts. See changes: adopt-pi-074-080-features
+        // (A.1), retry-forever-with-stop-control, update-pi-core-0-85-adopt-apis.
         getBridgeState().isAgentStreaming = false;
         abortLatch.clear(sessionId);
         const retryEnd = retryTracker.observeAgentSettled(sessionId);
@@ -2167,15 +2228,6 @@ function initBridge(pi: ExtensionAPI) {
         const trackerSynth = retryTracker.observeAgentEnd(sessionId, event as any);
         if (trackerSynth) {
           sendSyntheticRetryEvent(trackerSynth.eventType, trackerSynth.data);
-          if (
-            trackerSynth.eventType === "auto_retry_waiting" &&
-            typeof trackerSynth.data.attempt === "number"
-          ) {
-            floorRetryWaiting = {
-              attempt: trackerSynth.data.attempt,
-              delayMs: typeof trackerSynth.data.delayMs === "number" ? trackerSynth.data.delayMs : 0,
-            };
-          }
         }
         // Automatic session topic-naming: attempt on each terminal turn until
         // the first success (or a permanent lockout). Non-blocking; all errors
@@ -2542,49 +2594,11 @@ function initBridge(pi: ExtensionAPI) {
       }
       if (!heldByThrottle) connection.send(msg);
 
-      // Floor-pi settle synthesis: pi < 0.80.4 never emits `agent_settled`.
-      // Per-attempt agent_end gets retryPending compatibility state; exhaustion,
-      // disabled/non-retryable timeout, success, or abort gets terminal state.
-      // Native pi returns null here and forwards its real settle above.
-      // See changes: adopt-pi-074-080-features, fix-retry-error-lifecycle.
-      const synthSettle = settleFollowUp(eventType, piEmitsNativeSettled, Date.now());
-      if (synthSettle) {
-        if (floorRetryWaiting) {
-          // A typed waiting signal is the floor-pi proof that this agent_end is
-          // per-attempt. Keep the client lifecycle pending immediately.
-          connection.send({
-            type: "event_forward",
-            sessionId,
-            event: markFloorSettle(synthSettle, false),
-          });
-
-          // A non-retryable provider error can look waiting because extensions
-          // cannot call pi's private classifier. If the matching agent_start
-          // never arrives by the observed delay plus grace, converge terminal.
-          const expected = floorRetryWaiting;
-          setTimeout(() => {
-            if (!isActive() || !sessionReady) return;
-            if (!retryTracker.isAwaitingRetry(sessionId, expected.attempt)) return;
-            abortLatch.clear(sessionId);
-            const retryEnd = retryTracker.observeAgentSettled(sessionId);
-            if (retryEnd) {
-              sendSyntheticRetryEvent(retryEnd.eventType, retryEnd.data);
-            }
-            connection.send({
-              type: "event_forward",
-              sessionId,
-              event: synthesizeAgentSettledEvent(Date.now()),
-            });
-          }, floorRetryReconcileDelay(expected.delayMs));
-        } else {
-          abortLatch.clear(sessionId);
-          const retryEnd = retryTracker.observeAgentSettled(sessionId);
-          if (retryEnd) {
-            sendSyntheticRetryEvent(retryEnd.eventType, retryEnd.data);
-          }
-          connection.send({ type: "event_forward", sessionId, event: synthSettle });
-        }
-      }
+      // Native `agent_settled` (pi ≥ 0.80.4, guaranteed at the 0.85.1 floor) is
+      // the single terminal signal; the bridge forwards it above and the
+      // `agent_settled` handler closes the retry chain. The floor-pi synthesis
+      // path was retired once `piCompatibility.minimum` reached a version that
+      // emits natively. See change: update-pi-core-0-85-adopt-apis.
     }));
   }
 
@@ -2599,6 +2613,48 @@ function initBridge(pi: ExtensionAPI) {
       connection.send(msg);
     }));
   }
+
+  // ── Subagent fan-out admission ────────────────────────────────────────────
+  // Bounds concurrently in-flight `Agent` children so a wide fan-out on a loaded
+  // host cannot stall the parent's event loop until the process is reaped.
+  //
+  // Registered AFTER the pass-through loop above ON PURPOSE: `runner.emitToolCall`
+  // returns on the FIRST handler that answers a blocking result, so a gate
+  // registered earlier would starve the bridge's own `tool_call` forwarder — the
+  // dashboard would miss the refused call's `tool_call` while still seeing its
+  // `tool_execution_end`, and live UI and transcript would disagree. See D8.
+  //
+  // The result carries `block` + `reason` and NEVER `terminate`: a refusal is
+  // "not now" (re-issue after running children finish), not a task failure. The
+  // `block` decision itself lives in `subagent-fanout-admission.ts`. See change:
+  // bound-subagent-fanout-under-host-pressure (D2/D4/D5/D6/D7/D8).
+  const admissionSampler = new SaturationSampler();
+  const fanoutAdmission = new FanoutAdmissionGate({
+    resolveConfig: () => resolveAdmissionConfig(config),
+    saturation: admissionSampler,
+    // Refusals are ALSO written durably: the failure this mitigates ends with the
+    // process gone, so counters carried only by the live frame vanish in exactly
+    // the case that matters. Admissions write nothing (hot path, no FS I/O).
+    recordRefusal: (record) => {
+      try {
+        pi.appendEntry("subagent-admission-refused", record);
+      } catch (err) {
+        console.error("[dashboard] subagent-admission-refused entry failed:", err);
+      }
+    },
+  });
+  pi.on("tool_call", safe((event: any) => {
+    if (!isActive()) return;
+    return fanoutAdmission.onToolCall(event);
+  }));
+  // Release permits on `tool_execution_end` — the ONE signal pi emits on the
+  // normal, blocked AND aborted paths. NEVER `tool_result`: an aborted call
+  // skips the path that produces it, so a permit released there would leak on
+  // every Esc and eventually refuse all subagent work for the session. See D2.
+  pi.on("tool_execution_end", safe((event: any) => {
+    if (!isActive()) return;
+    fanoutAdmission.onExecutionEnd(event);
+  }));
 
   // Generic custom entries/messages (pi.appendEntry / pi.sendMessage) are NOT
   // subscribed here: pi does NOT dispatch `entry_appended` to extensions, and
@@ -3260,6 +3316,22 @@ function initBridge(pi: ExtensionAPI) {
     // Allow event forwarding now that session_register is buffered
     sessionReady = true;
 
+    // D3: mint-on-registration. Ask the mcp-server plugin for this session's
+    // /mcp credential now that the socket is (re)registered — the reply
+    // arrives on the session-private lane (mcp_token_minted) and lands in
+    // process.env before the first MCP use, and re-lands after every
+    // reconnect, which is what makes a dashboard restart self-heal. Ordered
+    // after session_register on the SAME socket, so the server's
+    // connection-key attribution is already established when it arrives.
+    // See change: wire-mcp-session-token (D3/D5).
+    connection.send({
+      type: "plugin_pi_message",
+      sessionId,
+      pluginId: "mcp-server",
+      messageType: "mcp/mint-token",
+      payload: {},
+    });
+
     // Flush any subagent frames buffered during the not-ready window (D1) so a
     // reconnect/discovery/reload gap self-heals instead of leaving a running
     // subagent's detail empty. See change: fix-subagent-live-detail-reliability.
@@ -3484,6 +3556,14 @@ function initBridge(pi: ExtensionAPI) {
       connection.send({
         type: "session_heartbeat",
         sessionId,
+        // Liveness truth for the server's status reconcile: `streaming` is
+        // otherwise a one-way latch and a single dropped `agent_end` sticks
+        // the card on `Thinking…` forever.
+        // `=== true` because the flag is optional and is `undefined` before
+        // the first turn: sent raw it would serialize away and read as "old
+        // bridge, no liveness truth" instead of "idle".
+        // See change: fix-stuck-streaming-status-latch.
+        agentRunning: getBridgeState().isAgentStreaming === true,
         // Fold the bridge→server ring-buffer eviction count into the heartbeat
         // so it reaches `/api/health`. See change:
         // fix-stuck-tool-card-on-dropped-event.
@@ -3495,6 +3575,11 @@ function initBridge(pi: ExtensionAPI) {
           // throttle's two information-loss modes are observable in production
           // instead of only at L1. See change: reduce-bridge-tick-bandwidth (D6).
           ...subagentTickThrottle.stats,
+          // Subagent fan-out admission counters ride the same transport, so a
+          // narrowed fan-out is observable instead of looking like a model that
+          // chose not to parallelize. See change:
+          // bound-subagent-fanout-under-host-pressure (D7).
+          ...fanoutAdmission.counters,
         },
       });
     }, HEARTBEAT_INTERVAL);
@@ -3735,6 +3820,10 @@ function initBridge(pi: ExtensionAPI) {
       updateCoalesceTimer = null;
       activeUpdateCoalescers = new Set();
     }
+    // Disable the admission sampler's private event-loop histogram. A bridge
+    // re-init (/reload, session replacement) constructs a fresh sampler; without
+    // this the superseded 20 ms-resolution monitor runs until process exit.
+    admissionSampler.dispose();
 
     // Dev build & restart: rebuild client and stop server before reload
     if (config.devBuildOnReload) {

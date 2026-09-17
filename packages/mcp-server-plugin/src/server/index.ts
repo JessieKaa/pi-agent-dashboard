@@ -20,60 +20,31 @@
  * - Provisioning failure is logged, never thrown: writing `mcp.json` is a
  *   convenience for local pi sessions, not a precondition for serving `/mcp`
  *   (J7).
+ *
+ * See change: extract-mcp-client-plugin (tasks 6.1, 6.2).
  */
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type { ServerPluginContext } from "@blackbelt-technology/dashboard-plugin-runtime/server";
-import { type ToolInvocation } from "./dispatch.js";
-import { probeAdapterVersion, provisionDashboardEntry } from "./provisioning.js";
+import {
+  createRealConfigIO,
+  type McpClientConfigService,
+} from "@blackbelt-technology/pi-dashboard-mcp-client-plugin/core";
+import { createAdapterWarnOnce } from "./adapter-diagnostic.js";
+import type { ToolInvocation } from "./dispatch.js";
+import { GENERATED_TOOLS } from "./generated/tools.js";
+import { type ListSessionsArgs, listSessions, validateListSessionsArgs } from "./list-sessions.js";
+import type { DashboardSession } from "@blackbelt-technology/pi-dashboard-shared/types.js";
+import { provisionDashboardEntry } from "./provisioning.js";
 import { mountMcpRoutes } from "./routes.js";
-import { SubscriptionRegistry, type StreamSink } from "./streaming.js";
+import { filterToolsByRoute } from "./route-skew.js";
+import { SubscriptionRegistry } from "./streaming.js";
 import { McpTokenRegistry } from "./tokens.js";
-import { MCP_TOOLS, checkToolCompleteness, assertContextPartitionTotal } from "./tools.js";
+import { assertContextPartitionTotal, checkToolCompleteness } from "./tools.js";
 
 const PLUGIN_ID = "mcp-server";
 
 /** Bridge message names this plugin answers on a session's own socket. */
 const MINT_MESSAGE = "mcp/mint-token";
 const REVOKE_MESSAGE = "mcp/revoke-token";
-
-function mcpConfigPath(): string {
-  return path.join(os.homedir(), ".pi", "agent", "mcp.json");
-}
-
-/**
- * Read the installed `pi-mcp-adapter` version from disk.
- *
- * Resolved here rather than consumed from a host service, because there is no
- * such service — consuming a name nobody registers yields `null` forever and
- * makes the probe report "not installed" even when it is, which is worse than
- * no diagnostic at all.
- */
-function readInstalledAdapterVersion(): string | null {
-  const candidates = [
-    path.join(os.homedir(), ".pi", "agent", "npm", "node_modules", "pi-mcp-adapter", "package.json"),
-    path.join(os.homedir(), ".pi", "agent", "node_modules", "pi-mcp-adapter", "package.json"),
-  ];
-  for (const p of candidates) {
-    try {
-      const raw = fs.readFileSync(p, "utf8");
-      const version = (JSON.parse(raw) as { version?: unknown }).version;
-      if (typeof version === "string") return version;
-    } catch {
-      /* not installed at this location; try the next */
-    }
-  }
-  return null;
-}
-
-/** Atomic write: temp file in the same directory, then rename. */
-function writeFileAtomic(target: string, content: string): void {
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  const tmp = `${target}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, content, { mode: 0o600 });
-  fs.renameSync(tmp, target);
-}
 
 export async function registerPlugin(ctx: ServerPluginContext): Promise<void> {
   ctx.logger.info("mcp-server plugin server entry activated");
@@ -97,16 +68,29 @@ export async function registerPlugin(ctx: ServerPluginContext): Promise<void> {
   const hostVerifyDeviceToken = ctx.consume<(t: string) => string | null>(
     "host.verifyDeviceToken",
   );
-  if (!hostVerifyDeviceToken) {
+  // Tier-aware companion (change: expand-mcp-tiered-surface, D1). Preferred
+  // when a host provides it; absent against an older host, where the id-only
+  // service is used and every device token reads as `operate`.
+  const hostVerifyDeviceTokenTier = ctx.consume<
+    (t: string) => { id: string; tier: import("@blackbelt-technology/pi-dashboard-shared/tiers.js").Tier } | null
+  >("host.verifyDeviceTokenTier");
+  if (!hostVerifyDeviceTokenTier) {
+    ctx.logger.info(
+      "mcp-server: host service 'host.verifyDeviceTokenTier' is unavailable — device tokens resolve to the operate tier (old host)",
+    );
+  }
+  if (!hostVerifyDeviceToken && !hostVerifyDeviceTokenTier) {
     ctx.logger.error(
       "mcp-server: host service 'host.verifyDeviceToken' is unavailable — device-token callers (Claude Desktop, Cursor, phone) cannot authenticate",
     );
   }
   const verifyDeviceToken = (token: string): string | null =>
-    hostVerifyDeviceToken?.(token) ?? null;
+    hostVerifyDeviceToken?.(token) ?? hostVerifyDeviceTokenTier?.(token)?.id ?? null;
 
   const handlers: Record<string, (inv: ToolInvocation) => Promise<unknown>> = {
-    list_sessions: async () => ({ sessions: ctx.sessionManager.listAll() }),
+    list_sessions: async ({ args }) =>
+      // Bounded, filterable, cursor-paged (change: paginate-mcp-list-sessions).
+      listSessions(ctx.sessionManager.listAll() as DashboardSession[], args as ListSessionsArgs),
     send_prompt: async ({ args }) => ({
       delivered: ctx.sendToSession(args.sessionId as string, args.text as string),
     }),
@@ -120,26 +104,85 @@ export async function registerPlugin(ctx: ServerPluginContext): Promise<void> {
     },
   };
 
-  const completeness = checkToolCompleteness(MCP_TOOLS, (name) => handlers[name]);
+  // Route-skew guard (D4): a published plugin may run against an older host
+  // that lacks some REST routes. Drop those rows from the advertised surface
+  // with one warning each, rather than advertising a tool that 404s.
+  const tools = filterToolsByRoute(
+    GENERATED_TOOLS,
+    (method, url) => ctx.fastify.hasRoute({ method: method as never, url }),
+    (m) => ctx.logger.warn(m),
+  );
+  // Completeness must consult the ACTUAL handlers: a context row with no
+  // handler would otherwise pass a membership-only resolver and only fail at
+  // call time. `rest`/`session` rows are executed by dispatch's binders.
+  const completeness = checkToolCompleteness(tools, (name) => {
+    const tool = tools.find((t) => t.name === name);
+    if (!tool) return undefined;
+    return tool.bind.kind === "context" ? handlers[name] : () => undefined;
+  });
   if (!completeness.ok) {
     ctx.logger.error(
       `mcp-server: advertised tools without a handler: ${completeness.missing.join(", ")}`,
     );
   }
 
+  // Lazy, once-per-process adapter-version diagnostic. Emitted on the first
+  // `/mcp` request (not at registration) and only when the consumed service's
+  // verdict is not `ok`; a missing service reads as `unknown`.
+  const warnAdapterOnce = createAdapterWarnOnce(ctx.logger, () =>
+    ctx.consume<McpClientConfigService>("mcp-client.config"),
+  );
+
   await mountMcpRoutes(ctx.fastify, {
     tokens,
+    tools,
     verifyDeviceToken: (token) => verifyDeviceToken(token),
+    verifyDeviceTokenTier: hostVerifyDeviceTokenTier ?? undefined,
+    onMcpRequest: warnAdapterOnce,
     serverInfo: { name: "pi-dashboard", version: process.env.npm_package_version ?? "0.0.0" },
     invokeTool: async (invocation) => {
       const handler = handlers[invocation.tool.name];
       if (!handler) throw new Error(`No handler for tool ${invocation.tool.name}`);
       return handler(invocation);
     },
+    // REST-bound tools execute through the live Fastify instance with caller
+    // identity (D4). `origin` is forwarded ONLY for genuinely-local callers
+    // (see dispatch's `injectIdentity`); session callers are excluded here too.
+    inject: async ({ method, url, payload, headers, remoteAddress }) => {
+      const res = await ctx.fastify.inject({
+        method: method as "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
+        url,
+        ...(payload !== undefined ? { payload: payload as object } : {}),
+        ...(headers ? { headers } : {}),
+        ...(remoteAddress ? { remoteAddress } : {}),
+      });
+      let body: unknown = res.body;
+      try {
+        body = res.json();
+      } catch {
+        /* non-JSON body stays as text */
+      }
+      return { statusCode: res.statusCode, body };
+    },
+    // Session-bound tools forward to the owning bridge.
+    sendToSession: (sessionId, message) => ctx.sendToSession(sessionId, message as never),
+    // Tool-specific argument checks beyond the generated schema shape — the
+    // bound/filter/cursor rules the list_sessions page owns.
+    validateToolArgs: (name, args) =>
+      name === "list_sessions" ? validateListSessionsArgs(args) : null,
     recordRefusal: ({ callerSessionId, targetSessionId, tool }) => {
       // G5 — refusals must be observable, with all three identifiers.
       ctx.logger.warn(
         `mcp-server: refused self-target caller=${callerSessionId} target=${targetSessionId} tool=${tool}`,
+      );
+    },
+    // D2/observability — an out-of-tier call is logged with caller identity,
+    // tool name, caller tier and required tier.
+    recordTierRefusal: ({ caller, tool, callerTier, requiredTier }) => {
+      const who =
+        caller.kind === "session" ? `session=${caller.sessionId}` : `device=${caller.deviceId}`;
+      ctx.logger.warn(
+        `mcp.tier_refused caller=${who} tool=${tool} callerTier=${callerTier} requiredTier=${requiredTier}`,
       );
     },
     // `subscriptions/listen` is intercepted by the route layer before dispatch
@@ -165,7 +208,17 @@ export async function registerPlugin(ctx: ServerPluginContext): Promise<void> {
     // representation on the wire (M4).
     const token = tokens.mintForSession(sessionId);
     ctx.logger.info(`mcp-server: minted a token for session ${sessionId}`);
-    return { token };
+    // D5: the plaintext travels back on the session-private extension lane —
+    // registerPiHandler return values are DISCARDED by the dispatcher, so a
+    // `return { token }` here was dead code and the delivery path never had a
+    // wire. X1: a closed bridge socket surfaces as `false` — logged with the
+    // session id, never a throw, and /mcp keeps serving other callers.
+    const delivered = ctx.sendExtensionMessage(sessionId, { type: "mcp_token_minted", token });
+    if (!delivered) {
+      ctx.logger.warn(
+        `mcp-server: could not deliver the minted token to session ${sessionId} (bridge unreachable)`,
+      );
+    }
   });
 
   ctx.registerPiHandler(REVOKE_MESSAGE, (msg: unknown, sessionId: string) => {
@@ -183,23 +236,13 @@ export async function registerPlugin(ctx: ServerPluginContext): Promise<void> {
 
   // --- Provisioning ---------------------------------------------------------
 
-  const adapterVersion = readInstalledAdapterVersion();
-  const probe = probeAdapterVersion(adapterVersion);
-  if (!probe.ok) {
-    // A warning, not a failure: the endpoint serves external clients fine
-    // without a local adapter. Only the local-pi path needs the floor.
-    ctx.logger.warn(`mcp-server: ${probe.message}`);
-  }
-
   // A live getter — the bound port is unknown until listen() resolves, so a
   // boot-time snapshot would provision a URL pointing at the wrong address on
   // any non-default port.
   const port = ctx.consume<() => number | null>("host.httpPort")?.() ?? 8000;
-  const result = provisionDashboardEntry(
-    { readFile: (p) => (fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null), writeFileAtomic },
-    mcpConfigPath(),
-    `http://127.0.0.1:${port}/mcp`,
-  );
+  const result = provisionDashboardEntry(createRealConfigIO(), {
+    url: `http://127.0.0.1:${port}/mcp`,
+  });
   if (!result.ok) {
     ctx.logger.warn(`mcp-server: could not provision mcp.json (${result.state}): ${result.message}`);
   } else {

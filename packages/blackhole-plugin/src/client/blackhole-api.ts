@@ -2,14 +2,19 @@
  * Thin REST client for the blackhole config endpoints plus the installed-ness
  * probe.
  *
- * Installed-ness comes from `GET /api/plugins` — pi's package registry as the
- * host's own requirement probes report it — NOT from the presence of blackhole's
- * directory or config file, which the extension creates on first run and which
- * therefore only means "has run at least once" (spec: installed-ness comes from
- * the package registry).
+ * Installed-ness comes from `GET /api/plugins/blackhole/status` — the plugin's
+ * own route, whose answer is the registry-backed `isPiExtensionInstalled`
+ * capability (degrading to config-file existence only when the host lacks the
+ * capability) — NOT from a client-side guess. During a scan failure (503) or
+ * any unknown answer this resolves to `true` (fail-open): an unknown answer
+ * must not fabricate a not-installed state over a working config. The client
+ * boot gate fails CLOSED on the same uncertainty — opposite stakes, deliberate
+ * postures (design D1).
  *
- * See change: add-blackhole-plugin.
+ * See change: add-blackhole-plugin, add-blackhole-session-pipeline.
  */
+
+import type { ModelInfo } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 
 export interface FieldView {
   value: unknown;
@@ -34,8 +39,8 @@ export interface ConfigParseError {
 export type ConfigResult = ConfigOk | ConfigParseError;
 
 const ROUTE = "/api/plugins/blackhole/config";
-const PLUGIN_ID = "blackhole";
-const EXTENSION_ID = "pi-blackhole";
+const STATUS_ROUTE = "/api/plugins/blackhole/status";
+const MODELS_ROUTE = "/api/models";
 
 async function parseJson<T>(res: Response): Promise<T> {
   const ct = res.headers.get("content-type") ?? "";
@@ -77,22 +82,103 @@ export async function putConfig(managed: Record<string, unknown>, apiBase = ""):
   return body;
 }
 
-interface PluginRow {
-  id: string;
-  status: { missingRequirements?: string[] } | null;
+/**
+ * Is `pi-blackhole` installed? Answers from the plugin's own `/status` route
+ * (design D1). Fail-open on unknown: network error, non-200 (incl. the 503 of
+ * a scan failure), or a malformed body resolve to `true` so an unknown answer
+ * cannot fabricate a not-installed state over a working config.
+ */
+export async function isExtensionInstalled(apiBase = "", signal?: AbortSignal): Promise<boolean> {
+  try {
+    const res = await fetch(`${apiBase}${STATUS_ROUTE}`, { signal });
+    const body = await parseJson<{ installed?: unknown }>(res);
+    if (res.ok && typeof body?.installed === "boolean") return body.installed;
+  } catch {
+    // network failure — unknown, fail open
+  }
+  return true;
+}
+
+export type ModelsResult =
+  | { kind: "ok"; models: ModelInfo[] }
+  | { kind: "unavailable"; reason: string };
+
+function extractProviderAndId(row: Record<string, unknown>): { provider: string; id: string } | null {
+  if (typeof row.id !== "string" || !row.id.trim()) return null;
+  const rawId = row.id.trim();
+  const rawProvider = typeof row.provider === "string" ? row.provider.trim() : "";
+
+  if (!rawProvider) {
+    if (!rawId.includes("/")) return null;
+    const slashIdx = rawId.indexOf("/");
+    return { provider: rawId.slice(0, slashIdx), id: rawId.slice(slashIdx + 1) };
+  }
+
+  const id = rawId.startsWith(`${rawProvider}/`)
+    ? rawId.slice(rawProvider.length + 1)
+    : rawId;
+
+  return id ? { provider: rawProvider, id } : null;
+}
+
+function parseModelRow(raw: unknown): ModelInfo | null {
+  if (!raw || typeof raw !== "object") return null;
+  const row = raw as Record<string, unknown>;
+  const pair = extractProviderAndId(row);
+  if (!pair) return null;
+
+  const model: ModelInfo = { provider: pair.provider, id: pair.id };
+  if (typeof row.name === "string" && row.name.trim()) {
+    model.name = row.name.trim();
+  }
+  if (typeof row.reasoning === "boolean") {
+    model.reasoning = row.reasoning;
+  }
+  if (typeof row.vision === "boolean") {
+    model.vision = row.vision;
+  }
+  if (typeof row.contextWindow === "number" && !Number.isNaN(row.contextWindow)) {
+    model.contextWindow = row.contextWindow;
+  }
+
+  return model;
 }
 
 /**
- * Is `pi-blackhole` present in pi's installed-package registry? Answers from the
- * host's own requirement report. A probe that has not reported yet (or a plugin
- * row the host does not know) resolves to `true` — an unknown answer must not
- * fabricate a not-installed state over a working config.
+ * Fetch available models from `GET /api/models` (design D1).
+ *
+ * Resolves to `{ kind: "ok", models }` or `{ kind: "unavailable", reason }` (never rejects).
+ *
+ * Write direction note:
+ * Consumers picking from this list MUST resolve the picked row by exact match against
+ * the fetched list (`models.find(m => `${m.provider}/${m.id}` === label)`), NEVER by
+ * splitting `label` on `/`, as model ids may contain slashes (e.g. meta/llama-3).
  */
-export async function isExtensionInstalled(apiBase = "", signal?: AbortSignal): Promise<boolean> {
-  const res = await fetch(`${apiBase}/api/plugins`, { signal });
-  const body = await parseJson<{ plugins?: PluginRow[] }>(res);
-  const row = body.plugins?.find((p) => p.id === PLUGIN_ID);
-  const missing = row?.status?.missingRequirements;
-  if (!Array.isArray(missing)) return true;
-  return !missing.some((m) => m === EXTENSION_ID || m.includes(EXTENSION_ID));
+export async function getModels(apiBase = "", signal?: AbortSignal): Promise<ModelsResult> {
+  try {
+    const res = await fetch(`${apiBase}${MODELS_ROUTE}`, { signal });
+    if (!res.ok) {
+      return {
+        kind: "unavailable",
+        reason: `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`,
+      };
+    }
+    const body = await parseJson<{ object?: string; data?: unknown[] }>(res);
+    if (!body || !Array.isArray(body.data)) {
+      return { kind: "unavailable", reason: "Invalid model list response format" };
+    }
+
+    const models: ModelInfo[] = [];
+    for (const raw of body.data) {
+      const parsed = parseModelRow(raw);
+      if (parsed) models.push(parsed);
+    }
+
+    return { kind: "ok", models };
+  } catch (err) {
+    return {
+      kind: "unavailable",
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
 }

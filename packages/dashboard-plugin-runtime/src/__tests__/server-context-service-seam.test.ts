@@ -20,8 +20,10 @@ function depsWithSharedRegistry(): ServerContextDeps {
     registerBrowserHandler: () => {},
     onEvent: () => () => {},
     onSessionEnded: () => () => {},
+    onSessionResolved: () => () => {},
     sendToSession: () => true,
     emitEventToSession: () => true,
+    sendExtensionMessage: () => false,
     consumeAll: <T = unknown>(prefix: string) => {
       const out: Array<{ key: string; value: T }> = [];
       for (const [key, value] of registry) if (key.startsWith(prefix)) out.push({ key, value: value as T });
@@ -36,6 +38,11 @@ function depsWithSharedRegistry(): ServerContextDeps {
     consume: <T = unknown>(name: string) => registry.get(name) as T | undefined,
     getPluginConfig: () => ({}),
     updatePluginConfig: async () => {},
+    mintSpawnToken: () => "tok-test",
+    renameSession: () => false,
+    assignSessionRef: () => false,
+    networkGuard: async () => {},
+    onShutdown: () => () => {},
   };
 }
 

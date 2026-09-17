@@ -1,4 +1,7 @@
 @import "tailwindcss";
+/* AsciiDoc / docx preview typography, scoped to `.asciidoc-body`.
+   See change: asciidoc-support. */
+@import "./styles/asciidoc.css";
 
 /* Plugin packages that ship client-side React components with Tailwind
    utility classes. Without these @source directives, Tailwind v4 only
@@ -16,6 +19,7 @@
 @source "../../subagents-plugin/src/client";
 @source "../../goal-plugin/src/client";
 @source "../../automation-plugin/src/client";
+@source "../../mcp-client-plugin/src/client";
 
 /* Shared font-size for code/diff payload inside tool-call renderers.
    See change: unify-tool-renderer-code-font-size. Keeps Read/Write/Edit/
@@ -71,7 +75,10 @@
   /* Text — clear hierarchy */
   --text-primary: #e5e5e5;     /* headings, important text */
   --text-secondary: #b0b0b0;   /* body text, descriptions */
-  --text-tertiary: #808080;    /* labels, secondary info */
+  /* --text-tertiary carries 10-11px body text: AA 4.5:1 on --bg-tertiary AND
+     --bg-surface. Mirrors themes.ts baseDark exactly (parity is tested).
+     See change: stop-discarding-known-session-state. */
+  --text-tertiary: #919191;    /* labels, secondary info */
   --text-muted: #585858;       /* hints, disabled text */
   --text-faint: #3a3a3a;       /* very subtle text */
 
@@ -205,7 +212,8 @@
   /* Text */
   --text-primary: #1a1a1a;
   --text-secondary: #444444;
-  --text-tertiary: #777777;
+  /* Mirrors themes.ts baseLight (see the :root note above). */
+  --text-tertiary: #636363;
   --text-muted: #aaaaaa;
   --text-faint: #d0d0d0;
 

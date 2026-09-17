@@ -1,12 +1,17 @@
 import path from "node:path";
 import { defineConfig } from "vitest/config";
+import { PARALLEL_MAX_WORKERS } from "../../vitest.workers";
 
 export default defineConfig({
   test: {
     include: ["src/**/__tests__/**/*.test.ts"],
     environment: "node",
     pool: "forks",
-    maxWorkers: "50%",
+    maxWorkers: PARALLEL_MAX_WORKERS,
+    // Session/agent command tests boot heavy async paths that blew the 5s
+    // default under fork contention. Contention headroom, not a hang budget.
+    // See change: contention-harden-real-process-tests.
+    testTimeout: 30_000,
     globalSetup: ["@blackbelt-technology/pi-dashboard-shared/test-support/setup-home.ts"],
     // Per-file HOME isolation: role-manager / model-resolve tests write
     // ~/.pi/agent/providers.json and clobber each other across parallel forks

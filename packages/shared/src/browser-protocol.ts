@@ -144,6 +144,34 @@ export interface SessionRemovedMessage {
 }
 
 /**
+ * A session transitioned to `archived` and was evicted from the live set.
+ * Distinct from `session_removed`, whose client handler intentionally keeps
+ * the row (ended, transcript preserved). The client deletes the id from its
+ * `sessions` Map and sets the folder's archived count in one step.
+ * See change: archive-sessions-lazy-load.
+ */
+export interface SessionArchivedMessage {
+  type: "session_archived";
+  sessionId: string;
+  /** Folder group key the archived session now counts under. */
+  cwd: string;
+  /** New archived count for that folder group key. */
+  count: number;
+}
+
+/**
+ * A folder's archived count changed (restore, delete or pin re-key). Sent
+ * whenever the count changes EXCEPT the archive transition itself, which
+ * carries the count on `session_archived` instead.
+ * See change: archive-sessions-lazy-load.
+ */
+export interface ArchivedCountUpdatedMessage {
+  type: "archived_count_updated";
+  cwd: string;
+  count: number;
+}
+
+/**
  * A session's process outlived its shutdown.
  *
  * Emitted alongside `session_removed`, never instead of it: the record IS
@@ -301,6 +329,21 @@ export interface BrowserOpenSpecUpdateMessage {
   type: "openspec_update";
   cwd: string;
   data: OpenSpecData;
+}
+
+/**
+ * Server → browser reply to one `openspec_get`. `final:false` is the immediate
+ * cold-cache placeholder (a final reply follows); `final:true` is the last
+ * reply for this `requestId`. `data` has the same shape as an `openspec_update`
+ * payload so the client applies it identically.
+ * See change: fix-connect-snapshot-frame-loss (D6).
+ */
+export interface OpenSpecGetResultMessage {
+  type: "openspec_get_result";
+  requestId: string;
+  cwd: string;
+  data: OpenSpecData;
+  final: boolean;
 }
 
 /**
@@ -516,6 +559,63 @@ export interface SessionsReorderedMessage {
 }
 
 /**
+ * Server → browser reply to one `sessions_page` request: the next batch of a
+ * session group's ended sessions that the snapshot window excluded. `order`
+ * lists the ids of `sessions` in the group's ended-sequence order; `hasMore`
+ * is true when further non-window ended sessions remain beyond this page.
+ * See change: fix-connect-snapshot-frame-loss (D5/D9).
+ */
+export interface SessionsPageResultMessage {
+  type: "sessions_page_result";
+  cwd: string;
+  sessions: DashboardSession[];
+  order: string[];
+  hasMore: boolean;
+}
+
+/**
+ * One row of the in-memory archive index. Built at boot from a sidecar and
+ * served by the archived listing/search endpoints without disk IO. `endedAt`
+ * falls back to the sidecar mtime at build time so every row sorts.
+ * See change: archive-sessions-lazy-load.
+ */
+export interface ArchivedSessionSummary {
+  id: string;
+  name?: string;
+  firstMessage?: string;
+  cwd: string;
+  /** Display folder group path (pin > worktree main > cwd). */
+  groupPath: string;
+  gitWorktree?: { mainPath: string; name: string };
+  endedAt: number;
+  archivedAt: number;
+  sessionFile: string;
+  /**
+   * Paired-device id of the host the session RAN on, carried through archiving.
+   * Absent means local (same encoding as `DashboardSession.originDeviceId`).
+   *
+   * Without it an archived session's origin is unknowable — and `sessionFile`
+   * here is a path on the ORIGIN host, which on a same-username machine names a
+   * real but unrelated local file (#E15). Old rows lack it and read as local,
+   * which is what they were before remote origins existed.
+   * See change: serve-retained-remote-transcripts.
+   */
+  originDeviceId?: string;
+  /**
+   * How much of this REMOTE session's transcript the dashboard retained.
+   * Stamped ONLY by the single-row read (`GET /api/sessions/archived/:id`),
+   * never by the listing — the listing would pay a store read per row for a
+   * state only the opened session renders.
+   *
+   * It cannot ride the usual path: completeness reaches live sessions via a
+   * `session_updated` broadcast, which the client drops for any session absent
+   * from its live map — and an archived session is absent by construction.
+   * See change: serve-retained-remote-transcripts (task 2.2).
+   */
+  retainedTranscript?: "complete" | "incomplete" | "absent";
+}
+
+/**
  * Atomic on-connect snapshot of the server's full session registry and
  * per-cwd ordering. Replaces the legacy per-session `session_added` loop
  * + per-cwd `sessions_reordered` loop that the gateway used to emit on
@@ -531,10 +631,23 @@ export interface SessionsReorderedMessage {
  */
 export interface SessionsSnapshotMessage {
   type: "sessions_snapshot";
-  /** Every session known to the server at construction time, alive AND ended. */
+  /** Every non-archived session known to the server, alive AND ended. */
   sessions: DashboardSession[];
   /** cwd → ordered session ids. Only non-empty arrays are included. */
   orders: Record<string, string[]>;
+  /**
+   * Session group key → count of ended sessions for that group regardless of
+   * the snapshot window, for every group with ≥1 ended session. A group whose
+   * ended sessions all fall outside the window still renders a stub folder
+   * group from this count. See change: fix-connect-snapshot-frame-loss (D4).
+   */
+  endedTotals: Record<string, number>;
+  /**
+   * Folder group key → archived-session count, from the in-memory archive
+   * index. Folders with count 0 are omitted. See change:
+   * archive-sessions-lazy-load.
+   */
+  archivedCountByCwd: Record<string, number>;
 }
 
 export interface PinnedDirsUpdatedMessage {
@@ -617,6 +730,13 @@ export interface BrowserPromptRequestMessage {
     props: Record<string, unknown>;
   };
   placement: string;
+  /**
+   * Correlation token echoed by the bridge on a `prompt_resync_request` reply,
+   * so the server routes the re-emitted prompt to the requesting socket as a
+   * blocking frame instead of the guarded fan-out. Absent on a live prompt.
+   * See change: fix-pending-prompt-lost-on-replay (D4).
+   */
+  __resyncRequestId?: string;
 }
 
 /**
@@ -1008,6 +1128,8 @@ export type ServerToBrowserMessage =
   | SessionAddedMessage
   | SessionUpdatedMessage
   | SessionRemovedMessage
+  | SessionArchivedMessage
+  | ArchivedCountUpdatedMessage
   | SessionOrphanedMessage
   | EventMessage
   | EventReplayMessage
@@ -1019,7 +1141,9 @@ export type ServerToBrowserMessage =
   | BrowserUiDismissMessage
   | BrowserFilesListMessage
   | BrowserOpenSpecUpdateMessage
+  | OpenSpecGetResultMessage
   | BrowserGitHeadUpdateMessage
+  | SessionsPageResultMessage
   | BrowserOpenSpecGroupsUpdateMessage
   | BrowserGoalsUpdateMessage
   | BrowserModelsListMessage
@@ -1070,7 +1194,9 @@ export type ServerToBrowserMessage =
   | PromptReceivedToBrowserMessage
   | CanvasIntentMessage
   | CanvasServerChipMessage
-  | FileChangedMessage;
+  | FileChangedMessage
+  | BrowserRelayFrameMessage
+  | BrowserRelayStatusMessage;
 
 /**
  * Server push: drive the per-session auto-canvas surface (change: auto-canvas).
@@ -1280,6 +1406,28 @@ export interface OpenSpecRefreshBrowserMessage {
   cwd: string;
 }
 
+/**
+ * Browser asks the server for one cwd's OpenSpec data, with a cold-cache pull
+ * (immediate placeholder, then one gated poll). `requestId` correlates the
+ * possibly two-phase replies. See change: fix-connect-snapshot-frame-loss (D6).
+ */
+export interface OpenSpecGetMessage {
+  type: "openspec_get";
+  requestId: string;
+  cwd: string;
+}
+
+/**
+ * Browser asks for the next batch of a session group's ended sessions that the
+ * snapshot window excluded. `offset` = number of non-window ended sessions the
+ * client already holds for the group. See change: fix-connect-snapshot-frame-loss (D5/D9).
+ */
+export interface SessionsPageMessage {
+  type: "sessions_page";
+  cwd: string;
+  offset: number;
+}
+
 export interface RenameSessionBrowserMessage {
   type: "rename_session";
   sessionId: string;
@@ -1382,7 +1530,9 @@ export interface ServersUpdatedMessage {
 export interface KillProcessBrowserMessage {
   type: "kill_process";
   sessionId: string;
-  pgid: number;
+  /** Process group to kill. Optional: the REST/MCP lifecycle path may not know
+   *  it, and the bridge no-ops on a falsy pgid. See change: expand-mcp-tiered-surface. */
+  pgid?: number;
 }
 
 export interface ListSessionsBrowserMessage {
@@ -1414,13 +1564,25 @@ export interface ResumeSessionBrowserMessage {
   placement?: "front" | "keep";
 }
 
-export interface HideSessionBrowserMessage {
-  type: "hide_session";
+/**
+ * Archive a session. Ended → archives immediately (reply `{success:true}`);
+ * alive-but-idle → the server registers a one-shot intent, ends it, and
+ * archives on the `ended` transition (reply `{success:true, pending:true}`);
+ * running or `live:true` → error reply. Replaces the removed hide verbs.
+ * See change: archive-sessions-lazy-load.
+ */
+export interface ArchiveSessionBrowserMessage {
+  type: "archive_session";
   sessionId: string;
 }
 
-export interface UnhideSessionBrowserMessage {
-  type: "unhide_session";
+/**
+ * Restore an archived session into the live set as ended (`restoredAt = now`,
+ * `hidden = false`). Replaces the removed unhide verb.
+ * See change: archive-sessions-lazy-load.
+ */
+export interface UnarchiveSessionBrowserMessage {
+  type: "unarchive_session";
   sessionId: string;
 }
 
@@ -1797,6 +1959,8 @@ export type BrowserToServerMessage =
   | FetchContentMessage
   | ListFilesToBrowserMessage
   | OpenSpecRefreshBrowserMessage
+  | OpenSpecGetMessage
+  | SessionsPageMessage
   | RenameSessionBrowserMessage
   | RequestModelsBrowserMessage
   | RequestProvidersBrowserMessage
@@ -1806,8 +1970,8 @@ export type BrowserToServerMessage =
   | StopAfterTurnBrowserMessage
   | ListSessionsBrowserMessage
   | ResumeSessionBrowserMessage
-  | HideSessionBrowserMessage
-  | UnhideSessionBrowserMessage
+  | ArchiveSessionBrowserMessage
+  | UnarchiveSessionBrowserMessage
   | SpawnSessionBrowserMessage
   | AttachProposalBrowserMessage
   | DetachProposalBrowserMessage
@@ -1863,6 +2027,10 @@ export type BrowserToServerMessage =
   | RemoveTagGloballyBrowserMessage
   | RecoveryDismissMessage
   | SubagentResyncRequestBrowserMessage
+  | PromptResyncRequestBrowserMessage
+  | BrowserRelaySubscribeMessage
+  | BrowserRelayUnsubscribeMessage
+  | BrowserRelayInputMessage
   | WatchFilesBrowserMessage;
 
 /**
@@ -1891,6 +2059,25 @@ export interface SubagentResyncRequestBrowserMessage {
    * See change: reduce-subagent-details-payload (D6, task 9.4).
    */
   reason?: "open" | "cadence";
+}
+
+/**
+ * Browser → server → bridge: ask a session's bridge to re-emit every prompt it
+ * is still awaiting an answer for, so a dialog lost to transcript back-pressure
+ * or a client state reset can be rebuilt without a page reload. The server
+ * forwards it to the session's bridge and records the requesting socket against
+ * `requestId`, so the replies are delivered requester-scoped.
+ * See change: fix-pending-prompt-lost-on-replay (B).
+ */
+export interface PromptResyncRequestBrowserMessage {
+  type: "prompt_resync_request";
+  sessionId: string;
+  /**
+   * Correlation token; the bridge echoes it as `__resyncRequestId` on each
+   * re-emitted prompt. Optional: an older client omits it and replies fall back
+   * to the ordinary fan-out.
+   */
+  requestId?: string;
 }
 
 /**
@@ -1946,3 +2133,126 @@ export interface ActiveWorktreeInit {
   code?: string;
 }
 
+
+// ── Browser relay (change: add-browser-relay) ──────────────────────────
+//
+// Live-view messages for the browser plugin's screencast tap. The relay
+// endpoint sockets themselves are NOT in this protocol — they are plugin-owned
+// WS routes (`/ws/browser-ext/<guid>`, `/ws/browser-cdp/<guid>`) and never
+// traverse this gateway. Only the viewer plane (tiles + audit) rides `/ws`,
+// so it is reachable through the tunnel exactly like the rest of the UI.
+//
+// FRAME/STATUS ARE SECRET-FREE BY CONSTRUCTION (spec shared-protocol F2):
+// neither carries the relay guid or a profile token — `instanceId` is the
+// public, non-secret address. Do NOT add a `guid`/`token` field here.
+
+/**
+ * Browser → server: start streaming frames for one tab of one live instance.
+ * `tabId` is the Chrome tab id from `browser_relay_status`. The relay may
+ * refuse (tab state `client-screencast-active`) when the CDP client already
+ * runs its own screencast on that tab.
+ */
+export interface BrowserRelaySubscribeMessage {
+  type: "browser_relay_subscribe";
+  instanceId: string;
+  tabId: number;
+}
+
+/** Browser → server: stop streaming; the last unsubscribe stops the screencast. */
+export interface BrowserRelayUnsubscribeMessage {
+  type: "browser_relay_unsubscribe";
+  instanceId: string;
+  tabId: number;
+}
+
+/**
+ * Browser → server: one viewer input event. `x`/`y` are NORMALIZED to `[0,1]`
+ * of the rendered frame (never CSS pixels, never device pixels) so tile
+ * scaling cannot mis-target; the relay multiplies by the last frame's
+ * `metadata.deviceWidth/deviceHeight` before dispatching. Only the kinds below
+ * are accepted — an unknown kind, or out-of-range coordinates, is dropped and
+ * audited, and the viewer never reaches `Runtime.*`.
+ */
+export interface BrowserRelayInputMessage {
+  type: "browser_relay_input";
+  instanceId: string;
+  tabId: number;
+  kind: "mouse" | "key" | "scroll" | "bringToFront";
+  /** mouse/scroll only — normalized `[0,1]` of the frame. */
+  x?: number;
+  y?: number;
+  /** mouse only. */
+  action?: "click" | "move" | "down" | "up";
+  button?: "left" | "middle" | "right";
+  clickCount?: number;
+  /** scroll only — raw wheel deltas, not normalized (they are not positions). */
+  deltaX?: number;
+  deltaY?: number;
+  /** key only — a DOM key event, mirrored to `Input.dispatchKeyEvent`. */
+  keyType?: "keyDown" | "keyUp" | "char";
+  key?: string;
+  code?: string;
+  text?: string;
+}
+
+/** One frame's device-pixel geometry + capture time. */
+export interface BrowserRelayFrameMetadata {
+  deviceWidth: number;
+  deviceHeight: number;
+  timestamp: number;
+}
+
+/**
+ * Server → browser: ONE screencast frame, sent ONLY to sockets that subscribed
+ * to this `{instanceId, tabId}` — never broadcast. `jpegBase64` is the raw
+ * base64 payload (no data-URL prefix).
+ */
+export interface BrowserRelayFrameMessage {
+  type: "browser_relay_frame";
+  instanceId: string;
+  tabId: number;
+  jpegBase64: string;
+  metadata: BrowserRelayFrameMetadata;
+}
+
+/**
+ * Tab state as the tile renders it. `no-frames` means "no repaint for 2 s" —
+ * which a hidden tab AND a visible idle tab both produce, hence the neutral
+ * tile wording; `detached` + `reason: "devtools"` means the user opened
+ * DevTools and input must stop; `client-screencast-active` is the refusal
+ * state when the agent already screenshots that tab.
+ */
+export type BrowserRelayTabState =
+  | "live"
+  | "no-frames"
+  | "detached"
+  | "client-screencast-active";
+
+export interface BrowserRelayTabStatus {
+  tabId: number;
+  title: string;
+  url: string;
+  state: BrowserRelayTabState;
+  /** Set when `state === "detached"`. */
+  reason?: "devtools";
+}
+
+export interface BrowserRelayInstanceStatus {
+  instanceId: string;
+  profileDirectory: string;
+  /** `no-cdp-client` = extension handshake done, agent has not attached yet. */
+  state: "connected" | "no-cdp-client";
+  tabs: BrowserRelayTabStatus[];
+}
+
+/**
+ * Server → browser: the full live-instance snapshot, broadcast on every
+ * instance/tab change and on every audit append (coalesced to ≤1 per 500 ms).
+ * `auditSeq` is monotonic, so the audit viewer refetches when it changes and
+ * does not when a status with the same seq arrives.
+ */
+export interface BrowserRelayStatusMessage {
+  type: "browser_relay_status";
+  instances: BrowserRelayInstanceStatus[];
+  auditSeq: number;
+}

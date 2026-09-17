@@ -185,6 +185,18 @@ export function replayEntriesAsEvents(
       }
     }
 
+    // Persisted compaction entry — change: replay-compaction-boundary.
+    // Synthesizes the same `session_compact` event the bridge forwards live, so
+    // a cold replay renders the divider the live path rendered. Metadata is
+    // deliberately NOT fabricated: the entry carries no `reason`/`willRetry`,
+    // and the reducer's existing guard renders a metadata-free (legacy)
+    // divider. `summary` is LLM-context text, not transcript content, so it is
+    // never emitted. Positioned by iteration order (the entry's own place in
+    // the branch), like every other arm.
+    if (entry.type === "compaction") {
+      messages.push(makeEvent(sessionId, "session_compact", ts, {}));
+    }
+
     if (entry.type === "model_change") {
       messages.push(makeEvent(sessionId, "model_select", ts, {
         type: "model_select",
@@ -201,17 +213,38 @@ export function replayEntriesAsEvents(
     }
   }
 
-  // Close any orphaned tool calls (agent killed mid-execution)
+  // Close any orphaned tool calls (agent killed mid-execution).
+  //
+  // Indexed rather than re-scanned per orphan. The previous `messages.find`
+  // inside this loop was O(orphans × messages): measured 175 ms at 5k orphans,
+  // 785 ms at 10k, 2.8 s at 20k — clean quadratic. That was tolerable while the
+  // only input was a pi-written local file parsed inside the load worker; a
+  // RETAINED REMOTE transcript is bridge-controlled bytes replayed on the event
+  // loop, where the same curve is a whole-dashboard stall. Output is unchanged
+  // — `find` returns the FIRST match and a Map keyed on first-write does too.
+  // See change: serve-retained-remote-transcripts.
+  const startByToolCallId = new Map<string, (typeof messages)[number]>();
+  if (openToolCalls.size > 0) {
+    for (const m of messages) {
+      if (m.event.eventType !== "tool_execution_start") continue;
+      const id = (m.event.data as any)?.toolCallId;
+      if (typeof id === "string" && !startByToolCallId.has(id)) startByToolCallId.set(id, m);
+    }
+  }
   for (const toolCallId of openToolCalls) {
-    const startEvent = messages.find(
-      (m) => m.event.eventType === "tool_execution_start" && (m.event.data as any).toolCallId === toolCallId,
-    );
+    const startEvent = startByToolCallId.get(toolCallId);
     const ts = startEvent ? startEvent.event.timestamp : Date.now();
+    // An orphan is a call the session DIED holding, so it closes as an error
+    // carrying the same marker the server-side live heal writes. Closing it as
+    // `{result:"", isError:false}` rendered a killed call as a successful empty
+    // result, contradicting the live view of the same call.
+    // See change: heal-orphaned-tool-cards-on-session-end (design D7).
     messages.push(makeEvent(sessionId, "tool_execution_end", ts, {
       toolCallId,
       toolName: (startEvent?.event.data as any)?.toolName ?? "unknown",
-      result: "",
-      isError: false,
+      result: "parent session ended",
+      isError: true,
+      healedBy: "session_ended",
     }));
   }
 

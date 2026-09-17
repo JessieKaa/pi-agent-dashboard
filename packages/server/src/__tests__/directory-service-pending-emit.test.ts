@@ -8,14 +8,17 @@
  *
  * See change: emit-openspec-pending-from-poll.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
 import * as fs from "node:fs";
-import * as path from "node:path";
 import * as os from "node:os";
+import * as path from "node:path";
+import type { DashboardSession, OpenSpecData } from "@blackbelt-technology/pi-dashboard-shared/types.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDirectoryService, type DirectoryService } from "../directory-service.js";
 import type { PreferencesStore } from "../persistence/preferences-store.js";
 import type { SessionManager } from "../session/memory-session-manager.js";
-import type { DashboardSession, OpenSpecData } from "@blackbelt-technology/pi-dashboard-shared/types.js";
+import { createMemorySessionManager } from "../session/memory-session-manager.js";
+import { discoverAndBroadcastSessions } from "../session/session-bootstrap.js";
 
 const runOpenSpecListMock = vi.fn();
 const runOpenSpecStatusMock = vi.fn();
@@ -194,6 +197,33 @@ describe("DirectoryService — poll-path pending emit", () => {
     expect(final.pending).not.toBe(true);
   });
 
+  it("E27: openspec_get polls the gated path — transitional pending + one change-gated final; gate honoured, CLI never re-run (fix-connect-snapshot-frame-loss)", async () => {
+    mkChangesDir(tmpCwd);
+    runOpenSpecListMock.mockResolvedValue({ changes: [{ name: "demo", status: "active", completedTasks: 0, totalTasks: 1 }] });
+    build();
+
+    // Cold get: PENDING placeholder + one poll through `pollDirectoryGated`.
+    // The transitional pending:true reaches every browser (via the service's
+    // onChangeCallback) exactly as a periodic poll would.
+    const first = service.getOrPollOpenSpec(tmpCwd);
+    expect(first.hit).toMatchObject({ pending: true, hasOpenspecDir: true });
+    const final = await first.poll!;
+    expect(final.initialized).toBe(true);
+
+    // The gated-path broadcast discipline: transitional pending, then exactly
+    // ONE change-gated final (prevJson was empty → the final always fires).
+    expect(emits.map((e) => e.data.pending === true)).toEqual([true, false]);
+    expect(emits[1].data).toMatchObject({ initialized: true });
+    expect(runOpenSpecListMock).toHaveBeenCalledTimes(1);
+
+    // Gate unchanged (fs untouched): the second get is a cache hit — no poll,
+    // no CLI re-run. `openspec_get` never force-polls.
+    const second = service.getOrPollOpenSpec(tmpCwd);
+    expect(second.poll).toBeUndefined();
+    expect(second.hit?.initialized).toBe(true);
+    expect(runOpenSpecListMock).toHaveBeenCalledTimes(1);
+  });
+
   it("3.4 repeated empty/failed tick still delivers the terminal clear (diff-guard not suppressed)", async () => {
     vi.useFakeTimers();
     try {
@@ -222,5 +252,72 @@ describe("DirectoryService — poll-path pending emit", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+/**
+ * E13 — pinned-directory discovery must never resurrect an ARCHIVED id from
+ * its `.jsonl`. `discoverAndBroadcastSessions` consults the archive index
+ * before restoring, so the archived session stays non-resident and no
+ * `session_added` frame is emitted for it.
+ *
+ * See change: archive-sessions-lazy-load.
+ */
+describe("discoverAndBroadcastSessions — archived ids stay non-resident (E13)", () => {
+  let tmpCwd: string;
+  let service: DirectoryService;
+
+  beforeEach(() => {
+    tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), "bootstrap-archived-"));
+    runOpenSpecListMock.mockResolvedValue({ changes: [] });
+  });
+
+  afterEach(async () => {
+    service?.stopPolling();
+    const { discoverSessionsForCwd } = await import("../session/session-discovery.js");
+    vi.mocked(discoverSessionsForCwd).mockReturnValue([]);
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  function jsonl(id: string): string {
+    const file = path.join(tmpCwd, `2026-01-01T00-00-00-000Z_${id}.jsonl`);
+    fs.writeFileSync(file, `${JSON.stringify({ type: "session", id, cwd: tmpCwd })}\n`);
+    return file;
+  }
+
+  it("restores the un-archived discovery and skips the archived one", async () => {
+    const archivedFile = jsonl("disc-archived");
+    const residentFile = jsonl("disc-resident");
+    const discovered = (id: string, sessionFile: string) => ({
+      id, cwd: tmpCwd, startedAt: 1000, modifiedAt: 2000, sessionFile, sessionDir: tmpCwd,
+    });
+    const { discoverSessionsForCwd } = await import("../session/session-discovery.js");
+    vi.mocked(discoverSessionsForCwd).mockReturnValue([
+      discovered("disc-archived", archivedFile),
+      discovered("disc-resident", residentFile),
+    ]);
+
+    service = createDirectoryService(createMockPrefs([tmpCwd]), createMockSessions(), undefined, {
+      changeWatcher: createStubWatcher() as any,
+    });
+
+    const sessionManager = createMemorySessionManager();
+    const added: string[] = [];
+    const browserGateway = {
+      broadcastSessionAdded: (s: { id: string }) => added.push(s.id),
+      broadcastToAll: () => {},
+      broadcastOpenSpecUpdate: () => {},
+    } as never;
+
+    await discoverAndBroadcastSessions({
+      sessionManager,
+      browserGateway,
+      directoryService: service,
+      sessionArchive: { has: (id: string) => id === "disc-archived" } as never,
+    });
+
+    expect(sessionManager.get("disc-archived")).toBeUndefined();
+    expect(added).toEqual(["disc-resident"]);
+    expect(sessionManager.get("disc-resident")).toBeDefined();
   });
 });

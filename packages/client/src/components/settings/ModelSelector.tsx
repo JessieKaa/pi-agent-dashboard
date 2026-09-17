@@ -1,3 +1,4 @@
+import { LayerPortal } from "@blackbelt-technology/pi-dashboard-client-utils/LayerPortal";
 import type { ProviderRefreshError } from "@blackbelt-technology/pi-dashboard-shared/protocol.js";
 import type { ModelInfo, RoleInfo } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import { mdiAlertOutline, mdiBrain, mdiChevronDown, mdiCog, mdiEye, mdiLoading, mdiStar, mdiStarOutline } from "@mdi/js";
@@ -5,6 +6,7 @@ import { Icon } from "@mdi/react";
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { LIST_POPOVER_MIN_HEIGHT, usePopoverFlip } from "../../hooks/usePopoverFlip.js";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
+import { useModelConfigOptional } from "../../lib/state/ModelConfigContext.js";
 import { usePopoverBoundary } from "../../lib/state/PopoverBoundaryContext.js";
 
 // Per-browser view-state persistence (NOT favorites — those persist server-side).
@@ -84,6 +86,11 @@ interface Props {
 
 const labelOf = (m: ModelInfo) => `${m.provider}/${m.id}`;
 const ctxFmt = (n: number) => (n >= 1_000_000 ? `${n / 1_000_000}M` : `${Math.round(n / 1000)}k`);
+
+// Trigger→panel gap for the portaled `fixed` panel — replaces the `mt-1` /
+// `mb-1` the inline form got from flow (a portaled panel has no flow sibling).
+// See change: fix-composer-popover-layering.
+const GAP = 4;
 
 /**
  * One capability icon (MDI) with optional uncertainty `?` overlay.
@@ -239,6 +246,7 @@ function PopulatedCatalogueBody({
   setFilter,
   favOnly,
   setFavOnly,
+  favoritesEnabled,
   providerFilter,
   setProviderFilter,
   setSelectedIndex,
@@ -256,6 +264,7 @@ function PopulatedCatalogueBody({
   setFilter: (v: string) => void;
   favOnly: boolean;
   setFavOnly: (updater: (v: boolean) => boolean) => void;
+  favoritesEnabled: boolean;
   providerFilter: string;
   setProviderFilter: (v: string) => void;
   setSelectedIndex: (v: number) => void;
@@ -290,19 +299,21 @@ function PopulatedCatalogueBody({
               ))}
             </select>
           )}
-          <button
-            type="button"
-            data-testid="favs-only-toggle"
-            aria-pressed={favOnly}
-            onClick={() => { setFavOnly((v) => !v); setSelectedIndex(0); }}
-            className={`flex items-center gap-1 px-2 py-1 text-xs rounded border whitespace-nowrap ${
-              favOnly
-                ? "text-amber-400 border-amber-400"
-                : "text-[var(--text-secondary)] border-[var(--border-primary)] bg-[var(--bg-tertiary)]"
-            }`}
-          >
-            <Icon path={favOnly ? mdiStar : mdiStarOutline} size={0.55} /> {i18nT("common.favs", undefined, "Favs")}
-          </button>
+          {favoritesEnabled && (
+            <button
+              type="button"
+              data-testid="favs-only-toggle"
+              aria-pressed={favOnly}
+              onClick={() => { setFavOnly((v) => !v); setSelectedIndex(0); }}
+              className={`flex items-center gap-1 px-2 py-1 text-xs rounded border whitespace-nowrap ${
+                favOnly
+                  ? "text-amber-400 border-amber-400"
+                  : "text-[var(--text-secondary)] border-[var(--border-primary)] bg-[var(--bg-tertiary)]"
+              }`}
+            >
+              <Icon path={favOnly ? mdiStar : mdiStarOutline} size={0.55} /> {i18nT("common.favs", undefined, "Favs")}
+            </button>
+          )}
         </div>
         <input
           ref={inputRef}
@@ -365,6 +376,7 @@ export function ModelSelector({ current, models, onSelect, onRefresh, refreshErr
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const dropdownId = useId();
   // Opt into the horizontal axis, left-preserving: this `left-0` 320px dropdown
   // must flip (not silently swap to right-0) when its composer pane is too
@@ -372,7 +384,7 @@ export function ModelSelector({ current, models, onSelect, onRefresh, refreshErr
   // ~280px. `boundaryRef` is the composer/chat pane when rendered there (else
   // viewport). See change: fix-popover-container-clip.
   const boundaryRef = usePopoverBoundary();
-  const { flipUp, maxHeight, minHeight, anchorRight, maxWidth } = usePopoverFlip(triggerRef, {
+  const { flipUp, maxHeight, minHeight, anchorRight, maxWidth, triggerRect } = usePopoverFlip(triggerRef, {
     open,
     estimatedWidth: 320, // 20rem natural width
     minContentWidth: 280, // readable floor for the provider/model grid
@@ -384,8 +396,19 @@ export function ModelSelector({ current, models, onSelect, onRefresh, refreshErr
     minPopoverHeight: LIST_POPOVER_MIN_HEIGHT,
   });
 
+  // Favorites are the selector's DEFAULT when the caller owns neither prop:
+  // read the pair all-or-nothing from the model-config context. Passing either
+  // prop makes the caller own BOTH (no mixing with context). No resolvable
+  // toggle → no ★ buttons, no Favs filter, persisted favs-only ignored.
+  // See change: model-picker-everywhere-favorites (design D1).
+  const modelConfig = useModelConfigOptional();
+  const callerOwnsFavorites = favorites !== undefined || onToggleFavorite !== undefined;
+  const effectiveFavorites = callerOwnsFavorites ? favorites : modelConfig?.favorites;
+  const effectiveToggle = callerOwnsFavorites ? onToggleFavorite : modelConfig?.toggleFavorite;
+  const favoritesEnabled = effectiveToggle !== undefined;
+
   const hasModels = !!models && models.length > 0;
-  const favSet = useMemo(() => new Set(favorites ?? []), [favorites]);
+  const favSet = useMemo(() => new Set(effectiveFavorites ?? []), [effectiveFavorites]);
 
   // Persist view state on change.
   useEffect(() => { writeLS(PROVIDER_FILTER_KEY, providerFilter); }, [providerFilter]);
@@ -418,11 +441,11 @@ export function ModelSelector({ current, models, onSelect, onRefresh, refreshErr
     const tokens = filter.trim().toLowerCase().split(/\s+/).filter(Boolean);
     return models!.filter((m) => {
       if (providerFilter && m.provider !== providerFilter) return false;
-      if (favOnly && !favSet.has(labelOf(m))) return false;
+      if (favoritesEnabled && favOnly && !favSet.has(labelOf(m))) return false;
       const full = labelOf(m).toLowerCase();
       return tokens.length === 0 || tokens.every((t) => full.includes(t));
     });
-  }, [hasModels, models, providerFilter, favOnly, filter, favSet]);
+  }, [hasModels, models, providerFilter, favOnly, favoritesEnabled, filter, favSet]);
 
   // Group by provider only. No separate favorites group — the ★ Favs filter
   // (persisted in localStorage) is the favorites surface; the per-row star
@@ -445,14 +468,26 @@ export function ModelSelector({ current, models, onSelect, onRefresh, refreshErr
     }
   }, [open]);
 
-  // Close on outside click
+  // Close on outside click / touch. The panel is PORTALED to the layer root,
+  // so it is no longer a DOM descendant of the container — every in-panel
+  // mousedown would otherwise read as "outside" and close the menu before a
+  // selection registers. `panelRef` is checked FIRST: the trigger toggles, so
+  // letting a panel click fall through to it would close-then-reopen.
+  // See change: fix-composer-popover-layering (pattern: FolderActionsMenu).
   useEffect(() => {
     if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) setOpen(false);
+    const handler = (e: Event) => {
+      const target = e.target as Node;
+      if (panelRef.current?.contains(target)) return;
+      if (triggerRef.current?.contains(target)) return;
+      setOpen(false);
     };
     document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
+    document.addEventListener("touchstart", handler);
+    return () => {
+      document.removeEventListener("mousedown", handler);
+      document.removeEventListener("touchstart", handler);
+    };
   }, [open]);
 
   // Scroll selected item into view
@@ -502,16 +537,18 @@ export function ModelSelector({ current, models, onSelect, onRefresh, refreshErr
           flatIdx === selectedIndex ? "bg-[var(--bg-tertiary)]" : "hover:bg-[var(--bg-hover)]"
         } ${isCurrent ? "text-[var(--accent-blue)]" : "text-[var(--text-secondary)]"}`}
       >
-        <button
-          type="button"
-          data-testid="model-fav-toggle"
-          aria-label={isFav ? "Unfavorite" : "Favorite"}
-          aria-pressed={isFav}
-          onClick={(e) => { e.stopPropagation(); onToggleFavorite?.(label, !isFav); }}
-          className={`flex-shrink-0 ${isFav ? "text-amber-400" : "text-[var(--text-tertiary)] hover:text-[var(--text-secondary)]"}`}
-        >
-          <Icon path={isFav ? mdiStar : mdiStarOutline} size={0.6} />
-        </button>
+        {favoritesEnabled && (
+          <button
+            type="button"
+            data-testid="model-fav-toggle"
+            aria-label={isFav ? "Unfavorite" : "Favorite"}
+            aria-pressed={isFav}
+            onClick={(e) => { e.stopPropagation(); effectiveToggle?.(label, !isFav); }}
+            className={`flex-shrink-0 ${isFav ? "text-amber-400" : "text-[var(--text-tertiary)] hover:text-[var(--text-secondary)]"}`}
+          >
+            <Icon path={isFav ? mdiStar : mdiStarOutline} size={0.6} />
+          </button>
+        )}
         <div className="flex-1 min-w-0">
           <div className="font-mono truncate">{m.name ?? label}</div>
           {m.name && <div className="font-mono text-[10px] text-[var(--text-muted)] truncate">{label}</div>}
@@ -566,22 +603,44 @@ export function ModelSelector({ current, models, onSelect, onRefresh, refreshErr
       </button>
 
       {open && (
-        <div
-          className={`absolute flex flex-col bg-[var(--bg-secondary)] border border-[var(--border-secondary)] rounded-lg shadow-lg z-50 overflow-hidden ${
-            anchorRight ? "right-0" : "left-0"
-          } ${flipUp ? "bottom-full mb-1" : "top-full mt-1"}`}
-          // Natural width 320px, capped by the pane-aware `maxWidth` (the hook
-          // flips before it would squish below `minContentWidth`).
-          style={{ width: Math.min(320, maxWidth), maxHeight, minHeight }}
-          data-testid="model-dropdown"
-          id={dropdownId}
-        >
+        // Portaled to the layer root (escapes the composer's stacking context
+        // + overflow clip — the underlap fix) and positioned `fixed` from the
+        // trigger's viewport rect. GAP replaces the mt-1/mb-1 a portaled panel
+        // has no flow sibling to get; `visibility` hides the pre-measure frame
+        // so the panel never flashes at (0,0). See change:
+        // fix-composer-popover-layering (pattern: FolderActionsMenu).
+        <LayerPortal>
+          <div
+            ref={panelRef}
+            className="fixed flex flex-col bg-[var(--bg-secondary)] border border-[var(--border-secondary)] rounded-lg shadow-lg z-popover overflow-hidden"
+            style={{
+              // Natural width 320px, capped by the pane-aware `maxWidth` (the
+              // hook flips before it would squish below `minContentWidth`).
+              width: Math.min(320, maxWidth),
+              maxHeight,
+              minHeight,
+              visibility: triggerRect ? "visible" : "hidden",
+              ...(triggerRect
+                ? flipUp
+                  ? { bottom: Math.round(window.innerHeight - triggerRect.top + GAP) }
+                  : { top: Math.round(triggerRect.bottom + GAP) }
+                : {}),
+              ...(triggerRect
+                ? anchorRight
+                  ? { right: Math.max(0, Math.round(window.innerWidth - triggerRect.right)) }
+                  : { left: Math.round(triggerRect.left) }
+                : {}),
+            }}
+            data-testid="model-dropdown"
+            id={dropdownId}
+          >
           {hasModels ? (
             <PopulatedCatalogueBody
               filter={filter}
               setFilter={setFilter}
               favOnly={favOnly}
               setFavOnly={setFavOnly}
+              favoritesEnabled={favoritesEnabled}
               providerFilter={providerFilter}
               setProviderFilter={setProviderFilter}
               setSelectedIndex={setSelectedIndex}
@@ -598,7 +657,8 @@ export function ModelSelector({ current, models, onSelect, onRefresh, refreshErr
           ) : (
             <EmptyCatalogueBody awaitingRefresh={awaitingRefresh} failCount={failCount} onOpenProviderSettings={onOpenProviderSettings} />
           )}
-        </div>
+          </div>
+        </LayerPortal>
       )}
     </div>
   );

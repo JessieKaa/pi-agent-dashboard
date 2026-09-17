@@ -1,4 +1,9 @@
-import { mdiAlertOutline, mdiArrowRightCircleOutline, mdiClose, mdiCommentQuestion, mdiConsoleLine, mdiEyeOffOutline, mdiEyeOutline, mdiFlash, mdiLoading, mdiPaperclip, mdiPencil, mdiPencilOutline, mdiPlay, mdiPlayCircleOutline, mdiPlus, mdiRefresh, mdiRemoteDesktop, mdiSourceBranch, mdiSourceBranchPlus, mdiSourceFork } from "@mdi/js";
+import { Confirm } from "@blackbelt-technology/pi-dashboard-client-utils/Confirm";
+import {
+  HOST_PRESSURE_DEGRADED_MS,
+  HOST_PRESSURE_UNRESPONSIVE_MS,
+} from "@blackbelt-technology/pi-dashboard-shared/host-pressure.js";
+import { mdiAlertOutline, mdiArchiveOutline, mdiArrowRightCircleOutline, mdiClose, mdiCommentQuestion, mdiConsoleLine, mdiFlash, mdiLoading, mdiPaperclip, mdiPencil, mdiPencilOutline, mdiPlay, mdiPlayCircleOutline, mdiPlus, mdiRefresh, mdiRemoteDesktop, mdiSourceBranch, mdiSourceBranchPlus, mdiSourceFork } from "@mdi/js";
 import { Icon } from "@mdi/react";
 import React, { useCallback, useEffect, useState } from "react";
 import { getApiBase } from "../../lib/api/api-context.js";
@@ -27,7 +32,7 @@ export const statusColors = statusColorsExt;
 export const sourceBadgeColors = sourceBadgeColorsExt;
 
 import { SessionCardActionBarSlot, SessionCardBadgeSlot, SessionCardFlowsSlot, SessionCardMemorySlot, useHasWidgetBarPrompt, useSlotHasClaimsForSession, WorktreeCardSectionSlot } from "@blackbelt-technology/dashboard-plugin-runtime";
-import type { CommandInfo, DashboardSession, GitStatus, ImageContent, OpenSpecChange, OpenSpecData, OpenSpecGroup, OpenSpecReadiness, OpenSpecReadinessReason } from "@blackbelt-technology/pi-dashboard-shared/types.js";
+import type { ClosedReason, CommandInfo, DashboardSession, GitStatus, ImageContent, OpenSpecChange, OpenSpecData, OpenSpecGroup, OpenSpecReadiness, OpenSpecReadinessReason } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import { useDisplayPrefs } from "../../hooks/useDisplayPrefs.js";
 import { useFxVisibility } from "../../hooks/useFxVisibility.js";
 import type { InflightBashTool } from "../../hooks/useInflightBashTools.js";
@@ -80,7 +85,11 @@ export function ActivityIndicator({ session, retryAttempt }: { session: Dashboar
     return <span className="text-yellow-400">{i18nT("common.resuming", undefined, "Resuming…")}</span>;
   }
 
-  if (session.status === "ended") return null;
+  // Ended sessions have no activity, so this slot used to be blank (it
+  // `return`ed null). It now carries WHY the session ended; a MOVED session
+  // keeps the MovedBadge instead (one fact, one pill).
+  // See change: stop-discarding-known-session-state.
+  if (session.status === "ended") return <EndedReasonPill session={session} />;
 
   if (session.currentTool === "ask_user" && !hasWidgetBarPrompt) {
     // Blocked-on-you: distinct "Needs you" label + needs-you color + icon.
@@ -125,6 +134,206 @@ export function StatusShapeBadge({ shape, colorClass }: { shape: StatusShape; co
       className={`absolute -bottom-1 -right-1 inline-flex rounded-full bg-[var(--bg-tertiary)] leading-none ${colorClass}`}
     >
       <Icon path={path} size={0.34} />
+    </span>
+  );
+}
+
+// ── Host pressure ───────────────────────────────────────────────────────────
+// The VERDICT is the server's (`host-pressure-tracker.ts`), pushed on a state
+// transition as `session.hostPressure`. The card only renders it and counts the
+// elapsed silence from the server-stamped `since`.
+//
+// It deliberately does NOT derive the verdict from `processMetrics.updatedAt`:
+// that field arrives once, in the connect `sessions_snapshot`, and is never
+// refreshed — deriving silence from it read EVERY live session as unresponsive
+// about a minute after page load.
+// See changes: stop-discarding-known-session-state, fix-false-unresponsive-badge.
+
+// Thresholds come from `packages/shared`: the escalation below happens BETWEEN
+// server transitions, so it must use the very numbers the server fires on.
+// Re-exported so existing `SessionCard` import sites keep working.
+export { HOST_PRESSURE_DEGRADED_MS, HOST_PRESSURE_UNRESPONSIVE_MS };
+/** Local re-render cadence; the sidebar has no ticker of its own. */
+const HOST_PRESSURE_TICK_MS = 5_000;
+
+type HostPressureState = "unknown" | "healthy" | "degraded" | "unresponsive";
+
+interface HostPressureDerivation {
+  state: HostPressureState;
+  silenceMs?: number;
+  eventLoopMaxMs?: number;
+}
+
+/**
+ * Read the server's pressure verdict off the session row.
+ *
+ * `hostPressure` absent → `unknown` ("we have not heard" is a different fact
+ * from "all is well"); explicit `null` → recovered/healthy; an object → the
+ * server saw silence, and `since` (its receipt time of the last frame) anchors
+ * the locally-ticking duration.
+ *
+ * The state is re-derived from elapsed silence so the pill escalates
+ * degraded → unresponsive between transitions, but it never falls BELOW the
+ * server's verdict — a browser clock behind the server's must not erase a
+ * badge the server put there. `eventLoopMaxMs` stays retroactive corroboration
+ * only: a blocked loop cannot report itself.
+ * See change: fix-false-unresponsive-badge.
+ */
+export function deriveHostPressure(session: DashboardSession, now: number): HostPressureDerivation {
+  const pressure = session.hostPressure;
+  const eventLoopMaxMs = session.processMetrics?.eventLoopMaxMs;
+  if (pressure === undefined) return { state: "unknown" };
+  if (pressure === null) return { state: "healthy", silenceMs: 0, eventLoopMaxMs };
+  const silenceMs = Math.max(0, now - pressure.since);
+  if (silenceMs >= HOST_PRESSURE_UNRESPONSIVE_MS) {
+    return { state: "unresponsive", silenceMs, eventLoopMaxMs };
+  }
+  if (silenceMs > HOST_PRESSURE_DEGRADED_MS) {
+    return { state: "degraded", silenceMs, eventLoopMaxMs };
+  }
+  return { state: pressure.state, silenceMs, eventLoopMaxMs };
+}
+
+/**
+ * Past-tense corroboration. A frozen loop cannot report itself, so a non-zero
+ * `eventLoopMaxMs` can only ever describe a stall the session already
+ * recovered from — never the one in progress. See design D4.
+ */
+export function formatEventLoopCorroboration(eventLoopMaxMs: number): string {
+  const duration = formatElapsed(eventLoopMaxMs);
+  return i18nT(
+    "session.eventLoopStalledEarlier",
+    { duration },
+    `Event loop stalled ${duration} earlier — already recovered.`,
+  );
+}
+
+function formatHostPressureTooltip(d: HostPressureDerivation): string {
+  const duration = formatElapsed(d.silenceMs ?? 0);
+  const parts = [
+    i18nT("session.hostPressureSilence", { duration }, `No frames received from this session for ${duration}.`),
+  ];
+  if (d.eventLoopMaxMs != null && d.eventLoopMaxMs > 0) {
+    parts.push(formatEventLoopCorroboration(d.eventLoopMaxMs));
+  }
+  return parts.join(" ");
+}
+
+/**
+ * Per-session host-pressure pill (live sessions only). Renders NOTHING for a
+ * healthy or unknown session — zero added pixels keeps the Von Restorff
+ * isolation that makes a genuinely sick card stand out among dozens (Nielsen
+ * #8). Every rendered state carries a glyph as well as a colour (WCAG 1.4.1).
+ *
+ * The sidebar has no ticker, so the component owns a small LOCAL interval to
+ * re-render as wall-clock advances; it is render-only — no polling, no socket
+ * traffic. See change: stop-discarding-known-session-state.
+ */
+function HostPressureIndicator({ session }: { session: DashboardSession }) {
+  const hasTimestamp = session.hostPressure != null;
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!hasTimestamp) return;
+    const id = window.setInterval(() => setTick((n) => n + 1), HOST_PRESSURE_TICK_MS);
+    return () => window.clearInterval(id);
+  }, [hasTimestamp]);
+
+  // Metrics are latest-only and never retained for a dead session.
+  if (session.status === "ended") return null;
+
+  const d = deriveHostPressure(session, Date.now());
+  if (d.state !== "degraded" && d.state !== "unresponsive") return null;
+
+  const isError = d.state === "unresponsive";
+  const silence = formatElapsed(d.silenceMs ?? 0);
+  const label = i18nT(
+    isError ? "session.hostUnresponsive" : "session.hostSlow",
+    { duration: silence },
+    isError ? `unresponsive · ${silence}` : `host slow · ${silence}`,
+  );
+  return (
+    <span
+      data-testid={`session-host-pressure-${session.id}`}
+      data-host-pressure={d.state}
+      title={formatHostPressureTooltip(d)}
+      className={`flex-shrink-0 inline-flex items-center gap-0.5 px-1.5 py-0 text-[10px] rounded-full border ${
+        isError
+          ? "bg-[var(--severity-error-bg)] text-[var(--severity-error-fg)] border-[var(--severity-error-border)]"
+          : "bg-[var(--severity-warning-bg)] text-[var(--severity-warning-fg)] border-[var(--severity-warning-border)]"
+      }`}
+    >
+      <span aria-hidden="true">◐</span>
+      {label}
+    </span>
+  );
+}
+
+const ENDED_REASON_CLASS: Record<ClosedReason, string> = {
+  manual: "bg-[var(--bg-tertiary)] text-[var(--text-secondary)] border-[var(--border-subtle)]",
+  process_gone: "bg-[var(--severity-error-bg)] text-[var(--severity-error-fg)] border-[var(--severity-error-border)]",
+  spawn_failed: "bg-[var(--severity-error-bg)] text-[var(--severity-error-fg)] border-[var(--severity-error-border)]",
+  unknown: "bg-[var(--bg-tertiary)] text-[var(--text-secondary)] border-[var(--border-subtle)]",
+};
+
+const ENDED_REASON_GLYPH: Record<ClosedReason, string | undefined> = {
+  manual: undefined,
+  process_gone: "✕",
+  spawn_failed: "✕",
+  unknown: "?",
+};
+
+const ENDED_REASON_LABEL: Record<ClosedReason, { key: string; fallback: string }> = {
+  manual: { key: "session.endedReasonManual", fallback: "closed" },
+  process_gone: { key: "session.endedReasonProcessGone", fallback: "process gone" },
+  spawn_failed: { key: "session.endedReasonSpawnFailed", fallback: "restart failed" },
+  unknown: { key: "session.endedReasonUnknown", fallback: "ended — reason unknown" },
+};
+
+const ENDED_REASON_TITLE: Record<ClosedReason, { key: string; fallback: string }> = {
+  manual: { key: "session.endedReasonManualTitle", fallback: "Closed by you" },
+  process_gone: { key: "session.endedReasonProcessGoneTitle", fallback: "The pi process is gone — this session did not close cleanly" },
+  spawn_failed: { key: "session.endedReasonSpawnFailedTitle", fallback: "pi could not be restarted" },
+  unknown: { key: "session.endedReasonUnknownTitle", fallback: "Ended — the reason is unknown" },
+};
+
+/**
+ * Why an ended session stopped. The subtitle row used to `return null` for
+ * every ended session, so a kill, a spawn failure and a clean exit all read as
+ * a bare `ended`. Mirrors the `moved` micro-pill — same class of fact ("why
+ * this card is no longer live"). Renders nothing when the reason is absent, or
+ * when the session MOVED (the MovedBadge already explains that case).
+ * See change: stop-discarding-known-session-state.
+ */
+function EndedReasonPill({ session }: { session: DashboardSession }) {
+  if (session.status !== "ended") return null;
+  if (hasMovedAway(session)) return null;
+  const reason = session.closedReason;
+  if (!reason) return null;
+  // Defensive: a persisted value outside the vocabulary must not crash the card
+  // (`title.key` on `undefined`). The boundary normalizes too; this is the last
+  // line of defence. Keyed on vocabulary MEMBERSHIP, not a nullish fallback —
+  // `manual`'s glyph is legitimately absent (a silent close) and must stay so.
+  // See change: stop-discarding-known-session-state.
+  // `Object.hasOwn`, not `in`: `"constructor"` (and any other inherited
+  // `Object.prototype` key) passes the `in` operator and resolves the map to
+  // `Object`'s own member, crashing the `.key` read. A wire frame
+  // (`session_updated.updates`) can carry any string at runtime.
+  const safeReason: ClosedReason = Object.hasOwn(ENDED_REASON_LABEL, reason)
+    ? reason
+    : "unknown";
+  const label = ENDED_REASON_LABEL[safeReason];
+  const title = ENDED_REASON_TITLE[safeReason];
+  const glyph = ENDED_REASON_GLYPH[safeReason];
+  const klass = ENDED_REASON_CLASS[safeReason];
+  return (
+    <span
+      data-testid={`session-ended-reason-${session.id}`}
+      data-closed-reason={safeReason}
+      className={`flex-shrink-0 inline-flex items-center gap-0.5 px-1.5 py-0 text-[10px] rounded-full border ${klass}`}
+      title={i18nT(title.key, undefined, title.fallback)}
+    >
+      {glyph ? <span aria-hidden="true">{glyph}</span> : null}
+      {i18nT(label.key, undefined, label.fallback)}
     </span>
   );
 }
@@ -445,8 +654,7 @@ export function SessionCard({
   showGitInfo,
   isHidden,
   allSessions,
-  onHide,
-  onUnhide,
+  onArchive,
   contextUsage,
   openspecChanges,
   openspecInitialized,
@@ -489,8 +697,12 @@ export function SessionCard({
    *  so the dialog can render active-session names. Optional; safe default `[]`.
    *  See change: add-worktree-lifecycle-actions. */
   allSessions?: DashboardSession[];
-  onHide: (id: string) => void;
-  onUnhide: (id: string) => void;
+  /**
+   * Archive this session (ended → immediate; idle-alive → the card asks for
+   * confirmation first because archiving ends the pi process). Replaces the
+   * removed manual hide. See change: archive-sessions-lazy-load.
+   */
+  onArchive: (id: string) => void;
   contextUsage?: ContextUsageInfo;
   openspecChanges?: OpenSpecChange[];
   /**
@@ -613,6 +825,13 @@ export function SessionCard({
   const [isRenaming, setIsRenaming] = useState(false);
   const canRename = session.status !== "ended" && !!onRename;
   const isAlive = session.status !== "ended";
+  // Archive affordance (archive-sessions-lazy-load): ended OR idle-alive
+  // (not streaming, no tool in flight). NEVER on a running card.
+  const canArchive =
+    !!onArchive &&
+    (session.status === "ended" ||
+      (isAlive && session.status !== "streaming" && !session.currentTool));
+  const [archiveConfirmOpen, setArchiveConfirmOpen] = useState(false);
   const isMobile = useMobile();
   const prefs = useDisplayPrefs(session.id);
   // Suppress purple `card-input-stripes` when a widget-bar slot owns the
@@ -697,6 +916,7 @@ export function SessionCard({
             </span>
           )}
           <ActivityIndicator session={session} retryAttempt={retryAttempt} />
+          <HostPressureIndicator session={session} />
           <MovedBadge session={session} />
           <OriginDeviceChip session={session} />
           {/* Pi-native queue count badge — sum of steering + follow-up depth.
@@ -880,24 +1100,22 @@ export function SessionCard({
         >
           {formatRelativeTime(now - selectBadgeTimestamp(session))}
         </span>
-        {/* Hide/unhide button */}
-        {isHidden ? (
+        {/* Archive button (archive-sessions-lazy-load). Replaces the removed
+            hide/unhide pair: shown on ended and idle-alive cards, NEVER while
+            running (streaming or a tool in flight). Ended → immediate;
+            idle-alive → confirm (archiving ends the pi process). */}
+        {canArchive && (
           <button
-            onClick={(e) => { e.stopPropagation(); onUnhide(session.id); }}
-            className="text-[var(--text-tertiary)] hover:text-green-400 p-0.5 flex-shrink-0"
-            title={i18nT("session.showSession", undefined, "Show session")}
-            data-testid="session-unhide-btn"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (session.status === "ended") onArchive(session.id);
+              else setArchiveConfirmOpen(true);
+            }}
+            className="text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] rounded p-0.5 flex-shrink-0"
+            title={i18nT("session.archiveSession", undefined, "Archive session")}
+            data-testid="session-archive-btn"
           >
-            <Icon path={mdiEyeOutline} size={0.45} />
-          </button>
-        ) : (
-          <button
-            onClick={(e) => { e.stopPropagation(); onHide(session.id); }}
-            className="text-[var(--text-tertiary)] hover:text-[var(--text-muted)] p-0.5 flex-shrink-0"
-            title={i18nT("session.hideSession", undefined, "Hide session")}
-            data-testid="session-hide-btn"
-          >
-            <Icon path={mdiEyeOffOutline} size={0.45} />
+            <Icon path={mdiArchiveOutline} size={0.45} />
           </button>
         )}
         {isAlive && onShutdown && (
@@ -994,10 +1212,14 @@ export function SessionCard({
         )}
       </div>
 
-      {/* Line 3: activity (left) | context bar + cost (right) */}
+      {/* Line 3: activity/meta (left, the shrink victim so a long
+          `currentTool` ellipsizes instead of pushing the pressure pill out) |
+          pressure + context bar + cost (right). */}
       <div className="flex items-center mt-0.5 text-[11px] gap-2">
-        <ActivityIndicator session={session} retryAttempt={retryAttempt} />
-        <span className="flex-1" />
+        <div className="flex-auto min-w-0 flex items-center gap-2" data-testid="session-card-meta">
+          <ActivityIndicator session={session} retryAttempt={retryAttempt} />
+        </div>
+        <HostPressureIndicator session={session} />
         {prefs.contextUsageBar && (
           <ContextUsageBar
             tokens={contextUsage?.tokens ?? null}
@@ -1146,6 +1368,26 @@ export function SessionCard({
       <SessionCardActionBarSlot session={session} />
       </div>{/* end card content */}
       </div>{/* end flex row */}
+      {/* Idle-alive archive confirmation (ended archives without a dialog).
+          Portalled by Dialog — placement in the tree is irrelevant. */}
+      {archiveConfirmOpen && (
+        <Confirm
+          open
+          onClose={() => setArchiveConfirmOpen(false)}
+          title={i18nT("session.archiveIdleTitle", undefined, "Archive session?")}
+          message={i18nT(
+            "session.archiveIdleMessage",
+            undefined,
+            "This session is still running. Archiving will end it and move it to the folder archive.",
+          )}
+          confirmLabel={i18nT("session.archiveSession", undefined, "Archive session")}
+          onConfirm={() => {
+            setArchiveConfirmOpen(false);
+            onArchive(session.id);
+          }}
+          testId="session-archive-confirm"
+        />
+      )}
     </li>
   );
 }

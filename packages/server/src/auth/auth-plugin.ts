@@ -27,7 +27,7 @@ import {
 } from "./auth.js";
 import { verifyLocalToken } from "./local-token.js";
 import { isBypassedHost, isGenuinelyLocal } from "./localhost-guard.js";
-import type { WsRouteScope } from "./ws-ticket.js";
+import type { CoreWsRouteScope } from "./ws-ticket.js";
 
 /**
  * Returns true if the request URL matches any of the configured bypass prefixes.
@@ -323,6 +323,9 @@ export async function registerAuthPlugin(
       const payload = verifyToken(cookieToken, authState.secret);
       if (payload) {
         (request as any).isAuthenticated = true;
+        // Additive marker: a dashboard login session (vs a device bearer).
+        // `operatorGuard` on the token-mint route admits exactly this kind.
+        (request as any).authVia = "session";
         return;
       }
       // Invalid/expired — clear cookie
@@ -354,8 +357,8 @@ export function validateWsUpgrade(
   opts?: {
     /** Ephemeral single-use ticket (D11); the durable bearer never rides WS. */
     ticket?: string | null;
-    scope?: WsRouteScope | null;
-    consumeTicket?: (ticket: string, scope: WsRouteScope) => boolean;
+    scope?: CoreWsRouteScope | null;
+    consumeTicket?: (ticket: string, scope: CoreWsRouteScope) => boolean;
     /** Upgrade request headers (for proxy-hop detection + local token). */
     headers?: Record<string, unknown>;
     /** Local-IPC allowlist token. */

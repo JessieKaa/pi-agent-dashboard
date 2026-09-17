@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type DashboardConfig, DEFAULT_MEMORY_LIMITS, DEFAULT_DASHBOARD_PORT, DEFAULT_GATEWAY_PORT, ensureConfig, loadConfig, resolveDashboardPorts, resolvePublicBaseUrls } from "../config.js";
+import { type DashboardConfig, DEFAULT_DASHBOARD_PORT, DEFAULT_GATEWAY_PORT, DEFAULT_MEMORY_LIMITS, ensureConfig, loadConfig, parseSessionListConfig, READINESS_TIMEOUT_MAX_MS, READINESS_TIMEOUT_MIN_MS, resolveDashboardPorts, resolvePublicBaseUrls, SPAWN_READINESS_BUDGET_MS, spawnReadinessBudgetMs, validateSessionListConfig } from "../config.js";
 
 describe("loadConfig", () => {
   let testDir: string;
@@ -30,6 +30,61 @@ describe("loadConfig", () => {
     expect(config.autoShutdown).toBe(false);
     expect(config.lastServer).toBeUndefined();
     expect(config.shutdownIdleSeconds).toBe(300);
+  });
+
+  // add-configurable-readiness-timeout: defaults to the historical 10 s
+  // window; a positive number round-trips, anything else falls back.
+  it("readinessTimeoutMs defaults to 10000; valid values round-trip; invalid → default", () => {
+    expect(loadConfig().readinessTimeoutMs).toBe(10_000);
+    fs.writeFileSync(configFile, JSON.stringify({ readinessTimeoutMs: 60_000 }));
+    expect(loadConfig().readinessTimeoutMs).toBe(60_000);
+    fs.writeFileSync(configFile, JSON.stringify({ readinessTimeoutMs: 0 }));
+    expect(loadConfig().readinessTimeoutMs).toBe(10_000);
+    fs.writeFileSync(configFile, JSON.stringify({ readinessTimeoutMs: -1 }));
+    expect(loadConfig().readinessTimeoutMs).toBe(10_000);
+    fs.writeFileSync(configFile, JSON.stringify({ readinessTimeoutMs: "fast" }));
+    expect(loadConfig().readinessTimeoutMs).toBe(10_000);
+  });
+
+  // Both ends of the range are failure modes, not preferences: a sub-second
+  // window reproduces the spurious timeout, an unbounded one never ends the
+  // poll (`now() + 1e21 === 1e21`) so `onLaunchEnd` never fires.
+  it("readinessTimeoutMs clamps into [1000, 600000]; non-finite → default", () => {
+    fs.writeFileSync(configFile, JSON.stringify({ readinessTimeoutMs: 0.5 }));
+    expect(loadConfig().readinessTimeoutMs).toBe(READINESS_TIMEOUT_MIN_MS);
+    fs.writeFileSync(configFile, JSON.stringify({ readinessTimeoutMs: 500 }));
+    expect(loadConfig().readinessTimeoutMs).toBe(READINESS_TIMEOUT_MIN_MS);
+    fs.writeFileSync(configFile, JSON.stringify({ readinessTimeoutMs: 1e21 }));
+    expect(loadConfig().readinessTimeoutMs).toBe(READINESS_TIMEOUT_MAX_MS);
+
+    // JSON has no Infinity/NaN literal — both arrive as null through a
+    // `JSON.stringify` round-trip, and null is not a number either way.
+    fs.writeFileSync(configFile, JSON.stringify({ readinessTimeoutMs: Infinity }));
+    expect(loadConfig().readinessTimeoutMs).toBe(10_000);
+    fs.writeFileSync(configFile, JSON.stringify({ readinessTimeoutMs: NaN }));
+    expect(loadConfig().readinessTimeoutMs).toBe(10_000);
+    fs.writeFileSync(configFile, JSON.stringify({ readinessTimeoutMs: null }));
+    expect(loadConfig().readinessTimeoutMs).toBe(10_000);
+    // …and the raw literals a hand-edited config could carry.
+    fs.writeFileSync(configFile, '{"readinessTimeoutMs": 1e999}');
+    expect(loadConfig().readinessTimeoutMs).toBe(10_000);
+  });
+
+  // The lock staleness bound must stay LARGER than the health poll for every
+  // configured value, or a second session breaks a live holder's lock
+  // mid-spawn and starts a competing server.
+  it("spawnReadinessBudgetMs keeps budget > poll for every configured value", () => {
+    expect(spawnReadinessBudgetMs(undefined)).toBe(SPAWN_READINESS_BUDGET_MS);
+    expect(spawnReadinessBudgetMs(10_000)).toBe(SPAWN_READINESS_BUDGET_MS);
+    expect(spawnReadinessBudgetMs(1_000)).toBe(SPAWN_READINESS_BUDGET_MS);
+    expect(spawnReadinessBudgetMs(60_000)).toBe(180_000);
+    expect(spawnReadinessBudgetMs(READINESS_TIMEOUT_MAX_MS)).toBe(READINESS_TIMEOUT_MAX_MS * 3);
+    // Invalid input degrades to the constant floor, never to 0/NaN.
+    expect(spawnReadinessBudgetMs(0)).toBe(SPAWN_READINESS_BUDGET_MS);
+    expect(spawnReadinessBudgetMs(NaN)).toBe(SPAWN_READINESS_BUDGET_MS);
+    for (const v of [1_000, 10_000, 60_000, READINESS_TIMEOUT_MAX_MS]) {
+      expect(spawnReadinessBudgetMs(v)).toBeGreaterThan(v);
+    }
   });
 
   it("reopenSessionsAfterShutdown defaults to ask and round-trips valid values; invalid → ask", () => {
@@ -1049,5 +1104,148 @@ describe("resolveDashboardPorts", () => {
       port: DEFAULT_DASHBOARD_PORT,
       piPort: DEFAULT_GATEWAY_PORT,
     });
+  });
+});
+
+describe("kroki configuration (test-plan #E9, #E10)", () => {
+  let testDir: string;
+  let configFile: string;
+  let origHome: string;
+
+  beforeEach(() => {
+    testDir = path.join(os.tmpdir(), `test-kroki-config-${Date.now()}`);
+    fs.mkdirSync(path.join(testDir, ".pi", "dashboard"), { recursive: true });
+    configFile = path.join(testDir, ".pi", "dashboard", "config.json");
+    origHome = process.env.HOME!;
+    process.env.HOME = testDir;
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
+  });
+
+  it("loads kroki fields when configured (test-plan #E9)", () => {
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({ kroki: { url: "http://localhost:8100", allowRemote: true } }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.kroki.url).toBe("http://localhost:8100");
+    expect(cfg.kroki.allowRemote).toBe(true);
+  });
+
+  it("missing kroki section returns defaults (url undefined, allowRemote false) (test-plan #E9)", () => {
+    fs.writeFileSync(configFile, JSON.stringify({}));
+    const cfg = loadConfig();
+    expect(cfg.kroki.url).toBeUndefined();
+    expect(cfg.kroki.allowRemote).toBe(false);
+  });
+});
+
+
+// ── sessionList archival policy (test-plan #E14) ──────────────────────────
+// Two surfaces, one policy: `loadConfig` must never throw on a hand-edited
+// value (it falls back to the default), while the write path must REJECT it
+// so an out-of-range setting is never persisted.
+// See change: archive-sessions-lazy-load.
+
+describe("sessionList config BVA (E14)", () => {
+  let testDir: string;
+  let configFile: string;
+  let origHome: string;
+
+  beforeEach(() => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), "test-config-session-list-"));
+    fs.mkdirSync(path.join(testDir, ".pi", "dashboard"), { recursive: true });
+    configFile = path.join(testDir, ".pi", "dashboard", "config.json");
+    origHome = process.env.HOME!;
+    process.env.HOME = testDir;
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("absent sessionList section yields 30 days / 60 minutes", () => {
+    fs.writeFileSync(configFile, JSON.stringify({}));
+    const cfg = loadConfig();
+    expect(cfg.sessionList.archiveAfterDays).toBe(30);
+    expect(cfg.sessionList.archiveSweepIntervalMinutes).toBe(60);
+  });
+
+  it.each<[string, unknown, boolean]>([
+    ["archiveAfterDays -1", { archiveAfterDays: -1 }, false],
+    ["archiveAfterDays 0", { archiveAfterDays: 0 }, true],
+    ["archiveAfterDays 1", { archiveAfterDays: 1 }, true],
+    ["archiveSweepIntervalMinutes 0", { archiveSweepIntervalMinutes: 0 }, false],
+    ["archiveSweepIntervalMinutes 1", { archiveSweepIntervalMinutes: 1 }, true],
+  ])("%s is validated", (_label, patch, ok) => {
+    const result = validateSessionListConfig(patch);
+    expect(result.ok).toBe(ok);
+    expect(result.errors.length > 0).toBe(!ok);
+  });
+
+  it("an out-of-range value on disk falls back to the default instead of throwing", () => {
+    // -1 must NOT be clamped to 0: that would silently DISABLE auto-archive.
+    expect(parseSessionListConfig({ archiveAfterDays: -1 })).toEqual({
+      archiveAfterDays: 30,
+      archiveSweepIntervalMinutes: 60,
+    });
+    expect(parseSessionListConfig({ archiveSweepIntervalMinutes: 0 }).archiveSweepIntervalMinutes).toBe(60);
+  });
+
+  it("in-range boundary values are preserved end-to-end", () => {
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({ sessionList: { archiveAfterDays: 0, archiveSweepIntervalMinutes: 1 } }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.sessionList.archiveAfterDays).toBe(0);
+    expect(cfg.sessionList.archiveSweepIntervalMinutes).toBe(1);
+  });
+});
+
+// ── subagent tick throttle: default ON + marker round-trip ───────────────────
+// See change: heal-orphaned-tool-cards-on-session-end (design D5).
+describe("subagentTickThrottleMs default + migration marker", () => {
+  let testDir: string;
+  let configFile: string;
+  let origHome: string;
+
+  beforeEach(() => {
+    testDir = path.join(os.tmpdir(), `test-throttle-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    fs.mkdirSync(path.join(testDir, ".pi", "dashboard"), { recursive: true });
+    configFile = path.join(testDir, ".pi", "dashboard", "config.json");
+    origHome = process.env.HOME!;
+    process.env.HOME = testDir;
+  });
+  afterEach(() => {
+    process.env.HOME = origHome;
+    fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("defaults to 500 when the key is absent", () => {
+    fs.writeFileSync(configFile, JSON.stringify({ port: 8000 }));
+    expect(loadConfig().subagentTickThrottleMs).toBe(500);
+  });
+
+  it("honours an explicit stored 0", () => {
+    fs.writeFileSync(configFile, JSON.stringify({ subagentTickThrottleMs: 0 }));
+    expect(loadConfig().subagentTickThrottleMs).toBe(0);
+  });
+
+  it("round-trips the migration marker so a settings save cannot strip it", () => {
+    fs.writeFileSync(configFile, JSON.stringify({ subagentTickThrottleMs: 0, subagentTickThrottleMigrated: true }));
+    expect(loadConfig().subagentTickThrottleMigrated).toBe(true);
+  });
+
+  it("ensureConfig seeds the marker on a fresh install", () => {
+    fs.rmSync(configFile, { force: true });
+    ensureConfig();
+    const written = JSON.parse(fs.readFileSync(configFile, "utf-8"));
+    expect(written.subagentTickThrottleMs).toBe(500);
+    expect(written.subagentTickThrottleMigrated).toBe(true);
   });
 });

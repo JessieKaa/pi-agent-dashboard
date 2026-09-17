@@ -2,8 +2,53 @@
  * Pure in-memory session registry.
  * Replaces SQLite-backed session-manager.ts.
  */
-import type { DashboardSession, SessionSource, SessionStatus } from "@blackbelt-technology/pi-dashboard-shared/types.js";
+
+import { pathKey } from "@blackbelt-technology/pi-dashboard-shared/session-group-path.js";
+import type { ClosedReason, DashboardSession, SessionSource, SessionStatus } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import { deriveEndedAt, type EndedAtDeriver } from "./derive-ended-at.js";
+import { resolveOrderKey } from "./resolve-order-key.js";
+
+/**
+ * Snapshot window constants (D4). The specs state the same numbers.
+ * `SNAPSHOT_ENDED_GLOBAL` — newest ended sessions kept overall, by
+ * `endedAt ?? lastActivityAt ?? startedAt` desc.
+ * `SNAPSHOT_ENDED_PER_GROUP` — first entries of `endedSequence(g)` kept for
+ * every group with a non-ended session or a pin.
+ * See change: fix-connect-snapshot-frame-loss.
+ */
+const SNAPSHOT_ENDED_GLOBAL = 120;
+const SNAPSHOT_ENDED_PER_GROUP = 3;
+
+/**
+ * Persisted-order read surface the snapshot window needs. Structural subset
+ * of `SessionOrderManager`, so the real manager satisfies it directly.
+ * See change: fix-connect-snapshot-frame-loss (D4).
+ */
+export interface SnapshotOrders {
+  getOrder(groupKey: string): string[];
+  getAllOrders(): Record<string, string[]>;
+}
+
+/**
+ * Shallow copy of a session row minus `notifyLog`. Snapshot and page rows are
+ * stripped because the notify log is replayed on subscribe — carrying it in
+ * every row is what pushed `sessions_snapshot` past MAX_WS_BUFFER.
+ * See change: fix-connect-snapshot-frame-loss (D4).
+ */
+export function stripNotifyLog(session: DashboardSession): DashboardSession {
+  const { notifyLog: _dropped, ...row } = session;
+  return row;
+}
+
+/** Wire shape of `buildSnapshot` — the connect `sessions_snapshot` payload body. */
+export interface SnapshotResult {
+  /** Windowed rows, `notifyLog`-stripped. */
+  sessions: DashboardSession[];
+  /** groupKey → persisted order filtered to the window (non-empty entries only). */
+  orders: Record<string, string[]>;
+  /** groupKey → ended count regardless of window, for every group with ≥1 ended. */
+  endedTotals: Record<string, number>;
+}
 
 /**
  * How a session's ending became known. `witnessed` — the server observed it
@@ -16,6 +61,13 @@ import { deriveEndedAt, type EndedAtDeriver } from "./derive-ended-at.js";
 export interface UnregisterOptions {
   /** Default `true` — preserves the observed-ending `Date.now()` stamp. */
   witnessed?: boolean;
+  /**
+   * Why the session is ending. Call sites that know their cause pass it
+   * explicitly (`"manual"`, `"spawn_failed"`, a pid probe result); a terminal
+   * transition with no better information is stamped `"unknown"` centrally.
+   * See change: stop-discarding-known-session-state.
+   */
+  closedReason?: ClosedReason;
 }
 
 export interface RegisterSessionParams {
@@ -94,19 +146,57 @@ export interface SessionManager {
   register(params: RegisterSessionParams): DashboardSession;
   /** Restore a previously persisted session (e.g. on startup). Does not trigger onChange. */
   restore(session: DashboardSession): void;
+  /**
+   * Evict a session from the live registry without marking it ended or
+   * emitting `onChange`/`onUnregister`. Used by the archive transition, which
+   * has already persisted the sidecar and does not want a further debounced
+   * write to originate for a non-resident session.
+   * See change: archive-sessions-lazy-load.
+   */
+  remove(sessionId: string): void;
   unregister(sessionId: string, opts?: UnregisterOptions): void;
   update(sessionId: string, updates: Partial<DashboardSession>): void;
   get(sessionId: string): DashboardSession | undefined;
   listActive(): DashboardSession[];
   listAll(): DashboardSession[];
+  /**
+   * Ended ids of `groupKey` in render order: the persisted order restricted
+   * to ended ids, then ended ids with no persisted position by `startedAt`
+   * desc — byte-for-byte the order the client's `sortSessionsByOrder`
+   * renders. `pinned` is the pinned-directory list the group keys resolve
+   * against. See change: fix-connect-snapshot-frame-loss (D4).
+   */
+  endedSequence(groupKey: string, pinned?: readonly string[]): string[];
+  /**
+   * The snapshot window id set, recomputed on every call: all non-ended ∪
+   * global newest-`SNAPSHOT_ENDED_GLOBAL` ended ∪ per-group first
+   * `SNAPSHOT_ENDED_PER_GROUP` of `endedSequence(g)` for groups with a
+   * non-ended session or a pin. See change: fix-connect-snapshot-frame-loss (D4).
+   */
+  snapshotVisibleIds(pinned?: readonly string[]): Set<string>;
+  /**
+   * Windowed connect snapshot: stripped rows, window-filtered orders,
+   * `endedTotals` per group. See change: fix-connect-snapshot-frame-loss (D4).
+   */
+  buildSnapshot(pinned?: readonly string[]): SnapshotResult;
   /** Called after any mutation (register, unregister, update). Receives the affected session ID and optional context. */
   onChange?: (sessionId: string, ctx?: OnChangeContext) => void;
   /** Called after a session is unregistered (status set to ended). */
   onUnregister?: (sessionId: string) => void;
+  /**
+   * Called on the EXACT transition to `ended`, from BOTH seams (`unregister`
+   * and `update`), before `onChange`. The eager, durable write point for the
+   * terminal `closedReason`: `onUnregister` covers only the unregister seam,
+   * and the routine `onChange` save is a full `.meta.json` overwrite that does
+   * not enumerate the field. See change: stop-discarding-known-session-state.
+   */
+  onEnded?: (sessionId: string) => void;
 }
 
 export function createMemorySessionManager(
   derive: EndedAtDeriver = deriveEndedAt,
+  /** Persisted orders the snapshot window reads; absent → empty orders. */
+  orders?: SnapshotOrders,
 ): SessionManager {
   const sessions = new Map<string, DashboardSession>();
 
@@ -129,12 +219,96 @@ export function createMemorySessionManager(
     session.endedAt = derive(session);
   }
 
+  // ── Snapshot window (D4) — see change: fix-connect-snapshot-frame-loss ──
+
+  /** Group key the sidebar groups/orders by (pin > worktree mainPath > cwd). */
+  const groupKeyOf = (s: DashboardSession, pinned: readonly string[]): string =>
+    resolveOrderKey(s, pinned);
+
+  /** Global-window sort key: `endedAt ?? lastActivityAt ?? startedAt` (startedAt is always set). */
+  const endedSortKey = (s: DashboardSession): number => s.endedAt ?? s.lastActivityAt ?? s.startedAt;
+
+  function endedSequence(groupKey: string, pinned: readonly string[] = []): string[] {
+    const ended: DashboardSession[] = [];
+    for (const s of sessions.values()) {
+      if (s.status === "ended" && groupKeyOf(s, pinned) === groupKey) ended.push(s);
+    }
+    const inGroup = new Set(ended.map((s) => s.id));
+    const persisted = (orders?.getOrder(groupKey) ?? []).filter((id) => inGroup.has(id));
+    const persistedSet = new Set(persisted);
+    const unpersisted = ended
+      .filter((s) => !persistedSet.has(s.id))
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .map((s) => s.id);
+    return [...persisted, ...unpersisted];
+  }
+
+  function snapshotVisibleIds(pinned: readonly string[] = []): Set<string> {
+    const visible = new Set<string>();
+    const endedAll: DashboardSession[] = [];
+    const endedByGroup = new Map<string, DashboardSession[]>();
+    const groupsWithNonEnded = new Set<string>();
+    for (const s of sessions.values()) {
+      if (s.status === "ended") {
+        endedAll.push(s);
+        const g = groupKeyOf(s, pinned);
+        let list = endedByGroup.get(g);
+        if (!list) {
+          list = [];
+          endedByGroup.set(g, list);
+        }
+        list.push(s);
+      } else {
+        visible.add(s.id);
+        groupsWithNonEnded.add(groupKeyOf(s, pinned));
+      }
+    }
+    // Global window: newest N ended, id asc as the deterministic tiebreak.
+    const globalWindow = endedAll
+      .sort((a, b) => endedSortKey(b) - endedSortKey(a) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .slice(0, SNAPSHOT_ENDED_GLOBAL);
+    for (const s of globalWindow) visible.add(s.id);
+    // Per-group window: first N of the group's ended sequence, for groups
+    // with a non-ended session or a pin.
+    const pinnedKeys = new Set(pinned.map((d) => pathKey(d, process.platform)));
+    for (const [g, list] of endedByGroup) {
+      if (!groupsWithNonEnded.has(g) && !pinnedKeys.has(pathKey(g, process.platform))) continue;
+      for (const id of endedSequence(g, pinned).slice(0, SNAPSHOT_ENDED_PER_GROUP)) {
+        visible.add(id);
+      }
+    }
+    return visible;
+  }
+
+  function buildSnapshot(pinned: readonly string[] = []): SnapshotResult {
+    // One visible-set computation feeds BOTH rows and orders, so the snapshot
+    // stays self-consistent even if a session's status flips mid-build (X7).
+    const visible = snapshotVisibleIds(pinned);
+    const rows: DashboardSession[] = [];
+    for (const s of sessions.values()) {
+      if (visible.has(s.id)) rows.push(stripNotifyLog(s));
+    }
+    const windowedOrders: Record<string, string[]> = {};
+    for (const [g, ids] of Object.entries(orders?.getAllOrders() ?? {})) {
+      const filtered = ids.filter((id) => visible.has(id));
+      if (filtered.length > 0) windowedOrders[g] = filtered;
+    }
+    const endedTotals: Record<string, number> = {};
+    for (const s of sessions.values()) {
+      if (s.status !== "ended") continue;
+      const g = groupKeyOf(s, pinned);
+      endedTotals[g] = (endedTotals[g] ?? 0) + 1;
+    }
+    return { sessions: rows, orders: windowedOrders, endedTotals };
+  }
+
   const mgr: SessionManager = {
     register(params: RegisterSessionParams): DashboardSession {
       // Preserve accumulated data (tokens, cost) from a prior session with the
-      // same ID (e.g. restored after server restart). Git and openspec data are
-      // polled by the bridge extension shortly after reconnect, so they don't
-      // need to be carried over.
+      // same ID (e.g. restored after server restart). Openspec data is polled
+      // by the bridge extension shortly after reconnect, so it doesn't need to
+      // be carried over. `gitWorktree` is NOT re-polled when the worktree no
+      // longer exists, so it is carried over for a same-cwd reattach (below).
       const existing = sessions.get(params.id);
       const priorStatus = existing?.status;
 
@@ -160,6 +334,14 @@ export function createMemorySessionManager(
           // Preserve context usage until bridge sends fresh data
           contextTokens: existing.contextTokens,
           contextWindow: existing.contextWindow,
+          // Preserve resolved worktree parentage across a SAME-cwd reattach
+          // (server restart / bridge reconnect / resume). A different cwd
+          // starts unresolved and the bridge re-reports it. Without this, the
+          // reconnect cache reset forces a fresh `gitWorktree: null` while the
+          // guard has no `prior` to protect — re-opening the clear during the
+          // worktree-removal window. See design D2b.
+          // See change: fix-worktree-grouping-lost-on-remove.
+          gitWorktree: existing.cwd === params.cwd ? existing.gitWorktree : undefined,
         } : {
           tokensIn: 0,
           tokensOut: 0,
@@ -215,15 +397,34 @@ export function createMemorySessionManager(
       sessions.set(session.id, session);
     },
 
+    remove(sessionId: string): void {
+      sessions.delete(sessionId);
+    },
+
     unregister(sessionId: string, opts?: UnregisterOptions): void {
       const session = sessions.get(sessionId);
       if (session) {
+        // Capture BEFORE flipping: a duplicate termination signal for an
+        // already-ended session is not a new ending and must not overwrite a
+        // good reason with `unknown` (design D1).
+        const wasEnded = session.status === "ended";
         session.status = "ended";
+        // Central `→ ended` stamp (design D1 option B): no unregister path can
+        // produce an unlabelled death. Call sites that know better pass an
+        // explicit reason; the rest get `unknown`.
+        if (!wasEnded && session.closedReason === undefined) {
+          session.closedReason = opts?.closedReason ?? "unknown";
+        }
         // An ended session is not compacting. Without this an unregister that
         // lands mid-compaction leaves the flag set on the record, and the
         // reload dispatcher would refuse forever on a session restored from
         // that record. See change: fix-out-of-band-reload.
         session.compacting = false;
+        // A dead session has no host pressure: the verdict describes a LIVE
+        // bridge's silence, and leaving it on the row lets a later
+        // `sessions_snapshot` serve a stale badge for a card that is gone.
+        // See change: fix-false-unresponsive-badge.
+        session.hostPressure = undefined;
         // Witnessed (the default) keeps the observed instant. An inferred
         // ending — heartbeat/grace expiry, or history registered then
         // immediately unregistered — must not record detection time.
@@ -236,6 +437,7 @@ export function createMemorySessionManager(
         if (session.endedAt === undefined) {
           session.endedAt = opts?.witnessed === false ? derive(session) : Date.now();
         }
+        if (!wasEnded) mgr.onEnded?.(sessionId);
         mgr.onChange?.(sessionId);
         mgr.onUnregister?.(sessionId);
       }
@@ -244,8 +446,30 @@ export function createMemorySessionManager(
     update(sessionId: string, updates: Partial<DashboardSession>): void {
       const session = sessions.get(sessionId);
       if (session) {
+        // Central `→ ended` stamp, mirroring `unregister`. `wasEnded` makes the
+        // detection exact: a no-op update on an already-ended session must not
+        // overwrite a good reason with `unknown` (design D1).
+        const wasEnded = session.status === "ended";
+        const priorReason = session.closedReason;
         Object.assign(session, updates);
         ensureEndedAt(session);
+        // Also fire when an ended record has NO reason (an explicit `undefined`
+        // key in `updates` can clear it): the invariant is "no ended session
+        // without a reason", and a stale reason already set is never touched.
+        if (session.status === "ended" && session.closedReason === undefined) {
+          session.closedReason = "unknown";
+        }
+        // Same clearing rule as `unregister`, for the seam that ends a session
+        // via `update({ status: "ended" })`.
+        // See change: fix-false-unresponsive-badge.
+        if (session.status === "ended") session.hostPressure = undefined;
+        // Persist on the terminal TRANSITION **and** whenever the reason CHANGES
+        // (e.g. an already-ended session learns a better reason). Firing only on
+        // the transition would skip the eager `setLiveness` write for the latter,
+        // leaving the reason stale on disk after the next full-overwrite save.
+        const endedNewly = !wasEnded && session.status === "ended";
+        const reasonChanged = session.status === "ended" && session.closedReason !== priorReason;
+        if (endedNewly || reasonChanged) mgr.onEnded?.(sessionId);
         mgr.onChange?.(sessionId);
       }
     },
@@ -261,6 +485,12 @@ export function createMemorySessionManager(
     listAll(): DashboardSession[] {
       return Array.from(sessions.values());
     },
+
+    endedSequence,
+
+    snapshotVisibleIds,
+
+    buildSnapshot,
   };
 
   return mgr;

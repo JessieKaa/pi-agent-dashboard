@@ -24,8 +24,10 @@ function baseDeps(): ServerContextDeps {
     registerBrowserHandler: () => {},
     onEvent: () => () => {},
     onSessionEnded: () => () => {},
+    onSessionResolved: () => () => {},
     sendToSession: () => true,
     emitEventToSession: () => true,
+    sendExtensionMessage: () => false,
     consumeAll: () => [],
     spawnSession: async () => ({ success: true }),
     abortSession: () => true,
@@ -36,6 +38,11 @@ function baseDeps(): ServerContextDeps {
     consume: () => undefined,
     getPluginConfig: () => ({}),
     updatePluginConfig: async () => {},
+    mintSpawnToken: () => "tok-test",
+    renameSession: () => false,
+    assignSessionRef: () => false,
+    networkGuard: async () => {},
+    onShutdown: () => () => {},
   };
 }
 

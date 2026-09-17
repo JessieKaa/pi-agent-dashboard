@@ -16,3 +16,5 @@ See change: fix-popover-container-clip — reads `usePopoverBoundary()`, passes 
 - Reuses the existing override plumbing unchanged — same `patch()` / `clearOverride()` / `isOverridden()`, so it accumulates with sibling overrides and participates in "Use global settings".
 - Selecting the global's own value still RECORDS an explicit override (a later global change must not move the session).
 - `min-h-[44px]` hit area (matches `ThinkingLevelSelector`) rather than the ~26px `py-1` boolean rows; restyling those siblings is deliberately out of scope.
+
+Adds the `reasoningInlineFlow` row and — replacing the removed single `customEntryFallback` toggle — one row per configured custom event group (labels from `useCustomEventGroups()`, configured order, `other` last; absent id falls to the group's configured default; per-group `isCustomGroupOverridden` dot; patch merges `customEventGroups` field-by-field). See changes: render-inline-reasoning-and-custom-entries, add-custom-event-group-filters.

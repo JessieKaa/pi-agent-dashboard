@@ -22,8 +22,9 @@
  * credential is per-request, because there is nowhere to cache it per
  * connection.
  */
-import type { McpCaller } from "./tokens.js";
-import type { McpTokenRegistry } from "./tokens.js";
+import crypto from "node:crypto";
+import type { Tier } from "@blackbelt-technology/pi-dashboard-shared/tiers.js";
+import type { McpCaller, McpTokenRegistry } from "./tokens.js";
 
 const BEARER_PREFIX = "bearer ";
 
@@ -37,6 +38,13 @@ export interface AuthDeps {
    * self-target guard.
    */
   verifyDeviceToken(token: string): string | null;
+  /**
+   * Tier-aware paired-device verification (change: expand-mcp-tiered-surface,
+   * D1). Preferred over `verifyDeviceToken` when present. Absent against an old
+   * host (service-board skew), in which case every device token resolves to
+   * `operate` — the access an old host grants.
+   */
+  verifyDeviceTokenTier?(token: string): { id: string; tier: Tier } | null;
 }
 
 /**
@@ -58,6 +66,21 @@ export function parseBearer(header: string | string[] | undefined): string | nul
 }
 
 /**
+ * SHA-256 fingerprint of the PRESENTED credential — the throttle key's second
+ * dimension (design.md D7). Computed over the raw presented value, valid or
+ * not: a brute-forcer rotating guesses still creates one bucket per distinct
+ * guess, and the per-ip ceiling catches the rotation.
+ *
+ * The digest is never logged (X6) — it exists only to key the throttle maps.
+ * A headerless request fingerprints the empty string: all such requests from
+ * one ip share a bucket, and the per-ip ceiling still bounds them.
+ */
+export function credentialFingerprint(header: string | string[] | undefined): string {
+  const token = parseBearer(header);
+  return crypto.createHash("sha256").update(token ?? "").digest("hex");
+}
+
+/**
  * Resolve an `Authorization` header to a caller, or `null` when it
  * authenticates nothing.
  *
@@ -76,6 +99,12 @@ export function authenticate(
   const sessionCaller = deps.tokens.resolve(token);
   if (sessionCaller) return sessionCaller;
 
+  // Prefer the tier-aware service; fall back to the id-only one with full
+  // access (an old host has no tiers). See change: expand-mcp-tiered-surface D1.
+  if (deps.verifyDeviceTokenTier) {
+    const verified = deps.verifyDeviceTokenTier(token);
+    return verified ? { kind: "device", deviceId: verified.id, tier: verified.tier } : null;
+  }
   const deviceId = deps.verifyDeviceToken(token);
-  return deviceId ? { kind: "device", deviceId } : null;
+  return deviceId ? { kind: "device", deviceId, tier: "operate" } : null;
 }

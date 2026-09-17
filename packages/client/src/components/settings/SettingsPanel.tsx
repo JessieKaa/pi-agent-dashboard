@@ -7,6 +7,8 @@ import {
   mergeCustomEventGroupPrefs,
   normalizeNotifyMinLevel,
 } from "@blackbelt-technology/pi-dashboard-shared/display-prefs.js";
+// Type-only import — erased at bundle time, so the rule above holds.
+import type { HostGateMode } from "@blackbelt-technology/pi-dashboard-shared/host-admission.js";
 // From the BROWSER-SAFE module, never `config.js`: a value import of the latter
 // pulls node:fs/os/path into the bundle and the SPA dies at boot with
 // `uv.homedir is not a function`. See change: fix-lazy-history-backfill-ux (D7).
@@ -63,6 +65,7 @@ import { UnifiedPackagesSection } from "../packages/UnifiedPackagesSection.js";
 import { DialogPortal } from "../primitives/DialogPortal.js";
 import type { ResourceType } from "../resource/ResourceCardGrid.js";
 import { RESOURCE_PAGE_TYPE, type ResourcePageId, ScopedResourceGrid } from "../resource/ScopedResourceGrid.js";
+import { AllowedHostsSection } from "./AllowedHostsSection.js";
 import { CanvasTypesSettingsSection } from "./CanvasTypesSettingsSection.js";
 import { DiagnosticsSection } from "./DiagnosticsSection.js";
 import { ModelProxySection } from "./ModelProxySection.js";
@@ -181,6 +184,14 @@ interface Config {
   auth?: AuthConfig;
   memoryLimits: MemoryLimitsConfig;
   trustedNetworks?: string[];
+  /**
+   * Bare hostnames the Host gate additionally admits (`allowedHosts`). Bound
+   * to the Security ▸ Allowed hostnames editor; written whole by Save.
+   * See change: add-host-allowlist-admission.
+   */
+  allowedHosts?: string[];
+  /** Host-gate rollout mode; `PI_DASHBOARD_HOST_GATE` overrides it server-side. */
+  hostGate?: { mode: HostGateMode };
   openspec?: {
     enabled?: boolean;
     pollIntervalSeconds?: number;
@@ -192,6 +203,12 @@ interface Config {
   modelProxy?: Record<string, any>;
   /** UI preference: show worktree spawn buttons in folder + OpenSpec rows. Default true. See change: openspec-worktree-spawn-button. */
   gitWorktreeEnabled?: boolean;
+  /** Session-list archive policy (archive-sessions-lazy-load). Optional —
+   * server defaults archiveAfterDays=30, archiveSweepIntervalMinutes=60. */
+  sessionList?: {
+    archiveAfterDays?: number;
+    archiveSweepIntervalMinutes?: number;
+  };
   /** Windows-only git/bash source. See change: embed-git-bash-on-windows. */
   windowsGitSource?: "auto" | "host" | "bundled";
   /** Keeper log behavior — gates capture of pi stdout/stderr into keeper-<id>.log. Default off. See change: add-keeper-output-capture-toggle. */
@@ -223,14 +240,14 @@ const NEEDS_ISSUER = new Set(["keycloak", "oidc"]);
 
 // Maps each config-diff key to the settings page it renders on, so the nav
 // rail can show a per-page dirty dot. See change: unify-settings-save-contract.
-const CONFIG_FIELD_PAGE: Record<string, string> = {
+export const CONFIG_FIELD_PAGE: Record<string, string> = {
   port: "server", piPort: "server", bindHost: "server", autoShutdown: "server", shutdownIdleSeconds: "server",
   tunnel: "server", memoryLimits: "server",
   spawnStrategy: "sessions", reattachPlacement: "sessions", reopenSessionsAfterShutdown: "sessions", completedFirst: "sessions",
-  questionFirst: "sessions", askUserPromptTimeoutSeconds: "sessions", spawnRegisterTimeoutMs: "sessions",
+  questionFirst: "sessions", askUserPromptTimeoutSeconds: "sessions", spawnRegisterTimeoutMs: "sessions", sessionList: "sessions",
   gitWorktreeEnabled: "sessions", dashboardName: "general", defaultModel: "sessions", defaultThinkingLevel: "sessions",
   windowsGitSource: "sessions", autoStart: "sessions",
-  trustedNetworks: "security", auth: "security",
+  trustedNetworks: "security", auth: "security", allowedHosts: "security", hostGate: "security",
   modelProxy: "providers",
   openspec: "openspec",
   devBuildOnReload: "developer", keeperLog: "developer",
@@ -242,7 +259,7 @@ const CONFIG_FIELD_PAGE: Record<string, string> = {
  * dirty state and to build the Save payload. See change:
  * unify-settings-save-contract.
  */
-function computeConfigPartial(config: Config, original: Config): Record<string, any> {
+export function computeConfigPartial(config: Config, original: Config): Record<string, any> {
   const partial: Record<string, any> = {};
   if (config.port !== original.port) partial.port = config.port;
   if (config.piPort !== original.piPort) partial.piPort = config.piPort;
@@ -277,6 +294,18 @@ function computeConfigPartial(config: Config, original: Config): Record<string, 
   if ((config.gitWorktreeEnabled ?? true) !== (original.gitWorktreeEnabled ?? true)) {
     partial.gitWorktreeEnabled = config.gitWorktreeEnabled ?? true;
   }
+  // archive-sessions-lazy-load: FIELD-level diff (same rationale as
+  // memoryLimits — a whole-object write would pin defaulted sibling keys).
+  {
+    const sessionListPartial: Record<string, number> = {};
+    if ((config.sessionList?.archiveAfterDays ?? 30) !== (original.sessionList?.archiveAfterDays ?? 30)) {
+      sessionListPartial.archiveAfterDays = config.sessionList?.archiveAfterDays ?? 30;
+    }
+    if ((config.sessionList?.archiveSweepIntervalMinutes ?? 60) !== (original.sessionList?.archiveSweepIntervalMinutes ?? 60)) {
+      sessionListPartial.archiveSweepIntervalMinutes = config.sessionList?.archiveSweepIntervalMinutes ?? 60;
+    }
+    if (Object.keys(sessionListPartial).length > 0) partial.sessionList = sessionListPartial;
+  }
   {
     const tunnelPartial: Record<string, any> = {};
     if (config.tunnel.enabled !== original.tunnel.enabled) {
@@ -296,6 +325,15 @@ function computeConfigPartial(config: Config, original: Config): Record<string, 
   }
   if (JSON.stringify(config.trustedNetworks) !== JSON.stringify(original.trustedNetworks)) {
     partial.trustedNetworks = config.trustedNetworks ?? [];
+  }
+  // Host-gate fields: each written WHOLE (design D1) — `allowedHosts` is a
+  // replace-list server-side, so a partial list write would merge wrong.
+  // See change: add-host-allowlist-admission.
+  if (JSON.stringify(config.allowedHosts ?? []) !== JSON.stringify(original.allowedHosts ?? [])) {
+    partial.allowedHosts = config.allowedHosts ?? [];
+  }
+  if ((config.hostGate?.mode ?? "report") !== (original.hostGate?.mode ?? "report")) {
+    partial.hostGate = { mode: config.hostGate?.mode ?? "report" };
   }
   /**
    * FIELD-level, not whole-object. `GET /api/config` returns the PARSED config,
@@ -419,16 +457,14 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
   // Cached per-provider health from GET /api/providers (`health[name]`), used to
   // seed each row's pill. See change: surface-provider-health-in-settings.
   const [providerHealth, setProviderHealth] = useState<Record<string, ProviderHealth>>({});
-  // Detect upstream pi-model-proxy extension for ModelProxySection coexistence advisory.
-  // See change: add-dashboard-model-proxy task 14.1.
-  const installedTopLevel = useInstalledPackages("global");
-  const upstreamPiModelProxyInstalled = installedTopLevel.packages.some(
-    (p) => p.source === "npm:@blackbelt-technology/pi-model-proxy",
-  );
   const [originalLlmProviders, setOriginalLlmProviders] = useState<LlmProvider[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [spawnTimeoutInvalid, setSpawnTimeoutInvalid] = useState(false);
+  // archive-sessions-lazy-load field validation: days ≥ 0 (0 disables),
+  // sweep interval ≥ 1 min. Invalid → field error + Save disabled.
+  const [archiveDaysInvalid, setArchiveDaysInvalid] = useState(false);
+  const [archiveSweepInvalid, setArchiveSweepInvalid] = useState(false);
   const [message, setMessage] = useState<{ type: "success" | "error" | "warn"; text: string } | null>(null);
   // Restart is a slow op: the HTTP ack returns immediately but the effect lands
   // when the server re-broadcasts `server_restarting` with our requestId. Hold
@@ -1675,6 +1711,72 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                     onChange={(v) => update((c) => { c.questionFirst = v; })}
                     hint={i18nT("session.whenASessionAsksAQuestion", undefined, "When a session asks a question (ask_user), move its card to the top of the active tier. Off keeps the card in place.")}
                   />
+                  {/* archive-sessions-lazy-load: auto-archive policy. Buffered
+                      into the draft, saved with the shared Save bar. */}
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <label className="text-sm text-[var(--text-secondary)]">
+                        {t("settings.archiveAfterDays", undefined, "Archive after")}
+                        <span className="ml-1.5 px-1 py-0.5 rounded text-[10px] align-middle bg-[var(--bg-tertiary)] text-[var(--text-tertiary)]">{t("settings.daysUnit", undefined, "days")}</span>
+                      </label>
+                      <input
+                        type="number"
+                        aria-label={t("settings.archiveAfterDays", undefined, "Archive after")}
+                        className={`w-24 bg-[var(--bg-secondary)] border rounded px-2 py-1 text-sm text-[var(--text-primary)] text-right ${
+                          archiveDaysInvalid
+                            ? "border-red-500 text-red-400"
+                            : "border-[var(--border-secondary)]"
+                        }`}
+                        value={config.sessionList?.archiveAfterDays ?? 30}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value, 10);
+                          const invalid = isNaN(v) || v < 0;
+                          setArchiveDaysInvalid(invalid);
+                          if (!invalid) update((c) => { c.sessionList = { ...c.sessionList, archiveAfterDays: v }; });
+                        }}
+                      />
+                    </div>
+                    {archiveDaysInvalid && (
+                      <p className="mt-1 text-xs text-red-400" data-testid="archive-after-days-error">
+                        {i18nT("settings.archiveDaysInvalid", undefined, "Must be 0 or greater (0 disables auto-archive).")}
+                      </p>
+                    )}
+                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">
+                      {i18nT("settings.archiveAfterDaysHint", undefined, "Ended sessions older than this are archived automatically out of the live list. 0 disables auto-archive.")}
+                    </p>
+                  </div>
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <label className="text-sm text-[var(--text-secondary)]">
+                        {t("settings.archiveSweepInterval", undefined, "Archive sweep interval")}
+                        <span className="ml-1.5 px-1 py-0.5 rounded text-[10px] align-middle bg-[var(--bg-tertiary)] text-[var(--text-tertiary)]">{t("settings.minUnit", undefined, "min")}</span>
+                      </label>
+                      <input
+                        type="number"
+                        aria-label={t("settings.archiveSweepInterval", undefined, "Archive sweep interval")}
+                        className={`w-24 bg-[var(--bg-secondary)] border rounded px-2 py-1 text-sm text-[var(--text-primary)] text-right ${
+                          archiveSweepInvalid
+                            ? "border-red-500 text-red-400"
+                            : "border-[var(--border-secondary)]"
+                        }`}
+                        value={config.sessionList?.archiveSweepIntervalMinutes ?? 60}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value, 10);
+                          const invalid = isNaN(v) || v < 1;
+                          setArchiveSweepInvalid(invalid);
+                          if (!invalid) update((c) => { c.sessionList = { ...c.sessionList, archiveSweepIntervalMinutes: v }; });
+                        }}
+                      />
+                    </div>
+                    {archiveSweepInvalid && (
+                      <p className="mt-1 text-xs text-red-400" data-testid="archive-sweep-interval-error">
+                        {i18nT("settings.archiveSweepInvalid", undefined, "Must be 1 or greater.")}
+                      </p>
+                    )}
+                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">
+                      {i18nT("settings.archiveSweepIntervalHint", undefined, "How often the server checks for ended sessions past the archive age.")}
+                    </p>
+                  </div>
                 </Section>
                 <Section title={t("settings.lifecycleRecovery", undefined, "Lifecycle & recovery")}>
                   <SelectField
@@ -1894,6 +1996,17 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                     c.auth.bypassHosts = nets;
                   })}
                 />
+                {/* Allowed hostnames — the Host gate's operator surface, between
+                    the two network-trust neighbours. Mode + hostnames edit the
+                    panel draft; the section itself never writes.
+                    See change: add-host-allowlist-admission. */}
+                <AllowedHostsSection
+                  mode={config.hostGate?.mode ?? "report"}
+                  allowedHosts={config.allowedHosts ?? []}
+                  onModeChange={(mode) => update((c) => { c.hostGate = { mode }; })}
+                  onAllowedHostsChange={(hosts) => update((c) => { c.allowedHosts = hosts; })}
+                  onNavigate={navigate}
+                />
                 <Section title={t("settings.pairDevice", undefined, "Pair a device")}>
                   {/* A route, not a duplicate (D2): Security keeps the words an
                       operator expects and one click to the act, which lives on
@@ -1975,7 +2088,6 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                   <ModelProxySection
                     config={config.modelProxy ?? {}}
                     onChange={(patch) => update((c) => { c.modelProxy = { ...c.modelProxy, ...patch }; })}
-                    upstreamExtensionDetected={upstreamPiModelProxyInstalled}
                     availableModels={catalogueModels}
                   />
                 </Section>
@@ -2125,8 +2237,9 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
         </div>
       </div>
 
-      {/* Save Bar — present only while dirty (dirty-gated friction). */}
-      {isDirty && (
+      {/* Save Bar — present only while dirty (dirty-gated friction) or a
+          numeric field is invalid (so the disabled Save explains why). */}
+      {(isDirty || spawnTimeoutInvalid || archiveDaysInvalid || archiveSweepInvalid) && (
         <div
           data-testid="settings-save-bar"
           className="shrink-0 flex items-center gap-3 px-4 py-3 border-t border-[var(--border-primary)] bg-[var(--bg-secondary)]"
@@ -2162,7 +2275,7 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
           </button>
           <button
             onClick={handleSave}
-            disabled={saving || restarting || spawnTimeoutInvalid}
+            disabled={saving || restarting || spawnTimeoutInvalid || archiveDaysInvalid || archiveSweepInvalid}
             data-testid="save-btn"
             className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium disabled:opacity-50"
           >

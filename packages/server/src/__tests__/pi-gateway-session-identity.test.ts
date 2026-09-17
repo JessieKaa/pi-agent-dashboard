@@ -190,7 +190,7 @@ describe("pi gateway session owner identity", () => {
     await waitForOpen(ws);
     ws.send(JSON.stringify({ type: "session_register", sessionId: "auto-close", cwd: "/tmp", source: "dashboard" }));
     await delay(100);
-    sm.update("auto-close", { kind: "automation" });
+    sm.update("auto-close", { finalizeOnSocketClose: true });
 
     expect(gateway.closeSession("auto-close")).toBe(true);
     await delay(200);

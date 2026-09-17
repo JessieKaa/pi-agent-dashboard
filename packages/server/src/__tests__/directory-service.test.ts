@@ -100,6 +100,7 @@ function createMockSessionManager(sessions: DashboardSession[] = []): SessionMan
       return session;
     }),
     restore: vi.fn(),
+    remove: vi.fn(),
     unregister: vi.fn((id) => {
       const s = map.get(id);
       if (s) { s.status = "ended"; s.endedAt = Date.now(); }
@@ -108,6 +109,10 @@ function createMockSessionManager(sessions: DashboardSession[] = []): SessionMan
     get: (id) => map.get(id),
     listActive: () => Array.from(map.values()).filter((s) => s.status !== "ended"),
     listAll: () => Array.from(map.values()),
+    // Snapshot-window surface (fix-connect-snapshot-frame-loss): unused here.
+    endedSequence: () => [],
+    snapshotVisibleIds: () => new Set<string>(),
+    buildSnapshot: () => ({ sessions: [], orders: {}, endedTotals: {} }),
   };
 }
 

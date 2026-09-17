@@ -50,6 +50,7 @@ function makeStubSessionManager(sessions: DashboardSession[]): SessionManager {
   return {
     register: () => { throw new Error("unused"); },
     restore: () => { /* unused */ },
+    remove: () => { /* unused */ },
     unregister: () => { /* unused */ },
     update(id, updates) {
       const s = map.get(id);
@@ -58,6 +59,10 @@ function makeStubSessionManager(sessions: DashboardSession[]): SessionManager {
     get: (id) => map.get(id),
     listActive: () => Array.from(map.values()).filter((s) => s.status !== "ended"),
     listAll: () => Array.from(map.values()),
+    // Snapshot-window surface (fix-connect-snapshot-frame-loss): unused here.
+    endedSequence: () => [],
+    snapshotVisibleIds: () => new Set<string>(),
+    buildSnapshot: () => ({ sessions: [], orders: {}, endedTotals: {} }),
   };
 }
 
@@ -143,8 +148,10 @@ describe("POST /api/git/worktree/remove", () => {
         url: "/api/git/worktree/remove",
         payload: { cwd: plain },
       });
+      // D3 (apply-checkout-root-to-worktree-ops): a non-repo path cannot
+      // resolve a main checkout → `unresolved` → main_checkout_unresolved.
       expect(res.statusCode).toBe(400);
-      expect(res.json()).toMatchObject({ success: false, code: "not_a_worktree" });
+      expect(res.json()).toMatchObject({ success: false, code: "main_checkout_unresolved" });
     } finally {
       rmSync(plain, { recursive: true, force: true });
     }
@@ -454,9 +461,10 @@ describe("POST /api/git/worktree/remove-batch", () => {
       payload: { items: [{ cwd: p1 }, { cwd: outside }, { cwd: p3 }] },
     });
     const results = res.json().data.results;
-    // Not a worktree → rejected per row, never removed.
+    // Not a worktree → rejected per row (D3: unresolved anchor →
+    // main_checkout_unresolved), never removed.
     expect(results[1].ok).toBe(false);
-    expect(results[1].code).toBe("not_a_worktree");
+    expect(results[1].code).toBe("main_checkout_unresolved");
     // The surrounding items still process — no abort on first failure.
     expect(results[0]).toMatchObject({ ok: true });
     expect(results[2]).toMatchObject({ ok: true });

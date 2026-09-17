@@ -7,11 +7,11 @@
  * by trivial mutation).
  */
 import { describe, expect, it } from "vitest";
-import { type McpCaller } from "../tokens.js";
-import { SESSION_TARGETING_TOOLS, evaluateSelfTarget } from "../guard.js";
+import { evaluateSelfTarget, SESSION_TARGETING_TOOLS } from "../guard.js";
+import type { McpCaller } from "../tokens.js";
 
-const sessionCaller = (sessionId: string): McpCaller => ({ kind: "session", sessionId });
-const deviceCaller: McpCaller = { kind: "device", deviceId: "device-1" };
+const sessionCaller = (sessionId: string): McpCaller => ({ kind: "session", sessionId, tier: "control" });
+const deviceCaller: McpCaller = { kind: "device", deviceId: "device-1", tier: "operate" };
 
 describe("evaluateSelfTarget — G1 self-target is refused", () => {
   it("refuses when the caller's resolved session equals the target", () => {

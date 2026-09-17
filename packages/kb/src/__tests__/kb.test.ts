@@ -1,19 +1,21 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { chunkMarkdown } from "../chunker.js";
-import { SqliteFtsStore } from "../sqlite-store.js";
-import { indexSource } from "../indexer.js";
-import { loadConfig } from "../config.js";
+import { fileURLToPath } from "node:url";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { chunkAsciiDoc, extractXrefs } from "../adoc-chunker.js";
+import { chunkMarkdown, MIN_CHUNK_CHARS } from "../chunker.js";
+import { DEFAULTS, loadConfig } from "../config.js";
+import { agentsChain, countInlineRows, doxInit, doxLint, extractRefPaths, parseRowPaths, scanDoxRows } from "../dox.js";
 import { evaluate } from "../eval.js";
+import { docTypeOf, indexSource } from "../indexer.js";
 import { kbInit } from "../init.js";
-import { existsSync, readFileSync } from "node:fs";
+import { classifyRef, filesystemResolver, httpsResolver, npmResolver, resolveAll, sourceIdentity } from "../sources.js";
+import { SqliteFtsStore } from "../sqlite-store.js";
+import { canonicalSource, isTrusted, recordTrust } from "../trust.js";
 import type { KbStore } from "../types.js";
-import { resolveAll, classifyRef, sourceIdentity, filesystemResolver, npmResolver, httpsResolver } from "../sources.js";
-import { isTrusted, recordTrust, canonicalSource } from "../trust.js";
-import { agentsChain, doxInit, doxLint, countInlineRows, parseRowPaths, extractRefPaths } from "../dox.js";
-import { createServer, type Server } from "node:http";
 
 describe("chunker", () => {
   it("splits on headings and builds breadcrumb", () => {
@@ -539,7 +541,7 @@ describe("dox: broken path references inside row prose", () => {
     writeFileSync(join(dir, "packages", "srv", "real.ts"), "export const a = 1;\n");
     writeFileSync(
       join(dir, "AGENTS.md"),
-      "# DOX\n\n| `packages/srv/real.ts` | Mirrors `packages/srv/gone.ts` logic. |\n",
+      "# DOX\n\n| File | Purpose |\n|---|---|\n| `packages/srv/real.ts` | Mirrors `packages/srv/gone.ts` logic. |\n",
     );
     const r = doxLint({ cwd: dir });
     const refs = r.issues.filter((i) => i.kind === "broken-ref");
@@ -555,7 +557,7 @@ describe("dox: broken path references inside row prose", () => {
     writeFileSync(join(dir, "packages", "srv", "other.ts"), "export const b = 2;\n");
     writeFileSync(
       join(dir, "AGENTS.md"),
-      "# DOX\n\n| `packages/srv/real.ts` | Mirrors `packages/srv/other.ts` logic. |\n",
+      "# DOX\n\n| File | Purpose |\n|---|---|\n| `packages/srv/real.ts` | Mirrors `packages/srv/other.ts` logic. |\n",
     );
     const r = doxLint({ cwd: dir });
     expect(r.issues.filter((i) => i.kind === "broken-ref")).toHaveLength(0);
@@ -568,7 +570,7 @@ describe("dox: kb dox lint", () => {
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "kb-doxlint-"));
     mkdirSync(join(dir, "src"), { recursive: true });
-    writeFileSync(join(dir, "AGENTS.md"), "# DOX\n\n| `src/a.md` |  |\n| `src/gone.md` |  |\n");
+    writeFileSync(join(dir, "AGENTS.md"), "# DOX — fixture\n\n| File | Purpose |\n|---|---|\n| `src/a.md` |  |\n| `src/gone.md` |  |\n");
     writeFileSync(join(dir, "src", "a.md"), "# A\na doc that is fine.\n");
     // src/b.md is eligible but has no row (missing)
     writeFileSync(join(dir, "src", "b.md"), "# B\nb doc that is fine.\n");
@@ -583,7 +585,7 @@ describe("dox: kb dox lint", () => {
   });
 
   it("clean tree exits with no issues", () => {
-    writeFileSync(join(dir, "AGENTS.md"), "# DOX\n\n| `src/a.md` |  |\n| `src/b.md` |  |\n");
+    writeFileSync(join(dir, "AGENTS.md"), "# DOX\n\n| File | Purpose |\n|---|---|\n| `src/a.md` |  |\n| `src/b.md` |  |\n");
     rmSync(join(dir, "src", "gone.md"), { force: true }); // not present anyway
     const r = doxLint({ cwd: dir });
     const real = r.issues.filter((i) => i.kind !== "missing-companion");
@@ -608,7 +610,7 @@ describe("dox: kb dox lint", () => {
     // sub-dir AGENTS.md with a BARE BASENAME row for a sibling file that exists
     const sub = join(dir, "src", "nested");
     mkdirSync(sub, { recursive: true });
-    writeFileSync(join(sub, "AGENTS.md"), "# DOX \u2014 src/nested\n\n| `api.ts` |  |\n");
+    writeFileSync(join(sub, "AGENTS.md"), "# DOX \u2014 src/nested\n\n| File | Purpose |\n|---|---|\n| `api.ts` |  |\n");
     writeFileSync(join(sub, "api.ts"), "export const api = 1;\n");
     const r = doxLint({ cwd: dir });
     // api.ts exists next to its AGENTS.md → must NOT be an orphan
@@ -620,7 +622,7 @@ describe("dox: kb dox lint", () => {
     // Excluding all of .pi blinds the orphan check on that whole tree.
     const sk = join(dir, ".pi", "skills");
     mkdirSync(sk, { recursive: true });
-    writeFileSync(join(sk, "AGENTS.md"), "# DOX \u2014 .pi/skills\n\n| `moved/SKILL.md` |  |\n");
+    writeFileSync(join(sk, "AGENTS.md"), "# DOX \u2014 .pi/skills\n\n| File | Purpose |\n|---|---|\n| `moved/SKILL.md` |  |\n");
     const r = doxLint({ cwd: dir });
     expect(r.issues.filter((i) => i.kind === "orphan" && i.path === "moved/SKILL.md").length).toBe(1);
   });
@@ -628,7 +630,7 @@ describe("dox: kb dox lint", () => {
   it("still excludes .pi/dashboard (caches, kb index, not source)", () => {
     const dash = join(dir, ".pi", "dashboard");
     mkdirSync(dash, { recursive: true });
-    writeFileSync(join(dash, "AGENTS.md"), "# DOX\n\n| `nope.md` |  |\n");
+    writeFileSync(join(dash, "AGENTS.md"), "# DOX\n\n| File | Purpose |\n|---|---|\n| `nope.md` |  |\n");
     const r = doxLint({ cwd: dir });
     expect(r.issues.filter((i) => i.agentsFile.includes(".pi/dashboard")).length).toBe(0);
   });
@@ -636,18 +638,22 @@ describe("dox: kb dox lint", () => {
   it("falls back to repo-root for root-config rows documented in a sub-dir AGENTS.md (Option B)", () => {
     // docs/AGENTS.md documents root-level config that lives at the repo root
     mkdirSync(join(dir, "docs"), { recursive: true });
-    writeFileSync(join(dir, "docs", "AGENTS.md"), "# DOX \u2014 docs\n\n| `biome.json` |  |\n");
+    writeFileSync(join(dir, "docs", "AGENTS.md"), "# DOX \u2014 docs\n\n| File | Purpose |\n|---|---|\n| `biome.json` |  |\n");
     writeFileSync(join(dir, "biome.json"), "{}\n"); // at repo root, not in docs/
     const r = doxLint({ cwd: dir });
     expect(r.issues.filter((i) => i.kind === "orphan" && i.path === "biome.json").length).toBe(0);
   });
 
-  it("ignores backtick cells in non-DOX prose tables (Defect B)", () => {
+  it("ignores backtick cells in non-DOX prose tables (Defect B, strengthened E3)", () => {
     writeFileSync(join(dir, "AGENTS.md"),
-      "# DOX\n\n| `src/a.md` |  |\n| `src/b.md` |  |\n\n## Subagent Routing\n\n| Agent | Use |\n| `Explore` | search |\n");
+      "# DOX — fixture\n\n| File | Purpose |\n|---|---|\n| `src/a.md` |  |\n| `src/b.md` |  |\n\n## Subagent Routing\n\n| Agent | Use |\n| `Explore` | search |\n");
     const r = doxLint({ cwd: dir });
-    // `Explore` lives under a non-DOX heading → not a file row, no orphan
+    // `Explore` sits in a table whose header is not a file-row header → not a
+    // file row, no orphan — STRUCTURALLY, regardless of headings.
     expect(r.issues.filter((i) => i.path === "Explore").length).toBe(0);
+    // the real file rows ARE still recognized (orphan/missing evaluated)
+    expect(parseRowPaths(join(dir, "AGENTS.md"))).toContain("src/a.md");
+    expect(r.issues.filter((i) => i.kind === "orphan").length).toBe(0);
   });
 
   it("excludes build output + electron bundled/vendored trees from the md walk", () => {
@@ -695,7 +701,7 @@ describe("dox: over-threshold severity split (fold-oversized-agents-directories)
   // rows, each purpose padded by `pad` chars to drive the byte total.
   const writeAgents = (opts: { inline: number; pointers?: number; pad?: number }) => {
     const { inline, pointers = 0, pad = 0 } = opts;
-    const lines = ["# DOX \u2014 fixture", ""];
+    const lines = ["# DOX \u2014 fixture", "", "| File | Purpose |", "|---|---|"];
     for (let i = 0; i < inline; i++) lines.push(`| \`f${i}.ts\` | purpose ${i}${"x".repeat(pad)} |`);
     for (let i = 0; i < pointers; i++) lines.push(`| \`p${i}.ts\` | summary \u2192 see \`P${i}.AGENTS.md\` |`);
     writeFileSync(join(dir, "AGENTS.md"), lines.join("\n") + "\n");
@@ -722,7 +728,7 @@ describe("dox: over-threshold severity split (fold-oversized-agents-directories)
 
   it("E4: countInlineRows regex precision — true pointer excluded, prose mention counted", () => {
     writeFileSync(join(dir, "AGENTS.md"),
-      "# DOX \u2014 fixture\n\n| `A.ts` | promoted \u2192 see `Foo.AGENTS.md` |\n| `B.ts` | documents the Foo.AGENTS.md sidecar |\n");
+      "# DOX \u2014 fixture\n\n| File | Purpose |\n|---|---|\n| `A.ts` | promoted \u2192 see `Foo.AGENTS.md` |\n| `B.ts` | documents the Foo.AGENTS.md sidecar |\n");
     expect(countInlineRows(join(dir, "AGENTS.md"))).toBe(1); // only B (prose mention, no `→ see`)
   });
 
@@ -755,7 +761,7 @@ describe("dox: over-threshold severity split (fold-oversized-agents-directories)
 
   it("E9: sidecar-pointer-only row for an existing file → no orphan/missing; parseRowPaths still lists it", () => {
     writeFileSync(join(dir, "Foo.tsx"), "export const Foo = 1;\n");
-    writeFileSync(join(dir, "AGENTS.md"), "# DOX \u2014 fixture\n\n| `Foo.tsx` | promoted \u2192 see `Foo.tsx.AGENTS.md` |\n");
+    writeFileSync(join(dir, "AGENTS.md"), "# DOX \u2014 fixture\n\n| File | Purpose |\n|---|---|\n| `Foo.tsx` | promoted \u2192 see `Foo.tsx.AGENTS.md` |\n");
     const r = doxLint({ cwd: dir });
     expect(r.issues.filter((i) => i.path === "Foo.tsx" && (i.kind === "orphan" || i.kind === "missing")).length).toBe(0);
     expect(parseRowPaths(join(dir, "AGENTS.md"))).toContain("Foo.tsx"); // exclusion is count-only
@@ -767,9 +773,9 @@ describe("dox: over-threshold severity split (fold-oversized-agents-directories)
     writeFileSync(join(dir, "root.md"), "# root\nroot doc.\n");
     writeFileSync(join(dir, "sub", "a.md"), "# a\nsub doc a.\n");
     writeFileSync(join(dir, "sub", "b.md"), "# b\nsub doc b.\n");
-    writeFileSync(join(dir, "AGENTS.md"), "# DOX \u2014 root\n\n| `root.md` | root doc. |\n");
+    writeFileSync(join(dir, "AGENTS.md"), "# DOX \u2014 root\n\n| File | Purpose |\n|---|---|\n| `root.md` | root doc. |\n");
     writeFileSync(join(dir, "sub", "AGENTS.md"),
-      "# DOX \u2014 sub\n\n| `a.md` | sub doc a. See change: fold-oversized-agents-directories. |\n| `b.md` | sub doc b. |\n");
+      "# DOX \u2014 sub\n\n| File | Purpose |\n|---|---|\n| `a.md` | sub doc a. See change: fold-oversized-agents-directories. |\n| `b.md` | sub doc b. |\n");
     const r = doxLint({ cwd: dir });
     const bad = r.issues.filter((i) => ["missing", "orphan", "broken-pointer"].includes(i.kind));
     expect(bad.length).toBe(0);
@@ -781,9 +787,9 @@ describe("dox: over-threshold severity split (fold-oversized-agents-directories)
     // SessionCard.tsx moved to session/, documented there, removed from parent.
     mkdirSync(join(dir, "components", "session"), { recursive: true });
     writeFileSync(join(dir, "components", "session", "SessionCard.tsx"), "export const SessionCard = 1;\n");
-    writeFileSync(join(dir, "components", "AGENTS.md"), "# DOX \u2014 components\n\n");
+    writeFileSync(join(dir, "components", "AGENTS.md"), "# DOX \u2014 components\n\n| File | Purpose |\n|---|---|\n");
     writeFileSync(join(dir, "components", "session", "AGENTS.md"),
-      "# DOX \u2014 components/session\n\n| `SessionCard.tsx` | Session card. |\n");
+      "# DOX \u2014 components/session\n\n| File | Purpose |\n|---|---|\n| `SessionCard.tsx` | Session card. |\n");
     const plan = doxInit({ cwd: dir, dryRun: true });
     const parentAppend = plan.appended.find((a) => a.file.endsWith("components/AGENTS.md"));
     const reHomed = (parentAppend?.rows ?? []).filter((row) => row.includes("SessionCard.tsx"));
@@ -802,7 +808,7 @@ describe("dox: marginal dirs report rows-arm only, never bytes-arm (E10)", () =>
   it("E10: marginal dirs (inline >40, <30000 bytes) → rows-arm; a small dir → no over-threshold; zero bytes-arm", () => {
     const mkDir = (name: string, inline: number) => {
       mkdirSync(join(dir, name), { recursive: true });
-      const lines = [`# DOX \u2014 ${name}`, ""];
+      const lines = [`# DOX \u2014 ${name}`, "", "| File | Purpose |", "|---|---|"];
       for (let i = 0; i < inline; i++) lines.push(`| \`${name}-f${i}.ts\` | short purpose ${i} |`);
       writeFileSync(join(dir, name, "AGENTS.md"), lines.join("\n") + "\n");
     };
@@ -815,5 +821,460 @@ describe("dox: marginal dirs report rows-arm only, never bytes-arm (E10)", () =>
     expect(over.filter((i) => i.arm === "bytes").length).toBe(0);
     expect(over.filter((i) => i.arm === "rows").length).toBe(3);   // hooks, extension, shared
     expect(over.some((i) => i.agentsFile.includes("small"))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fix-dox-lint-blind-rows — row recognition keyed on the table header, not on
+// heading state (test-plan E1–E10, X1) + arms parity, coverage, table-aware
+// write paths, and gitignore-aware walks (E11–E15, E17–E20).
+// ---------------------------------------------------------------------------
+
+const FILE_TABLE = "| File | Purpose |\n|---|---|\n";
+
+describe("dox: row recognition keyed on table header (fix-dox-lint-blind-rows)", () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "kb-rows-")); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  const w = (rel: string, body = "x\n") => { const abs = join(dir, rel); mkdirSync(join(abs, ".."), { recursive: true }); writeFileSync(abs, body); };
+
+  it("E1: row under a `## Files` subheading IS scanned (orphan fires)", () => {
+    w("AGENTS.md", "# DOX — pkg\n\n## Local contracts\n\nprose.\n\n## Files\n\n" + FILE_TABLE + "| `gone.md` | orphaned |\n");
+    const r = doxLint({ cwd: dir });
+    expect(r.issues.some((i) => i.kind === "orphan" && i.path === "gone.md")).toBe(true);
+  });
+
+  it("E2: file with NO `# DOX` heading IS scanned (orphan fires)", () => {
+    w("AGENTS.md", "Area notes.\n\n" + FILE_TABLE + "| `gone.md` | orphaned |\n");
+    const r = doxLint({ cwd: dir });
+    expect(r.issues.some((i) => i.kind === "orphan" && i.path === "gone.md")).toBe(true);
+  });
+
+  it("E4: prose table butted directly under the file table is NOT scanned", () => {
+    w("AGENTS.md", "# DOX — pkg\n\n" + FILE_TABLE + "| `real.md` | fine |\n| Subagent | Use for |\n|---|---|\n| `Explore` | search |\n");
+    w("real.md");
+    const r = doxLint({ cwd: dir });
+    expect(r.issues.filter((i) => i.path === "Explore").length).toBe(0);
+  });
+
+  it("E5: a loose row after a blank line is NOT in scanDoxRows().rows", () => {
+    const text = "# DOX — pkg\n\n" + FILE_TABLE + "| `real.md` | fine |\n\n| `loose.md` | split from its table |\n";
+    w("AGENTS.md", text);
+    expect(scanDoxRows(text).rows.map((r) => r.path)).toEqual(["real.md"]);
+  });
+
+  it("E6: a zero-row file table is exactly one zero-row-table finding naming the file + header line", () => {
+    w("AGENTS.md", "# DOX — pkg\n\n## Files\n\n" + FILE_TABLE + "prose after.\n");
+    const r = doxLint({ cwd: dir });
+    const z = r.issues.filter((i) => i.kind === "zero-row-table");
+    expect(z).toHaveLength(1);
+    expect(z[0].agentsFile).toBe("AGENTS.md");
+    expect(z[0].detail).toContain("5"); // header is the 5th line (1-based)
+  });
+
+  it("E7: whitespace-flex header is recognized", () => {
+    const text = "# DOX\n\n|  File  |  Purpose  |\n|---|---|\n| `a.md` | x |\n";
+    expect(scanDoxRows(text).rows.map((r) => r.path)).toEqual(["a.md"]);
+  });
+
+  it("E8: uppercase header is NOT recognized (case-sensitive)", () => {
+    const text = "# DOX\n\n| FILE | PURPOSE |\n|---|---|\n| `a.md` | x |\n";
+    expect(scanDoxRows(text).rows).toEqual([]);
+  });
+
+  it("E9: `| Path | Purpose |` is NOT recognized (no synonym)", () => {
+    const text = "# DOX\n\n| Path | Purpose |\n|---|---|\n| `a.md` | x |\n";
+    expect(scanDoxRows(text).rows).toEqual([]);
+  });
+
+  it("X1: no .git / no .gitignore → graceful degrade, no throw, missing still fires", () => {
+    // tmpdir fixtures carry no .git and no .gitignore anywhere
+    w("AGENTS.md", "# DOX — pkg\n\n" + FILE_TABLE + "| `a.md` | fine |\n");
+    w("a.md");
+    w("b.md");
+    const r = doxLint({ cwd: dir });
+    expect(r.issues.some((i) => i.kind === "missing" && i.path === "b.md")).toBe(true);
+  });
+});
+
+describe("dox: arms parity + coverage (fix-dox-lint-blind-rows)", () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "kb-parity-")); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  const w = (rel: string, body = "x\n") => { const abs = join(dir, rel); mkdirSync(join(abs, ".."), { recursive: true }); writeFileSync(abs, body); };
+
+  it("E11: stale arm sees a subheading-table row (sidecar sha drift)", () => {
+    w("real.md", "content\n");
+    w("AGENTS.md", "# DOX — pkg\n\n## Files\n\n" + FILE_TABLE + "| `real.md` | docs |\n");
+    const sf = join(dir, "staleness.json");
+    // v1 shape (bare path → sha string); a record without a version key reads
+    // as v1, and v1 values must be strings.
+    writeFileSync(sf, JSON.stringify({ "real.md": "stale" }));
+    const r = doxLint({ cwd: dir, stalenessFile: sf });
+    expect(r.issues.some((i) => i.kind === "stale" && i.path === "real.md")).toBe(true);
+  });
+
+  it("E12: broken-ref arm sees a subheading-table row", () => {
+    w("docs/keep.md");
+    w("AGENTS.md", "# DOX — pkg\n\n## Files\n\n" + FILE_TABLE + "| `keep.md` | mirrors `docs/missing-ref.md` |\n");
+    const r = doxLint({ cwd: dir });
+    expect(r.issues.some((i) => i.kind === "broken-ref" && i.path === "docs/missing-ref.md")).toBe(true);
+  });
+
+  it("E10: coverage counts files and rows (sidecar-pointer rows included)", () => {
+    w("AGENTS.md", "# DOX — root\n\n" + FILE_TABLE + "| `a.md` | docs |\n| `b.md` | docs |\n");
+    w("a.md");
+    w("b.md");
+    w("sub/AGENTS.md", "# DOX — sub\n\n" + FILE_TABLE + "| `c.md` | promoted → see `C.AGENTS.md` |\n| `d.md` | docs |\n");
+    w("sub/c.md");
+    w("sub/d.md");
+    const r = doxLint({ cwd: dir });
+    expect(r.filesScanned).toBe(2);
+    expect(r.rowsScanned).toBe(4);
+  });
+
+  it("E10: CLI text mode prints the coverage line", () => {
+    w("AGENTS.md", "# DOX — root\n\n" + FILE_TABLE + "| `a.md` | docs |\n");
+    w("a.md");
+    const kbDir = fileURLToPath(new URL("..", import.meta.url));
+    const env = { ...process.env, NODE_OPTIONS: [process.env.NODE_OPTIONS, "--experimental-sqlite"].filter(Boolean).join(" ") };
+    const out = execFileSync(process.execPath, ["--import", "tsx", join(kbDir, "cli.ts"), "dox", "lint", "--cwd", dir], { cwd: kbDir, encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"] });
+    expect(out).toContain("1 files, 1 rows scanned, 0 findings");
+  }, 30_000);
+});
+
+describe("dox: table-aware write paths (fix-dox-lint-blind-rows)", () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "kb-fix-")); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  const w = (rel: string, body = "x\n") => { const abs = join(dir, rel); mkdirSync(join(abs, ".."), { recursive: true }); writeFileSync(abs, body); };
+
+  it("E17: --fix prunes ONLY the orphan line — all other lines byte-identical", () => {
+    const input = [
+      "# DOX — pkg",
+      "",
+      FILE_TABLE + "| `real.md` | exists |",
+      "| `gone.md` | orphan |",
+      "",
+      "## Files",
+      "",
+      FILE_TABLE + "| `nested.md` | valid row under a subheading |",
+      "",
+      "| Prose | Table |",
+      "|---|---|",
+      "| `prose cell` | not a row |",
+      "",
+      "trailing prose.",
+      "",
+    ].join("\n");
+    w("AGENTS.md", input);
+    w("real.md");
+    w("nested.md");
+    const before = readFileSync(join(dir, "AGENTS.md"), "utf8");
+    const r = doxLint({ cwd: dir, fix: true });
+    expect(r.fixed).toBe(1);
+    const after = readFileSync(join(dir, "AGENTS.md"), "utf8");
+    expect(after).toBe(before.replace("| `gone.md` | orphan |\n", ""));
+  });
+
+  it("E18: --fix missing-arm converges — appended row lands inside the table", () => {
+    w("AGENTS.md", "# DOX — pkg\n\n" + FILE_TABLE + "| `a.md` | docs |\n");
+    w("a.md");
+    w("b.md");
+    doxLint({ cwd: dir, fix: true });
+    const once = readFileSync(join(dir, "AGENTS.md"), "utf8");
+    expect(once).toContain("| `b.md` |  |");
+    expect((once.match(/\| File \| Purpose \|/g) ?? []).length).toBe(1);
+    const r2 = doxLint({ cwd: dir });
+    expect(r2.issues.filter((i) => i.kind === "missing").length).toBe(0);
+    expect(parseRowPaths(join(dir, "AGENTS.md")).filter((p) => p === "b.md").length).toBe(1);
+  });
+
+  it("E19: doxInit is idempotent — second run appends nothing, one header+delimiter", () => {
+    w("src/thing.ts");
+    doxInit({ cwd: dir });
+    const first = readFileSync(join(dir, "src", "AGENTS.md"), "utf8");
+    expect(parseRowPaths(join(dir, "src", "AGENTS.md"))).toContain("thing.ts");
+    const plan2 = doxInit({ cwd: dir });
+    expect(plan2.appended.length).toBe(0);
+    expect(plan2.created.length).toBe(0);
+    expect(readFileSync(join(dir, "src", "AGENTS.md"), "utf8")).toBe(first);
+    const second = readFileSync(join(dir, "src", "AGENTS.md"), "utf8");
+    expect((second.match(/\| File \| Purpose \|/g) ?? []).length).toBe(1);
+    expect((second.match(/^\|---\|---\|$/gm) ?? []).length).toBe(1);
+  });
+
+  it("E20: doxInit create-template carries the file-table header; rows recognized by scanDoxRows", () => {
+    w("src/thing.ts");
+    doxInit({ cwd: dir });
+    const text = readFileSync(join(dir, "src", "AGENTS.md"), "utf8");
+    expect(text).toContain("| File | Purpose |");
+    expect(text).toContain("|---|---|");
+    expect(scanDoxRows(text).rows.map((r) => r.path)).toContain("thing.ts");
+  });
+});
+
+describe("dox: gitignore-aware walks (fix-dox-lint-blind-rows)", () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "kb-giwalk-")); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  const w = (rel: string, body = "x\n") => { const abs = join(dir, rel); mkdirSync(join(abs, ".."), { recursive: true }); writeFileSync(abs, body); };
+
+  it("E13: negated (tracked) md gets missing; ignored md does not", () => {
+    w(".gitignore", "skills/openspec-*/**\n!skills/openspec-shared/\n!skills/openspec-shared/**\n");
+    w("skills/openspec-alpha/SKILL.md");
+    w("skills/openspec-shared/SKILL.md");
+    w("AGENTS.md", "# DOX — root\n\n" + FILE_TABLE + "\n");
+    const r = doxLint({ cwd: dir });
+    const missing = r.issues.filter((i) => i.kind === "missing").map((i) => i.path);
+    expect(missing).toContain("skills/openspec-shared/SKILL.md");
+    expect(missing).not.toContain("skills/openspec-alpha/SKILL.md");
+  });
+
+  it("E15: deeper .gitignore negation overrides a shallower dir-ignore", () => {
+    w(".gitignore", "vendored/\n");
+    w("vendored/.gitignore", "!keep.md\n");
+    w("vendored/keep.md");
+    w("vendored/other.md");
+    w("AGENTS.md", "# DOX — root\n\n" + FILE_TABLE + "\n");
+    const r = doxLint({ cwd: dir });
+    const missing = r.issues.filter((i) => i.kind === "missing").map((i) => i.path);
+    expect(missing).toContain("vendored/keep.md");
+    expect(missing).not.toContain("vendored/other.md");
+  });
+
+  it("E14: indexer honours gitignore from a nested walk root; respectGitignore:false opts out", async () => {
+    w(".gitignore", "src/generated/\n");
+    w("src/keep.md");
+    w("src/generated/x.md");
+    const db = join(dir, ".kb.db");
+    const store = new SqliteFtsStore(db);
+    store.init();
+    try {
+      const src = { root: "t", dir: join(dir, "src") };
+      const on = await indexSource(store, src, { cwd: dir });
+      expect(on.scanned).toBe(1); // keep.md only
+      const off = await indexSource(store, src, { cwd: dir, respectGitignore: false });
+      expect(off.scanned).toBe(2);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+// ── AsciiDoc chunker + indexing (change: asciidoc-support) ──────────────
+describe("adoc chunker", () => {
+  const LONG = "section body long enough to comfortably exceed the hundred character tiny-chunk merge threshold so it survives as its own chunk.";
+
+  it("E5: a title-shaped line inside any delimited block stays content", () => {
+    const blocks: Array<[string, string]> = [
+      ["listing", "----"],
+      ["literal", "...."],
+      ["example", "===="],
+      ["sidebar", "****"],
+      ["quote", "____"],
+      ["passthrough", "++++"],
+      ["open", "--"],
+      ["table", "|==="],
+      ["comment", "////"],
+    ];
+    for (const [name, delim] of blocks) {
+      const text = `= T\n\n== Real\n${LONG}\n\n${delim}\n== Fake Title\ninside ${name}\n${delim}\n\n${LONG}\n`;
+      const { chunks } = chunkAsciiDoc({ root: "r", path: "b.adoc", text });
+      expect(chunks.some((c) => c.heading === "Fake Title"), name).toBe(false);
+      expect(chunks.some((c) => c.body.includes("== Fake Title")), name).toBe(true);
+      // exactly two sections: the preamble-less doc has "Real" only (+ nothing else)
+      expect(chunks.filter((c) => c.level > 0).map((c) => c.heading), name).toEqual(["Real"]);
+    }
+  });
+
+  it("E6: six '=' starts a level-6 section, seven '=' is body content", () => {
+    const text = `= T\n\n== Top\n${LONG}\n\n====== L6 ok\n${LONG}\n\n======= L7 not-a-title\n${LONG}\n`;
+    const { chunks } = chunkAsciiDoc({ root: "r", path: "l.adoc", text });
+    const l6 = chunks.find((c) => c.heading === "L6 ok");
+    expect(l6?.level).toBe(6);
+    expect(chunks.some((c) => c.heading === "L7 not-a-title")).toBe(false);
+    expect(l6?.body).toContain("======= L7 not-a-title");
+  });
+
+  it("E7: a section with no body emits no chunk", () => {
+    const text = `= T\n\n== A\n== B\n${LONG}\n`;
+    const { chunks } = chunkAsciiDoc({ root: "r", path: "e.adoc", text });
+    expect(chunks.some((c) => c.heading === "A")).toBe(false);
+    expect(chunks.some((c) => c.heading === "B")).toBe(true);
+  });
+
+  it("a section is never its own parent when the preamble chunk is dropped", () => {
+    // `= Title` immediately followed by `== Section` is the COMMON shape: the
+    // doctitle's preamble is empty and dropped, so its stack slot must not hand
+    // its ordinal to the section (that produced a self-referential parent, and a
+    // src===dst `child_of` self-loop in the graph).
+    const text = `= Title\n\n== Section\n${LONG}\n`;
+    const { chunks } = chunkAsciiDoc({ root: "r", path: "p.adoc", text });
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].parentChunkId).toBeNull();
+    expect(chunks[0].parentChunkId).not.toBe(chunks[0].chunkId);
+
+    // An EMPTY intermediate section is likewise never a parent.
+    const nested = `= T\n\n== Empty\n=== Child\n${LONG}\n`;
+    const kids = chunkAsciiDoc({ root: "r", path: "n.adoc", text: nested }).chunks;
+    expect(kids.map((c) => c.heading)).toEqual(["Child"]);
+    expect(kids[0].parentChunkId).toBeNull();
+
+    // The grandchild shape: `= Title` (dropped) + `== Section` + `=== Sub`.
+    // Parse-time ordinals are NOT final array indices — comparing the two made
+    // Sub its own parent (ordinal 1 vs final index 1).
+    const grand = `= Title\n\n== Section\n${LONG}\n\n=== Sub\n${LONG}\n`;
+    const gs = chunkAsciiDoc({ root: "r", path: "g.adoc", text: grand }).chunks;
+    expect(gs.map((c) => c.heading)).toEqual(["Section", "Sub"]);
+    expect(gs[0].parentChunkId).toBeNull();
+    expect(gs[1].parentChunkId).toBe(gs[0].chunkId);
+    expect(gs.every((c) => c.parentChunkId !== c.chunkId)).toBe(true);
+
+    // An empty section BEFORE a real parent+child must not shift the mapping.
+    const shifted = `= T\n\n== Empty\n== Real\n${LONG}\n\n=== Kid\n${LONG}\n`;
+    const sh = chunkAsciiDoc({ root: "r", path: "s.adoc", text: shifted }).chunks;
+    expect(sh.map((c) => c.heading)).toEqual(["Real", "Kid"]);
+    expect(sh[1].parentChunkId).toBe(sh[0].chunkId);
+
+    // A REAL parent still links: a preamble that survives owns the doctitle slot.
+    const withPreamble = `= T\n\n${LONG}\n\n== Section\n${LONG}\n`;
+    const linked = chunkAsciiDoc({ root: "r", path: "w.adoc", text: withPreamble }).chunks;
+    expect(linked).toHaveLength(2);
+    expect(linked[1].parentChunkId).toBe(linked[0].chunkId);
+  });
+
+  it("E8: an oversize split point never lands inside a delimited block", () => {
+    // One section whose ONLY blank lines sit inside a listing block. There is no
+    // safe split point, so the section must stay a single oversized chunk.
+    const inner = Array.from({ length: 160 }, (_, i) => `line ${i} of listing payload padding\n`).join("\n");
+    const noSafe = `= T\n\n== Big\n----\n${inner}\n----\n`;
+    const one = chunkAsciiDoc({ root: "r", path: "o1.adoc", text: noSafe }).chunks;
+    expect(one).toHaveLength(1);
+    expect(one[0].body.length).toBeGreaterThan(4000);
+
+    // With a blank line OUTSIDE the block, the split happens there — and never
+    // between the two `----` delimiters.
+    const para = Array.from({ length: 60 }, (_, i) => `outside paragraph ${i} padding text`).join(" ");
+    const safe = `= T\n\n== Big\n----\n${inner}\n----\n\n${para}\n\n${para}\n`;
+    const many = chunkAsciiDoc({ root: "r", path: "o2.adoc", text: safe }).chunks;
+    expect(many.length).toBeGreaterThan(1);
+    for (const c of many) {
+      const opens = (c.body.match(/^----$/gm) ?? []).length;
+      expect(opens % 2).toBe(0); // never a half-open block ⇒ no mid-block split
+    }
+  });
+
+  it("E9: a below-threshold section merges using the markdown thresholds", () => {
+    const tiny = "too short";
+    expect(tiny.length).toBeLessThan(MIN_CHUNK_CHARS);
+    const text = `= T\n\n== First\n${LONG}\n\n== Tiny\n${tiny}\n`;
+    const { chunks } = chunkAsciiDoc({ root: "r", path: "m.adoc", text });
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].heading).toBe("First");
+    expect(chunks[0].body).toContain(tiny);
+  });
+
+  it("E10: line anchors match the section's real line range", () => {
+    //  1: = T
+    //  2:
+    //  3: == One
+    //  4: <LONG>
+    //  5:
+    //  6: == Two
+    //  7: <LONG>
+    const text = `= T\n\n== One\n${LONG}\n\n== Two\n${LONG}\n`;
+    const { chunks } = chunkAsciiDoc({ root: "r", path: "a.adoc", text });
+    const one = chunks.find((c) => c.heading === "One")!;
+    const two = chunks.find((c) => c.heading === "Two")!;
+    expect([one.startLine, one.endLine]).toEqual([4, 4]);
+    expect([two.startLine, two.endLine]).toEqual([7, 7]);
+    const lines = text.split("\n");
+    expect(lines[one.startLine! - 1]).toBe(LONG);
+  });
+
+  it("E11: xref file components are extracted, bare anchors are not", () => {
+    const links = extractXrefs("see xref:other.adoc[L] and xref:other.adoc#frag[L] and <<anchor>> and <<deep.adoc#x,D>>");
+    expect(links.filter((l) => l === "other.adoc")).toHaveLength(2);
+    expect(links).toContain("deep.adoc");
+    expect(links.some((l) => l.includes("anchor"))).toBe(false);
+  });
+
+  it("X1: malformed input never throws and degrades gracefully", () => {
+    const unclosed = chunkAsciiDoc({ root: "r", path: "x1.adoc", text: `= T\n\n== A\n----\n== B\n${LONG}\n` });
+    expect(unclosed.chunks.some((c) => c.heading === "B")).toBe(false); // block swallowed it
+    const stray = chunkAsciiDoc({ root: "r", path: "x2.adoc", text: `____\n++++\n|===\n${LONG}\n` });
+    expect(Array.isArray(stray.chunks)).toBe(true);
+    expect(chunkAsciiDoc({ root: "r", path: "x3.adoc", text: "" }).chunks).toEqual([]);
+    expect(chunkAsciiDoc({ root: "r", path: "x4.adoc", text: "" }).attributes).toBeNull();
+  });
+
+  it("E16: markdown chunk ids are byte-identical after the adoc change", () => {
+    const text =
+      "# Top\nintro paragraph comfortably longer than the hundred character minimum threshold so it stays its own chunk for sure here.\n" +
+      "## Sub\nsub-section body also comfortably longer than the hundred character minimum threshold so it remains a distinct separate chunk.";
+    const { chunks } = chunkMarkdown({ root: "r", path: "a.md", text });
+    // sha256("a.md").slice(0,8) — the unchanged id formula, pinned literally.
+    expect(chunks.map((c) => c.chunkId)).toEqual(["fecccc97:0", "fecccc97:1"]);
+    expect(chunks.every((c) => c.startLine === undefined && c.endLine === undefined)).toBe(true);
+  });
+});
+
+describe("adoc indexing pipeline", () => {
+  const LONG = "asciidoc content long enough to comfortably exceed the tiny-chunk merge threshold so the chunk survives normalization.";
+  let dir: string;
+  let store: SqliteFtsStore;
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), "kb-adoc-"));
+    writeFileSync(join(dir, "a.md"), `# Alpha\n${LONG}\n`);
+    writeFileSync(join(dir, "b.adoc"), `= Bravo\n\n== Bravo Section\n${LONG}\n\nxref:c.asciidoc[Charlie]\n`);
+    writeFileSync(join(dir, "c.asciidoc"), `= Charlie\n\n== Charlie Section\n${LONG}\n`);
+    writeFileSync(join(dir, "d.txt"), `plain text file that must never be indexed ${LONG}\n`);
+    writeFileSync(join(dir, "guide.asciidoc"), LONG); // headerless → title fallback
+    store = new SqliteFtsStore(join(dir, ".kb.db"));
+    store.init();
+    const cfg = DEFAULTS; // default include/extensions, no caller overrides
+    await indexSource(store, { root: "t", dir }, { include: cfg.include, extensions: cfg.extensions });
+  });
+  afterAll(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("E13: default config indexes md + adoc + asciidoc and skips other files", () => {
+    const paths = new Set(store.listPaths("t"));
+    expect(paths.has("a.md")).toBe(true);
+    expect(paths.has("b.adoc")).toBe(true);
+    expect(paths.has("c.asciidoc")).toBe(true);
+    expect(paths.has("d.txt")).toBe(false);
+  });
+
+  it("E13: adoc files are chunked by the adoc chunker ('='-derived headings)", () => {
+    const hits = store.search("bravo section asciidoc content", { limit: 5, root: "t" });
+    const b = hits.find((h) => h.path === "b.adoc");
+    expect(b?.headingPath).toBe("Bravo > Bravo Section");
+  });
+
+  it("E15: a headerless asciidoc title falls back to the extension-stripped name", () => {
+    const chunk = store.getChunk("t", "guide.asciidoc");
+    expect(chunk?.heading).toBe("guide");
+  });
+
+  it("E10/E17: line anchors round-trip through the store", () => {
+    const chunk = store.getChunk("t", "c.asciidoc", "Charlie > Charlie Section");
+    expect(chunk?.startLine).toBe(4);
+    expect(chunk?.endLine).toBe(4);
+  });
+
+  it("E14: adoc under a source path is 'source-md', adoc under docs/ is 'doc'", () => {
+    expect(docTypeOf("packages/x/src/y.adoc", true)).toBe("source-md");
+    expect(docTypeOf("docs/z.adoc", true)).toBe("doc");
+    expect(docTypeOf("packages/x/src/y.adoc", false)).toBe("doc"); // source-md off
+  });
+
+  it("E12: an xref becomes a traversable graph edge", () => {
+    const nbrs = store.neighbors("b.adoc", 1);
+    expect(nbrs.some((n) => n.name === "c.asciidoc")).toBe(true);
   });
 });

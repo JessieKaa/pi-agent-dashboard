@@ -2,15 +2,17 @@
 
 import { AppleToolsSettings } from "@blackbelt-technology/pi-dashboard-apple-tools";
 import { FolderAutomationSection, AutomationBoard, AutomationRunMonitor, AutomationBadge, isAutomationRun, AutomationSettings, catalog as automation_catalog } from "@blackbelt-technology/pi-dashboard-automation-plugin";
-import { BlackholeSettings, catalog as blackhole_catalog } from "@blackbelt-technology/pi-dashboard-blackhole-plugin";
 import { CostView, CostSettings } from "@blackbelt-technology/pi-dashboard-cost-estimator";
 import { SessionFlowActionsClaim, shouldRenderFlowsSubcard, FlowDashboardClaim, FlowYamlPreviewClaim, isFlowYamlPreviewActive, FlowWriteToolRenderer, FlowAgentsToolRenderer, FlowsSettings, FlowInputWiringClaim, catalog as flows_catalog } from "@blackbelt-technology/pi-dashboard-flows-plugin";
 import { GoalChip, hasGoal, GoalControl, FolderGoalsSection, GoalsBoardClaim, GoalDetailClaim, GoalPluginSettings, catalog as goal_catalog } from "@blackbelt-technology/pi-dashboard-goal-plugin";
 import { GrammarSettings, GrammarComposerPanel, catalog as grammar_catalog } from "@blackbelt-technology/pi-dashboard-grammar-plugin";
 import { HermesMemorySettings, catalog as hermes_memory_catalog } from "@blackbelt-technology/pi-dashboard-hermes-memory-plugin";
 import { FolderKbSection, KbSettingsClaim, catalog as kb_catalog } from "@blackbelt-technology/pi-dashboard-kb-plugin";
+import { McpSettingsClaim, FolderMcpSection, FolderMcpPage } from "@blackbelt-technology/pi-dashboard-mcp-client-plugin";
 import { BuiltInRolesSettings, catalog as roles_catalog } from "@blackbelt-technology/pi-dashboard-roles-plugin";
 import { SubagentsSettings, SubagentPopoutClaim, catalog as subagents_catalog } from "@blackbelt-technology/pi-dashboard-subagents-plugin";
+import { BlackholeSettings, MemorySubcard, shouldRenderMemorySubcard, PipelineDetailView, isPipelineDetailActive, catalog as blackhole_catalog } from "@blackbelt-technology/pi-dashboard-blackhole-plugin";
+import { BrowserSettings, BrowserRelayBadge, LiveViewTile, isLiveViewActive, catalog as browser_catalog } from "@blackbelt-technology/pi-dashboard-browser-plugin";
 import { FlowsAnthropicBridgeSettings, catalog as flows_anthropic_bridge_catalog } from "@blackbelt-technology/pi-dashboard-flows-anthropic-bridge-plugin";
 import { QuotaWidget, QuotaSettings, catalog as quota_catalog } from "@blackbelt-technology/pi-dashboard-quota-plugin";
 
@@ -40,13 +42,13 @@ export const PLUGIN_REGISTRY: RegistryEntry[] = [
         "server": "./src/server/index.ts",
         "configSchema": "./config.schema.json",
         "requires": {
-            "piExtensions": [
-                "pi-mcp-adapter"
-            ],
             "paths": [
                 "${imcpServerPath}"
             ]
-        }
+        },
+        "dependsOn": [
+            "mcp-client"
+        ]
     },
     claims: [
       { pluginId: "apple-tools", priority: 100, slot: "settings-section", Component: AppleToolsSettings },
@@ -102,33 +104,6 @@ export const PLUGIN_REGISTRY: RegistryEntry[] = [
       { pluginId: "automation", priority: 100, slot: "settings-section", tab: "general", Component: AutomationSettings },
     ],
     catalog: automation_catalog,
-  },
-  {
-    manifest: {
-        "id": "blackhole",
-        "displayName": "Blackhole",
-        "priority": 100,
-        "claims": [
-            {
-                "slot": "settings-section",
-                "component": "BlackholeSettings",
-                "tab": "general"
-            }
-        ],
-        "client": "./src/client/index.tsx",
-        "server": "./src/server/index.ts",
-        "configSchema": "./src/configSchema.json",
-        "i18nCatalog": "catalog",
-        "requires": {
-            "piExtensions": [
-                "pi-blackhole"
-            ]
-        }
-    },
-    claims: [
-      { pluginId: "blackhole", priority: 100, slot: "settings-section", tab: "general", Component: BlackholeSettings },
-    ],
-    catalog: blackhole_catalog,
   },
   {
     manifest: {
@@ -367,6 +342,49 @@ export const PLUGIN_REGISTRY: RegistryEntry[] = [
   },
   {
     manifest: {
+        "id": "mcp-client",
+        "displayName": "MCP Client",
+        "priority": 100,
+        "claims": [
+            {
+                "slot": "settings-section",
+                "component": "McpSettingsClaim",
+                "tab": "general"
+            },
+            {
+                "slot": "sidebar-folder-section",
+                "component": "FolderMcpSection"
+            },
+            {
+                "slot": "worktree-card-section",
+                "component": "FolderMcpSection"
+            },
+            {
+                "slot": "shell-overlay-route",
+                "component": "FolderMcpPage",
+                "path": "/folder/:encodedCwd/mcp",
+                "depth": 2,
+                "parentPath": "/folder/:encodedCwd"
+            }
+        ],
+        "client": "./src/client/index.tsx",
+        "server": "./src/server/index.ts",
+        "configSchema": "./configSchema.json",
+        "requires": {
+            "piExtensions": [
+                "pi-mcp-adapter"
+            ]
+        }
+    },
+    claims: [
+      { pluginId: "mcp-client", priority: 100, slot: "settings-section", tab: "general", Component: McpSettingsClaim },
+      { pluginId: "mcp-client", priority: 100, slot: "sidebar-folder-section", Component: FolderMcpSection },
+      { pluginId: "mcp-client", priority: 100, slot: "worktree-card-section", Component: FolderMcpSection },
+      { pluginId: "mcp-client", priority: 100, slot: "shell-overlay-route", path: "/folder/:encodedCwd/mcp", depth: 2, parentPath: "/folder/:encodedCwd", Component: FolderMcpPage },
+    ],
+  },
+  {
+    manifest: {
         "id": "roles",
         "displayName": "Roles",
         "priority": 100,
@@ -424,6 +442,78 @@ export const PLUGIN_REGISTRY: RegistryEntry[] = [
   },
   {
     manifest: {
+        "id": "blackhole",
+        "displayName": "Blackhole",
+        "priority": 200,
+        "claims": [
+            {
+                "slot": "settings-section",
+                "component": "BlackholeSettings",
+                "tab": "general"
+            },
+            {
+                "slot": "session-card-memory",
+                "component": "MemorySubcard",
+                "shouldRender": "shouldRenderMemorySubcard"
+            },
+            {
+                "slot": "content-view",
+                "component": "PipelineDetailView",
+                "predicate": "isPipelineDetailActive"
+            }
+        ],
+        "client": "./src/client/index.tsx",
+        "server": "./src/server/index.ts",
+        "configSchema": "./src/configSchema.json",
+        "i18nCatalog": "catalog",
+        "requires": {
+            "piExtensions": [
+                "pi-blackhole"
+            ]
+        }
+    },
+    claims: [
+      { pluginId: "blackhole", priority: 200, slot: "settings-section", tab: "general", Component: BlackholeSettings },
+      { pluginId: "blackhole", priority: 200, slot: "session-card-memory", Component: MemorySubcard, shouldRender: shouldRenderMemorySubcard },
+      { pluginId: "blackhole", priority: 200, slot: "content-view", Component: PipelineDetailView, predicate: isPipelineDetailActive },
+    ],
+    catalog: blackhole_catalog,
+  },
+  {
+    manifest: {
+        "id": "browser",
+        "displayName": "Browser Relay",
+        "priority": 500,
+        "claims": [
+            {
+                "slot": "settings-section",
+                "component": "BrowserSettings"
+            },
+            {
+                "slot": "session-card-badge",
+                "component": "BrowserRelayBadge"
+            },
+            {
+                "slot": "content-view",
+                "component": "LiveViewTile",
+                "predicate": "isLiveViewActive"
+            }
+        ],
+        "client": "./src/client/index.tsx",
+        "server": "./src/server/index.ts",
+        "configSchema": "./configSchema.json",
+        "defaultEnabled": false,
+        "i18nCatalog": "catalog"
+    },
+    claims: [
+      { pluginId: "browser", priority: 500, slot: "settings-section", Component: BrowserSettings },
+      { pluginId: "browser", priority: 500, slot: "session-card-badge", Component: BrowserRelayBadge },
+      { pluginId: "browser", priority: 500, slot: "content-view", Component: LiveViewTile, predicate: isLiveViewActive },
+    ],
+    catalog: browser_catalog,
+  },
+  {
+    manifest: {
         "id": "flows-anthropic-bridge",
         "displayName": "Anthropic Messages Bridge",
         "priority": 500,
@@ -452,7 +542,7 @@ export const PLUGIN_REGISTRY: RegistryEntry[] = [
         "priority": 600,
         "claims": [
             {
-                "slot": "content-inline-footer",
+                "slot": "composer-context-group",
                 "component": "QuotaWidget"
             },
             {
@@ -467,11 +557,11 @@ export const PLUGIN_REGISTRY: RegistryEntry[] = [
         "i18nCatalog": "catalog"
     },
     claims: [
-      { pluginId: "quota", priority: 600, slot: "content-inline-footer", Component: QuotaWidget },
+      { pluginId: "quota", priority: 600, slot: "composer-context-group", Component: QuotaWidget },
       { pluginId: "quota", priority: 600, slot: "settings-section", tab: "general", Component: QuotaSettings },
     ],
     catalog: quota_catalog,
   },
 ];
 
-export const PLUGIN_REGISTRY_HASH = "879d335e01e636bd0711457721707b903134092ecbf7d4359ff2cccb547e4e7c";
+export const PLUGIN_REGISTRY_HASH = "30cffc0118551a078e10b05aff61d33985b1f43e188081fdbecf424d416f684b";

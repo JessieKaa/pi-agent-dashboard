@@ -8,6 +8,7 @@ Files in this directory. One row per file. Non-source area. Subdir files owned b
 | `.gitignore` | Excludes `.env` + `compose.override.yml` (user-specific). See change: docker-packaging. |
 | `compose.dev.yml` | Dev overlay. Bind-mounts source, anonymous node_modules volume keeps Linux node-pty, exposes 5173, `NODE_ENV=development`, command `start --dev`. See change: docker-packaging. |
 | `compose.override.yml.example` | Power-user template. Path-identical workspace binds, `:ro` example, `PI_DASHBOARD_PIN_DIRS`. Copy to `compose.override.yml`. See change: docker-packaging. |
+| `compose.kroki.yml` | Kroki diagram rendering overlay. Adds `yuzutech/kroki` with `KROKI_SAFE_MODE=secure` and no host ports, atomically sets `KROKI_URL=http://kroki:8000` on `pi-dashboard`. See change: diagram-rendering. |
 | `compose.test.cap.yml` | Overlay-mode capability layer. Grants `cap_add: [SYS_ADMIN]` for `mount -t overlay` in test-entrypoint.sh. → see `compose.test.cap.yml.AGENTS.md` |
 | `compose.test.yml` | Test overlay on `compose.yml`. Sets `PI_DASHBOARD_NO_MDNS=1`, `DASHBOARD_PORT="${DASHBOARD_PORT:-18000}"`,… → see `compose.test.yml.AGENTS.md` |
 | `compose.yml` | Base compose. Service `pi-dashboard`, `init:true`, env-driven ports, named volumes `pi-state`→`/home/pi/.pi`… → see `compose.yml.AGENTS.md` |
@@ -17,7 +18,7 @@ Files in this directory. One row per file. Non-source area. Subdir files owned b
 | `README.md` | User guide. Quick-start, config table, path-identical workspace mounts, volume perf profiles, gateway access, dev mode, Electron remote mode. See change: docker-packaging. |
 | `supervise-daemon.sh` | `supervise_daemon <pidfile> [label]` — keeps PID 1 alive for a DETACHED dashboard daemon, sourced by BOTH… → see `supervise-daemon.sh.AGENTS.md` |
 | `test-down.sh` | Teardown. Re-derives `COMPOSE_PROJECT_NAME` from `$PWD` via lib-ports.sh cksum. → see `test-down.sh.AGENTS.md` |
-| `test-entrypoint.sh` | Test entrypoint wrapper. `HOST_CWD` set → mounts overlayfs (lower `/mnt/test-lower` ro, upper/work tmpfs) at… → see `test-entrypoint.sh.AGENTS.md` |
+| `test-entrypoint.sh` | Test entrypoint wrapper. `HOST_CWD` set → mounts overlayfs (lower `/mnt/test-lower` ro, upper/work tmpfs) at… → see `test-entrypoint.sh.AGENTS.md` Seeds the windowed-session fixture via `scripts/seed-sessions-window.mjs` under `PI_E2E_SEED`. See change: fix-connect-snapshot-frame-loss. |
 | `test-up.sh` | Spin-up. Sources lib-ports.sh. Exports `HOST_CWD=$PWD`. Derives stable port pair + `COMPOSE_PROJECT_NAME`… → see `test-up.sh.AGENTS.md` |
 | `TESTING.md` | Runbook for disposable isolated test harness. Quick start. → see `TESTING.md.AGENTS.md` |
 | `up.sh` | Workspace launcher. Parses `PI_WORKSPACES` path-separator list, one path-identical `-v dir:dir` RW bind per… → see `up.sh.AGENTS.md` |

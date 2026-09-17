@@ -75,10 +75,57 @@ export function buildOpenSpecConnectSnapshot(
   return out;
 }
 
-import { handleAddFolderToWorkspace, handleCreateWorkspace, handleDeleteWorkspace, handleExtensionUiResponse, handleFavoriteModel, handleMoveFolderToWorkspace, handleOpenSpecBulkArchive, handleOpenSpecRefresh, handlePiGatewayForward, handlePinDirectory, handleRemoveFolderFromWorkspace, handleRenameWorkspace, handleReorderPinnedDirs, handleReorderSessions, handleReorderWorkspaceFolders, handleReorderWorkspaces, handleSetWorkspaceCollapsed, handleUnfavoriteModel, handleUnpinDirectory } from "../browser-handlers/directory-handler.js";
+/**
+ * D1 — a frame's delivery class is a STATIC function of its message type;
+ * it never depends on socket condition. `state` frames are idempotent
+ * snapshots of server-held state keyed by `(type, entityKey)`; everything
+ * else is `transcript` (recoverable via replay/history backfill). The third
+ * class, `blocking`, is NOT derivable from the message — it is the
+ * `ctx.critical` flag `sendTo` handles (the pending-prompt exemption).
+ * Key rules: singleton types use the bare type; cwd-keyed types carry the
+ * type in the key (openspec vs git for one cwd never collide); the terminal
+ * lifecycle frames deliberately share ONE key `terminal:<id>` so a later
+ * lifecycle frame supersedes an earlier pending one.
+ * See change: fix-connect-snapshot-frame-loss (D1).
+ */
+export function frameClassOf(
+  msg: ServerToBrowserMessage,
+): { cls: "state" | "transcript"; key: string } {
+  switch (msg.type) {
+    case "sessions_snapshot":
+    case "pinned_dirs_updated":
+    case "workspaces_updated":
+    case "favorite_models_updated":
+    case "display_prefs_updated":
+    case "reachability_updated":
+      return { cls: "state", key: msg.type };
+    case "openspec_update":
+    case "git_head_update":
+    case "sessions_page_result":
+      return { cls: "state", key: `${msg.type}:${msg.cwd}` };
+    case "openspec_get_result":
+      // The two-phase reply (placeholder then final) is NOT idempotent, so the
+      // delivery key carries requestId + phase: a final must not supersede its
+      // own queued placeholder, and a newer request for the same cwd must not
+      // coalesce over an older one. See change: fix-connect-snapshot-frame-loss.
+      return {
+        cls: "state",
+        key: `openspec_get_result:${msg.cwd}:${msg.requestId}:${msg.final ? "final" : "placeholder"}`,
+      };
+    case "terminal_added":
+      return { cls: "state", key: `terminal:${msg.terminal.id}` };
+    case "terminal_updated":
+    case "terminal_removed":
+      return { cls: "state", key: `terminal:${msg.terminalId}` };
+    default:
+      return { cls: "transcript", key: msg.type };
+  }
+}
+
+import { handleAddFolderToWorkspace, handleCreateWorkspace, handleDeleteWorkspace, handleExtensionUiResponse, handleFavoriteModel, handleMoveFolderToWorkspace, handleOpenSpecBulkArchive, handleOpenSpecGet, handleOpenSpecRefresh, handlePiGatewayForward, handlePinDirectory, handleRemoveFolderFromWorkspace, handleRenameWorkspace, handleReorderPinnedDirs, handleReorderSessions, handleReorderWorkspaceFolders, handleReorderWorkspaces, handleSetWorkspaceCollapsed, handleUnfavoriteModel, handleUnpinDirectory } from "../browser-handlers/directory-handler.js";
 import type { BrowserHandlerContext } from "../browser-handlers/handler-context.js";
-import { handleAbort, handleClearFollowupEntries, handleEditFollowupEntry, handleFlowControl, handleForceKill, handleKillProcess, handlePromoteFollowupEntry, handleRemoveFollowupEntry, handleResumeSession, handleRetrySession, handleSendPrompt, handleShutdown, handleSpawnSession, handleStopAfterTurn, handleSubagentResyncRequest, shutdownSession as shutdownSessionImpl } from "../browser-handlers/session-action-handler.js";
-import { handleAcceptReplaceProposal, handleAttachProposal, handleDetachProposal, handleDismissReplaceProposal, handleFetchContent, handleHideSession, handleListSessions, handleRemoveTagGlobally, handleRenameSession, handleSetSessionDisplayPrefs, handleSetSessionProcessDrawer, handleSetSessionTags, handleUnhideSession } from "../browser-handlers/session-meta-handler.js";
+import { handleAbort, handleClearFollowupEntries, handleEditFollowupEntry, handleFlowControl, handleForceKill, handleKillProcess, handlePromoteFollowupEntry, handlePromptResyncRequest, handleRemoveFollowupEntry, handleResumeSession, handleRetrySession, handleSendPrompt, handleShutdown, handleSpawnSession, handleStopAfterTurn, handleSubagentResyncRequest, shutdownSession as shutdownSessionImpl } from "../browser-handlers/session-action-handler.js";
+import { handleAcceptReplaceProposal, handleArchiveSession, handleAttachProposal, handleDetachProposal, handleDismissReplaceProposal, handleFetchContent, handleListSessions, handleRemoveTagGlobally, handleRenameSession, handleSessionsPage, handleSetSessionDisplayPrefs, handleSetSessionProcessDrawer, handleSetSessionTags, handleUnarchiveSession } from "../browser-handlers/session-meta-handler.js";
 import { clearGapState, forgetHistoryWindow, handleHistoryBackfill, handleSubscribe } from "../browser-handlers/subscription-handler.js";
 import { handleCloseInlineTerminal, handleCreateTerminal, handleKillTerminal, handleOpenInlineTerminal, handleRenameTerminal } from "../browser-handlers/terminal-handler.js";
 import { createPendingResumeRegistry, type PendingResumeRegistry } from "../pending/pending-resume-registry.js";
@@ -87,6 +134,71 @@ import type { TerminalManager } from "../terminal/terminal-manager.js";
 import { ResyncRequesterRegistry, resyncRequestIdOf } from "./subagent-resync-routing.js";
 
 
+
+/**
+ * Per-delivery cap on exempted critical frames (fix-pending-prompt-lost-on-replay,
+ * D2): one pending-prompt replay (or one resync delivery) may bypass the
+ * MAX_WS_BUFFER shed for at most this many frames. Fixed, not configurable.
+ */
+const CRITICAL_FRAMES_PER_DELIVERY = 4;
+
+/** Slack added to MAX_WS_BUFFER to form the absolute critical-frame ceiling. */
+const CRITICAL_FRAME_SLACK_BYTES = 1 * 1024 * 1024; // 1 MB
+
+/** Wire shape of `/api/health#droppedFrames.serverToBrowser`, split by frame class. */
+export interface DroppedFrameStats {
+  /** Transcript-class drops (ordinary frames shed under back-pressure). */
+  total: number;
+  bySession: Record<string, number>;
+  /** Blocking-class drops (critical frames past the cap or the ceiling). */
+  blocking: { total: number; bySession: Record<string, number> };
+  /** Pending state entries superseded before flush (latest-wins coalescing — NOT a drop). */
+  coalescedState: number;
+  /** Sockets terminated by the pending-state byte ceiling (stalled). */
+  stalledSocketsTerminated: number;
+  /**
+   * Shed `session_updated` CAPTURES — not distinct ids. A re-entry of an
+   * already-owed id counts again, as does a shed reconcile. `queued - sent` is
+   * therefore NOT the outstanding debt; read `getStatusReconcileInfo(ws)` for that.
+   */
+  statusReconcileQueued: number;
+  /** Reconcile `session_updated` frames actually PUT ON THE WIRE after drain. */
+  statusReconcileSent: number;
+}
+
+/**
+ * Wire shape of `/api/health#socketBufferOccupancy` — browser-socket
+ * `bufferedAmount` occupancy, sampled at the send-decision sites (never on a
+ * timer). Makes a back-pressure claim measurable instead of inferred from
+ * cumulative drop counters. `p95` is pooled across sockets, over a bounded
+ * reservoir. See change: fix-backpressure-status-and-subagent-frames.
+ */
+export interface SocketBufferOccupancy {
+  /** Highest `bufferedAmount` observed on any browser socket since boot. */
+  max: number;
+  /** 95th percentile over the bounded sample reservoir. */
+  p95: number;
+  /** Cumulative ms any socket was sampled above `MAX_WS_BUFFER`. */
+  msAboveThreshold: number;
+}
+
+/** Zero-value `SocketBufferOccupancy`, so route fallbacks stay TYPED. */
+export const EMPTY_SOCKET_BUFFER_OCCUPANCY: SocketBufferOccupancy = {
+  max: 0,
+  p95: 0,
+  msAboveThreshold: 0,
+};
+
+/** Zero-value `DroppedFrameStats`, so route fallbacks stay TYPED, not inline literals. */
+export const EMPTY_DROPPED_FRAME_STATS: DroppedFrameStats = {
+  total: 0,
+  bySession: {},
+  blocking: { total: 0, bySession: {} },
+  coalescedState: 0,
+  stalledSocketsTerminated: 0,
+  statusReconcileQueued: 0,
+  statusReconcileSent: 0,
+};
 
 export interface BrowserGateway {
   wss: WebSocketServer;
@@ -135,10 +247,58 @@ export interface BrowserGateway {
   /**
    * Per-hop dropped-frame counters for the diagnostics/health surface. A
    * server→browser frame is dropped when a browser socket's send buffer
-   * crosses MAX_WS_BUFFER under back-pressure. See change:
-   * fix-stuck-tool-card-on-dropped-event.
+   * crosses MAX_WS_BUFFER under back-pressure. `total`/`bySession` carry the
+   * TRANSCRIPT class (back-compat shape); `blocking` carries critical frames
+   * dropped past the exemption bounds. See changes:
+   * fix-stuck-tool-card-on-dropped-event, fix-pending-prompt-lost-on-replay.
    */
-  getDroppedFrameStats(): { total: number; bySession: Record<string, number> };
+  getDroppedFrameStats(): DroppedFrameStats;
+  /**
+   * Per-socket pending-state diagnostics (D2): entry count and retained
+   * bytes for `ws`, or `undefined` when no pending map is allocated. Zero
+   * cost in steady state. See change: fix-connect-snapshot-frame-loss.
+   */
+  getPendingStateInfo(ws: WebSocket): { entries: number; bytes: number } | undefined;
+  /**
+   * Per-socket status-reconcile diagnostics: the session ids currently owed to
+   * `ws` after a shed `session_updated`, and whether the reconcile timer is
+   * live. `undefined` when nothing is owed (zero cost in steady state).
+   * See change: fix-backpressure-status-and-subagent-frames.
+   */
+  getStatusReconcileInfo(ws: WebSocket): { owed: string[]; timerActive: boolean } | undefined;
+  /**
+   * Browser-socket buffered-amount occupancy for the health surface.
+   * See change: fix-backpressure-status-and-subagent-frames.
+   */
+  getSocketBufferOccupancy(): SocketBufferOccupancy;
+  /**
+   * TEST-ONLY back-pressure injector. Real saturation is caused by a browser
+   * failing to drain its own socket, which a browser automation driver cannot
+   * induce deterministically — so the L3 convergence specs have no way to
+   * observe a shed without one. Forces every transcript-class frame to shed as
+   * if the socket were over `MAX_WS_BUFFER`, leaving `bufferedAmount` itself
+   * untouched.
+   *
+   * INERT unless `PI_E2E_FORCE_SHED=1` was set in the server's environment at
+   * gateway construction. Returns the effective state, so a caller that is not
+   * running under the flag learns the request was refused instead of silently
+   * believing it took.
+   * See change: fix-backpressure-status-and-subagent-frames.
+   */
+  setTestForceShed(enabled: boolean): boolean;
+  /**
+   * Requester-scoped delivery of a prompt-resync reply (fix B, server half).
+   * `msg` is an ordinary bridge `prompt_request` that may carry the echoed
+   * `__resyncRequestId` token of a `prompt_resync_request` this gateway
+   * recorded. Resolution is NON-CONSUMING (peek, D5): every re-emitted prompt
+   * of one reply routes to the same requester, as a critical frame under the
+   * same bounded exemption as the replay path. Returns true when delivered;
+   * false (no/expired token, requester gone or no longer a subscriber) means
+   * the caller keeps the ordinary fan-out. Mid-replay requesters are NOT
+   * suppressed — mid-replay arrival is the expected timing for refresh.
+   * See change: fix-pending-prompt-lost-on-replay (D4/D5).
+   */
+  deliverPromptResyncReply(msg: ServerToBrowserMessage, sessionId: string): boolean;
   /** Track a pending interactive UI request for replay on reconnect */
   trackUiRequest(sessionId: string, requestId: string, method: string, params: Record<string, unknown>): boolean | void;
   /** Clear a pending interactive UI request (resolved or cancelled) */
@@ -276,6 +436,16 @@ export function createBrowserGateway(
   /** Shape of the replay window when one applies. Absent → `head-tail`.
    *  See change: add-tail-only-replay-window (D1). */
   replayWindowMode?: import("@blackbelt-technology/pi-dashboard-shared/memory-limits.js").ReplayWindowMode,
+  /** Archive index + transition owner (snapshot counts, archive verbs).
+   *  See change: archive-sessions-lazy-load. */
+  sessionArchive?: import("../session/session-archive.js").SessionArchive,
+  /** One-shot intents for idle-alive archive requests.
+   *  See change: archive-sessions-lazy-load. */
+  pendingArchiveIntents?: import("../pending/pending-archive-intent-registry.js").PendingArchiveIntentRegistry,
+  /** Retention store for REMOTE-origin session hydration: a remote session's
+   *  transcript is not on this filesystem, so this is where its history comes
+   *  from. See change: serve-retained-remote-transcripts. */
+  remoteTranscriptStore?: import("../session/remote-transcript-store.js").RemoteTranscriptStore,
 ): BrowserGateway {
   const wss = new WebSocketServer({ noServer: true });
 
@@ -318,6 +488,20 @@ export function createBrowserGateway(
   // Track pending interactive UI requests per session for replay on reconnect
   const pendingUiRequests = new Map<string, Map<string, { requestId: string; method: string; params: Record<string, unknown> }>>();
 
+  /**
+   * Clear a pending interactive-UI request. Extracted so the browser WS case
+   * and the exposed `clearUiRequest` (used by `POST
+   * /api/session/:id/extension-ui-response`) mutate the map identically
+   * (change: expand-mcp-tiered-surface, D3).
+   */
+  function clearUiRequestImpl(sessionId: string, requestId: string): void {
+    const sessionMap = pendingUiRequests.get(sessionId);
+    if (sessionMap) {
+      sessionMap.delete(requestId);
+      if (sessionMap.size === 0) pendingUiRequests.delete(sessionId);
+    }
+  }
+
   // Track pending PromptBus requests per session for replay on browser refresh
   const pendingPromptRequests = new Map<string, Map<string, Record<string, unknown>>>();
 
@@ -349,11 +533,17 @@ export function createBrowserGateway(
         });
       }
     }
-    // Also replay pending PromptBus requests
+    // Also replay pending PromptBus requests. These frames are BLOCKING (the
+    // agent is awaiting an answer), so this leg — and only this leg — is sent
+    // under the critical-frame exemption: bounded by a per-delivery cap and
+    // the absolute ceiling. The dead extension_ui_request leg above and
+    // replayNotifyLog stay fully guarded (D3).
+    // See change: fix-pending-prompt-lost-on-replay (D1/D2/D3).
     const sessionPrompts = pendingPromptRequests.get(sessionId);
     if (sessionPrompts) {
+      const criticalBudget = { remaining: CRITICAL_FRAMES_PER_DELIVERY };
       for (const msg of sessionPrompts.values()) {
-        sendTo(ws, msg as any);
+        sendTo(ws, msg as any, { sessionId, critical: true, criticalBudget });
       }
     }
   }
@@ -460,38 +650,382 @@ export function createBrowserGateway(
   /** Max buffered bytes per browser WebSocket before dropping messages (0 = no limit) */
   const MAX_WS_BUFFER = maxWsBufferBytes ?? 4 * 1024 * 1024; // 4MB default
 
+  // ── Critical-frame exemption bounds (change: fix-pending-prompt-lost-on-replay, D2) ──
+  // A blocking frame (a pending-prompt replay / resync reply) bypasses the
+  // MAX_WS_BUFFER shed ONLY while the socket stays under an ABSOLUTE ceiling
+  // of MAX_WS_BUFFER + 1 MB — so repeated resyncs on a stalled socket can pin
+  // at most 1 extra MB, never unbounded memory. Both bounds are fixed, not
+  // configurable; the ceiling derives from the same maxWsBufferBytes arg as
+  // the threshold itself.
+  const CRITICAL_FRAME_CEILING = MAX_WS_BUFFER + CRITICAL_FRAME_SLACK_BYTES;
+
   // ── Drop-site instrumentation (change: fix-stuck-tool-card-on-dropped-event) ──
   // The server→browser hop silently drops a frame when the send buffer crosses
   // MAX_WS_BUFFER (browser not draining under back-pressure / a stall). Count
   // every drop and emit a rate-limited warning so the next stuck-card incident
   // is attributable. Logging is rate-limited because drops cluster during a
-  // stall (a log-storm would itself add load).
+  // stall (a log-storm would itself add load). Counters are SPLIT by frame
+  // class (fix-pending-prompt-lost-on-replay, D1): `transcript` = ordinary
+  // frames shed under back-pressure; `blocking` = exempt-eligible frames that
+  // exceeded a bound (cap or ceiling) — a future regression is attributable to
+  // the exemption, not to transcript shedding.
   let droppedFramesTotal = 0;
   const droppedFramesBySession = new Map<string, number>();
+  let droppedBlockingTotal = 0;
+  const droppedBlockingBySession = new Map<string, number>();
   const DROP_WARN_WINDOW_MS = 5_000;
   let lastDropWarnAt = 0;
 
-  function recordDroppedFrame(sessionId: string | undefined, seq: number | undefined, bufferedAmount: number) {
-    droppedFramesTotal++;
-    if (sessionId) droppedFramesBySession.set(sessionId, (droppedFramesBySession.get(sessionId) ?? 0) + 1);
+  function recordDroppedFrame(
+    sessionId: string | undefined,
+    seq: number | undefined,
+    bufferedAmount: number,
+    frameClass: "transcript" | "blocking",
+  ) {
+    if (frameClass === "blocking") {
+      droppedBlockingTotal++;
+      if (sessionId) droppedBlockingBySession.set(sessionId, (droppedBlockingBySession.get(sessionId) ?? 0) + 1);
+    } else {
+      droppedFramesTotal++;
+      if (sessionId) droppedFramesBySession.set(sessionId, (droppedFramesBySession.get(sessionId) ?? 0) + 1);
+    }
     const now = Date.now();
     if (now - lastDropWarnAt >= DROP_WARN_WINDOW_MS) {
       lastDropWarnAt = now;
       console.warn(
-        `[browser-gw] dropped frame (back-pressure) hop=server→browser sessionId=${sessionId ?? "n/a"} seq=${seq ?? "n/a"} bufferedAmount=${bufferedAmount} > MAX_WS_BUFFER=${MAX_WS_BUFFER} (total dropped=${droppedFramesTotal})`,
+        `[browser-gw] dropped frame (back-pressure) class=${frameClass} hop=server→browser sessionId=${sessionId ?? "n/a"} seq=${seq ?? "n/a"} bufferedAmount=${bufferedAmount} > MAX_WS_BUFFER=${MAX_WS_BUFFER} (total dropped=${droppedFramesTotal}, blocking=${droppedBlockingTotal})`,
       );
     }
   }
 
-  function sendTo(ws: WebSocket, msg: ServerToBrowserMessage, ctx?: { sessionId?: string; seq?: number }) {
-    if (ws.readyState === WebSocket.OPEN) {
-      // Drop messages if the send buffer is full (browser not consuming)
-      if (MAX_WS_BUFFER > 0 && ws.bufferedAmount > MAX_WS_BUFFER) {
-        recordDroppedFrame(ctx?.sessionId, ctx?.seq, ws.bufferedAmount);
+  // ── Per-socket pending-state map (D2) — change: fix-connect-snapshot-frame-loss ──
+  // A `state` frame is NEVER shed: over threshold it defers into this map
+  // (latest-wins per delivery key, byte-accounted, FIFO by first insertion)
+  // and is flushed by send-completion, by a 250 ms interval while non-empty,
+  // and ahead of any transcript send. The byte ceiling bounds memory on a
+  // stalled socket by terminating it (the browser reconnects; the bootstrap
+  // after reconnect is small). `blocking` (critical) frames are NOT deferred
+  // — they keep their own bounded exemption above.
+  interface PendingState {
+    map: Map<string, string /* serialized */>;
+    bytes: number;
+    timer?: NodeJS.Timeout;
+  }
+  const pendingState = new Map<WebSocket, PendingState>();
+  let coalescedState = 0;
+  let stalledSocketsTerminated = 0;
+  const STATE_FLUSH_INTERVAL_MS = 250;
+  let lastStateFlushWarnAt = 0;
+
+  /** Clear the flush timer and drop the socket's pending map (close/error/terminate). */
+  function dropPendingState(ws: WebSocket): void {
+    const pending = pendingState.get(ws);
+    if (!pending) return;
+    if (pending.timer !== undefined) clearInterval(pending.timer);
+    pendingState.delete(ws);
+  }
+
+  /** Send-callback: re-flush on success; log rate-limited on error (X3). */
+  function onStateSent(ws: WebSocket): (err?: Error | null) => void {
+    return (err) => {
+      if (err) {
+        const now = Date.now();
+        if (now - lastStateFlushWarnAt >= DROP_WARN_WINDOW_MS) {
+          lastStateFlushWarnAt = now;
+          console.warn(`[browser-gw] state flush send failed (will not retry this frame) hop=server→browser:`, err);
+        }
         return;
       }
-      ws.send(JSON.stringify(msg));
+      flushPendingState(ws);
+    };
+  }
+
+  /** Drain the map in insertion order while the socket is under threshold. */
+  function flushPendingState(ws: WebSocket): void {
+    const pending = pendingState.get(ws);
+    if (!pending || pending.map.size === 0) return;
+    if (ws.readyState !== WebSocket.OPEN) return;
+    while (pending.map.size > 0 && ws.bufferedAmount <= MAX_WS_BUFFER) {
+      const next = pending.map.entries().next();
+      if (next.done) break;
+      const [key, serialized] = next.value;
+      pending.map.delete(key);
+      pending.bytes -= Buffer.byteLength(serialized);
+      ws.send(serialized, onStateSent(ws));
     }
+    if (pending.map.size === 0) dropPendingState(ws);
+  }
+
+  /**
+   * Deliver one `state` frame (D2): immediate send while the socket is under
+   * threshold and nothing is pending; otherwise defer latest-wins per key.
+   * Over the byte ceiling the socket is terminated as stalled (counted) and
+   * the map is dropped. `MAX_WS_BUFFER === 0` (no-limit mode) always sends.
+   */
+  function sendState(ws: WebSocket, key: string, serialized: string): void {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (MAX_WS_BUFFER === 0) {
+      ws.send(serialized);
+      return;
+    }
+    let pending = pendingState.get(ws);
+    if (ws.bufferedAmount <= MAX_WS_BUFFER && (pending === undefined || pending.map.size === 0)) {
+      ws.send(serialized, onStateSent(ws));
+      return;
+    }
+    if (pending === undefined) {
+      pending = { map: new Map(), bytes: 0 };
+      pendingState.set(ws, pending);
+    }
+    const old = pending.map.get(key);
+    if (old !== undefined) {
+      pending.bytes -= Buffer.byteLength(old);
+      coalescedState++;
+    }
+    const len = Buffer.byteLength(serialized);
+    if (pending.bytes + len > MAX_WS_BUFFER) {
+      ws.terminate();
+      stalledSocketsTerminated++;
+      dropPendingState(ws);
+      // A terminated socket can never receive its reconcile either.
+      dropStatusDebt(ws);
+      closeOccupancySpan(ws);
+      return;
+    }
+    pending.map.set(key, serialized);
+    pending.bytes += len;
+    if (pending.timer === undefined) {
+      pending.timer = setInterval(() => flushPendingState(ws), STATE_FLUSH_INTERVAL_MS);
+    }
+  }
+
+  // ── Status-reconcile debt register (change: fix-backpressure-status-and-subagent-frames) ──
+  // `session_updated` is transcript-class and has NO recovery path: no seq, no
+  // backfill, no guaranteed successor. A session that changes status once and
+  // then runs quiet for minutes (a long tool call) therefore shows the stale
+  // value until a reconnect. A shed `session_updated` is recorded here as a
+  // DEBT owed to that socket — ids only, never a queued payload, so it cannot
+  // contribute to the pending-state byte ceiling. On flush the frame is REBUILT
+  // from `sessionManager.get(id)`, so nothing stale is ever queued and two
+  // partial `updates` never have to be merged (D1).
+  interface StatusDebt {
+    ids: Set<string>;
+    timer?: NodeJS.Timeout;
+  }
+  const statusDebt = new Map<WebSocket, StatusDebt>();
+  let statusReconcileQueued = 0;
+  let statusReconcileSent = 0;
+  // Own interval, deliberately NOT the pending-state one: that timer exists only
+  // when a STATE frame defers, and a socket saturated purely by transcript
+  // traffic — the incident's exact shape — never creates it (D3).
+  const STATUS_RECONCILE_INTERVAL_MS = 250;
+
+  /** Clear the reconcile timer and drop the socket's debt (close/error/terminate). */
+  function dropStatusDebt(ws: WebSocket): void {
+    const debt = statusDebt.get(ws);
+    if (!debt) return;
+    if (debt.timer !== undefined) clearInterval(debt.timer);
+    statusDebt.delete(ws);
+  }
+
+  /** Record a shed `session_updated` as owed to `ws`; start the timer if idle. */
+  function recordStatusDebt(ws: WebSocket, sessionId: string): void {
+    let debt = statusDebt.get(ws);
+    if (debt === undefined) {
+      debt = { ids: new Set() };
+      statusDebt.set(ws, debt);
+    }
+    debt.ids.add(sessionId);
+    statusReconcileQueued++;
+    if (debt.timer === undefined) {
+      debt.timer = setInterval(() => flushStatusDebt(ws), STATUS_RECONCILE_INTERVAL_MS);
+    }
+  }
+
+  /**
+   * Re-send each owed session's CURRENT status while the socket is under
+   * threshold. The send carries `ctx.sessionId`, so a reconcile that is itself
+   * shed re-enters the debt at the drop site — delivery is eventually-consistent
+   * rather than attempted once (D4). Only the settled value is delivered; an
+   * intermediate transition inside one flood window is not recovered (D5).
+   */
+  function flushStatusDebt(ws: WebSocket): void {
+    const debt = statusDebt.get(ws);
+    if (!debt) return;
+    if (ws.readyState !== WebSocket.OPEN) {
+      dropStatusDebt(ws);
+      closeOccupancySpan(ws);
+      return;
+    }
+    for (const id of [...debt.ids]) {
+      if (shouldShed(ws.bufferedAmount)) break; // still saturated — the rest stay owed
+      debt.ids.delete(id);
+      const session = sessionManager.get(id);
+      // Session gone before its reconcile: discard the debt, send nothing.
+      if (!session) continue;
+      const delivered = sendTo(
+        ws,
+        {
+          type: "session_updated",
+          sessionId: id,
+          // `?? null` is load-bearing. `currentTool` is optional, and the client
+          // merges with `{ ...existing, ...updates }` — an `undefined` here is
+          // dropped by `JSON.stringify`, so the merge would PRESERVE the stale
+          // tool name. `null` is the established clearing value, so a session
+          // that finished its tool reconciles to "no tool", not to the old one.
+          // `hostPressure` joins the rebuild for the same reason and with the
+          // same `?? null` clearing semantics: it is pushed on a TRANSITION
+          // only, so a shed recovery frame has no successor — the badge would
+          // stay lit until a reconnect.
+          // See change: fix-false-unresponsive-badge.
+          updates: {
+            status: session.status,
+            currentTool: session.currentTool ?? null,
+            hostPressure: session.hostPressure ?? null,
+          },
+        },
+        { sessionId: id },
+      );
+      // Only a frame that reached the wire counts. `sendTo` re-checks the
+      // threshold and can shed this very frame (the X1 race), in which case the
+      // id was just re-recorded as owed — counting it as sent would report a
+      // delivery that never happened and corrupt the queued/sent attribution.
+      if (delivered) statusReconcileSent++;
+    }
+    if (debt.ids.size === 0) dropStatusDebt(ws);
+  }
+
+  // ── Socket buffer occupancy (lever B) ──
+  // Sampled at the send-decision sites, which ALREADY read `bufferedAmount` for
+  // the shed predicate — so the sample is free of an extra property read, and
+  // no timer is introduced. A periodic sampler was tried first and rejected: it
+  // breaks the gateway's "zero timers on an unsaturated socket" invariant
+  // (browser-gateway-critical-frames P3/E9).
+  //
+  // Time-above-threshold is measured per socket by an entry/exit span rather
+  // than by counting samples, so it stays correct under a bursty send rate.
+  // The exit branch is the HOT one, so it is gated on `size > 0` — a field read
+  // that is zero in steady state — instead of an unconditional Map lookup.
+  const OCCUPANCY_SAMPLE_CAP = 512;
+  const occupancySamples: number[] = [];
+  let occupancyWriteIdx = 0;
+  let occupancyMax = 0;
+  let occupancyMsAboveThreshold = 0;
+  const occupancyAboveSince = new Map<WebSocket, number>();
+
+  function noteOccupancy(ws: WebSocket, buffered: number, above: boolean): void {
+    if (buffered > occupancyMax) occupancyMax = buffered;
+    if (occupancySamples.length < OCCUPANCY_SAMPLE_CAP) occupancySamples.push(buffered);
+    else {
+      occupancySamples[occupancyWriteIdx] = buffered;
+      occupancyWriteIdx = (occupancyWriteIdx + 1) % OCCUPANCY_SAMPLE_CAP;
+    }
+    if (above) {
+      if (!occupancyAboveSince.has(ws)) occupancyAboveSince.set(ws, Date.now());
+    } else if (occupancyAboveSince.size > 0) {
+      const since = occupancyAboveSince.get(ws);
+      if (since !== undefined) {
+        occupancyMsAboveThreshold += Date.now() - since;
+        occupancyAboveSince.delete(ws);
+      }
+    }
+  }
+
+  // ── Test-only shed injector ──
+  // Read ONCE at construction, so the production hot path below is a single
+  // already-false boolean read that short-circuits before anything else.
+  const FORCE_SHED_AVAILABLE = process.env.PI_E2E_FORCE_SHED === "1";
+  let forceShedTranscript = false;
+
+  /**
+   * The transcript shed predicate, in ONE place: over the byte threshold, or
+   * under the test-only injector. Three sites ask (`sendTo`, `fanout`, the
+   * reconcile flush) and they must never drift apart — a flush that thought the
+   * socket was drained while `sendTo` disagreed would spin.
+   * `FORCE_SHED_AVAILABLE` is a construction-time constant, so on a production
+   * instance this short-circuits to the bare threshold compare.
+   */
+  function shouldShed(bufferedAmount: number): boolean {
+    if (FORCE_SHED_AVAILABLE && forceShedTranscript) return true;
+    return MAX_WS_BUFFER > 0 && bufferedAmount > MAX_WS_BUFFER;
+  }
+
+  /** Close an open above-threshold span when the socket goes away. */
+  function closeOccupancySpan(ws: WebSocket): void {
+    const since = occupancyAboveSince.get(ws);
+    if (since === undefined) return;
+    occupancyMsAboveThreshold += Date.now() - since;
+    occupancyAboveSince.delete(ws);
+  }
+
+  /**
+   * Deliver one frame to one socket. Returns whether it reached the wire — a
+   * `false` means shed, deferred as state, or socket not open. Most callers
+   * ignore it; the status reconcile does not (it must not count a shed frame as
+   * sent). See change: fix-backpressure-status-and-subagent-frames.
+   */
+  function sendTo(
+    ws: WebSocket,
+    msg: ServerToBrowserMessage,
+    ctx?: { sessionId?: string; seq?: number; critical?: boolean; criticalBudget?: { remaining: number } },
+  ): boolean {
+    if (ws.readyState === WebSocket.OPEN) {
+      // Dispatch on the static frame class (D1/D2): a `state` frame routes
+      // through `sendState` (deferred, never shed) so no handler can
+      // accidentally send state onto the shedding path. A `critical` ctx
+      // stays on the blocking exemption below — that flag, not the type,
+      // defines the blocking class.
+      const { cls, key } = frameClassOf(msg);
+      if (cls === "state" && ctx?.critical !== true) {
+        sendState(ws, key, JSON.stringify(msg));
+        return false;
+      }
+      // Transcript/blocking: already-flushable pending state goes first, so
+      // a state frame never waits behind a later transcript frame (D2).
+      if (pendingState.get(ws)?.map.size) flushPendingState(ws);
+      const buffered = ws.bufferedAmount;
+      noteOccupancy(ws, buffered, MAX_WS_BUFFER > 0 && buffered > MAX_WS_BUFFER);
+      // Drop transcript messages if the send buffer is full (browser not consuming).
+      // A `critical` frame (pending-prompt replay / resync reply) is exempt
+      // from the shed while under the absolute ceiling and within its
+      // per-delivery budget — the one carve-out that keeps a blocking prompt
+      // deliverable on a socket a full replay just saturated.
+      // See change: fix-pending-prompt-lost-on-replay (D1/D2).
+      if (shouldShed(buffered)) {
+        const exempt =
+          ctx?.critical === true &&
+          ws.bufferedAmount <= CRITICAL_FRAME_CEILING &&
+          (ctx.criticalBudget === undefined || ctx.criticalBudget.remaining > 0);
+        if (!exempt) {
+          recordDroppedFrame(ctx?.sessionId, ctx?.seq, ws.bufferedAmount, ctx?.critical === true ? "blocking" : "transcript");
+          // A shed status frame is a debt, not a loss — including a shed
+          // RECONCILE, which re-enters here and is re-recorded (D4).
+          if (msg.type === "session_updated") recordStatusDebt(ws, msg.sessionId);
+          return false;
+        }
+        if (ctx.criticalBudget !== undefined) ctx.criticalBudget.remaining--;
+      }
+      ws.send(JSON.stringify(msg));
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * D4 — project a live `sessions_reordered` through a fresh snapshot window
+   * BEFORE serialization (fanout only sees strings). Filtering by the GLOBAL
+   * visible set is exactly per-group: a group's first-3 contains only that
+   * group's ids, so a group's own ids are in the global set iff they are in
+   * the group's window. Terminal ids and out-of-window ended ids drop here,
+   * at the single choke point every reorder site routes through.
+   * Guarded for lean fakes lacking the window fn (folderHeadSnapshot precedent).
+   * See change: fix-connect-snapshot-frame-loss (D4).
+   */
+  function projectOrderThroughWindow(ids: readonly string[]): string[] {
+    if (typeof sessionManager.snapshotVisibleIds !== "function") return [...ids];
+    const pinned = preferencesStore?.getPinnedDirectories?.() ?? [];
+    const visible = sessionManager.snapshotVisibleIds(pinned);
+    return ids.filter((id) => visible.has(id));
   }
 
   function broadcast(msg: ServerToBrowserMessage) {
@@ -500,15 +1034,33 @@ export function createBrowserGateway(
     // `openspec_update` on repos with many changes. Back-pressure and
     // liveness guards are preserved (mirrors `sendTo`).
     // See change: scope-openspec-poll-to-active-cwds.
+    if (msg.type === "sessions_reordered") {
+      msg = { ...msg, sessionIds: projectOrderThroughWindow(msg.sessionIds) };
+    }
+    const { cls, key } = frameClassOf(msg);
     const serialized = JSON.stringify(msg);
-    fanout(serialized);
+    // `fanout` sees only the serialized string and cannot recover the frame's
+    // type or session id without parsing it. `broadcast` still holds the TYPED
+    // message, so the shed site's debt id is derived here and passed down (D2).
+    const dirtyId = msg.type === "session_updated" ? msg.sessionId : undefined;
+    fanout(serialized, cls === "state" ? key : undefined, dirtyId);
   }
 
-  function fanout(serialized: string) {
+  function fanout(serialized: string, stateKey?: string, dirtyId?: string) {
     for (const [ws] of subscriptions) {
       if (ws.readyState !== WebSocket.OPEN) continue;
-      if (MAX_WS_BUFFER > 0 && ws.bufferedAmount > MAX_WS_BUFFER) {
-        recordDroppedFrame(undefined, undefined, ws.bufferedAmount);
+      if (stateKey !== undefined) {
+        // State class: deferred when over threshold, never shed (D2).
+        sendState(ws, stateKey, serialized);
+        continue;
+      }
+      // Transcript class: already-flushable pending state goes first (D2).
+      if (pendingState.get(ws)?.map.size) flushPendingState(ws);
+      const buffered = ws.bufferedAmount;
+      noteOccupancy(ws, buffered, MAX_WS_BUFFER > 0 && buffered > MAX_WS_BUFFER);
+      if (shouldShed(buffered)) {
+        recordDroppedFrame(undefined, undefined, buffered, "transcript");
+        if (dirtyId !== undefined) recordStatusDebt(ws, dirtyId);
         continue;
       }
       ws.send(serialized);
@@ -524,7 +1076,8 @@ export function createBrowserGateway(
   function broadcastOpenSpecUpdateImpl(cwd: string, dataSerialized: string) {
     const header = `{"type":"openspec_update","cwd":${JSON.stringify(cwd)},"data":`;
     const serialized = header + dataSerialized + "}";
-    fanout(serialized);
+    // Pre-serialized state frame: hand fanout the D1 delivery key directly.
+    fanout(serialized, `openspec_update:${cwd}`, undefined);
   }
 
   wss.on("connection", (ws, req) => {
@@ -534,23 +1087,6 @@ export function createBrowserGateway(
     console.error(`[browser-gw] browser client connected from ${remoteAddr} origin=${origin} ua=${ua.slice(0, 80)} (total: ${subscriptions.size + 1})`);
     const subs = new Set<string>();
     subscriptions.set(ws, subs);
-
-    // Atomic snapshot of the full session registry + per-cwd orders.
-    // Replaces the legacy per-session `session_added` loop and per-cwd
-    // `sessions_reordered` loop. Client REPLACES (not merges) its
-    // `sessions` Map and `sessionOrderMap` on receipt so stale ids from a
-    // previous server lifetime are dropped atomically.
-    // See change: fix-stale-sessions-on-reconnect.
-    {
-      const sessionsSnapshot = sessionManager.listAll();
-      const orders: Record<string, string[]> = {};
-      if (sessionOrderManager) {
-        for (const [cwd, sessionIds] of Object.entries(sessionOrderManager.getAllOrders())) {
-          if (sessionIds.length > 0) orders[cwd] = sessionIds;
-        }
-      }
-      sendTo(ws, { type: "sessions_snapshot", sessions: sessionsSnapshot, orders });
-    }
 
     // Send pinned directories on connect
     if (preferencesStore) {
@@ -623,6 +1159,30 @@ export function createBrowserGateway(
       gateway.onConnect(ws);
     }
 
+    // Atomic windowed snapshot of the session registry + per-group orders,
+    // sent LAST in the bootstrap (D3): every small idempotent state frame
+    // above is already on the wire, so the one large frame never queues ahead
+    // of them on a slow socket. Still the first session-registry send. Client
+    // REPLACES (not merges) its `sessions` Map and `sessionOrderMap` on
+    // receipt. `endedTotals` counts ended per group regardless of window.
+    // See changes: fix-stale-sessions-on-reconnect,
+    //              fix-connect-snapshot-frame-loss (D3/D4).
+    {
+      const pinnedDirs = preferencesStore?.getPinnedDirectories?.() ?? [];
+      // `typeof` guard: hand-rolled fakes may predate the window API
+      // (folderHeadSnapshot precedent); they fall back to the full list.
+      const snapshot = typeof sessionManager.buildSnapshot === "function"
+        ? sessionManager.buildSnapshot(pinnedDirs)
+        : { sessions: sessionManager.listAll(), orders: {} as Record<string, string[]>, endedTotals: {} as Record<string, number> };
+      sendTo(ws, {
+        type: "sessions_snapshot",
+        ...snapshot,
+        // Archived counts come from the index, not the (non-resident) sessions.
+        // See change: archive-sessions-lazy-load.
+        archivedCountByCwd: sessionArchive?.countsByKey() ?? {},
+      });
+    }
+
 
     ws.on("message", async (raw) => {
       // Malformed (non-JSON) frames are silently dropped. Only frame-parse
@@ -649,6 +1209,9 @@ export function createBrowserGateway(
           pendingResumeIntents,
           pendingClientCorrelations,
           pendingWorktreeBaseRegistry,
+          sessionArchive,
+          pendingArchiveIntents,
+          remoteTranscriptStore,
           isRecoveryLivenessPending: gateway.isRecoveryLivenessPending,
           recordResyncRequester: (requestId, requesterWs) =>
             resyncRequesters.record(requestId, requesterWs),
@@ -762,6 +1325,9 @@ export function createBrowserGateway(
           case "subagent_resync_request":
             handleSubagentResyncRequest(msg, ctx);
             break;
+          case "prompt_resync_request":
+            handlePromptResyncRequest(msg, ctx);
+            break;
           case "shutdown":
             // Awaited like every other async case in this switch, so a rejection
             // reaches the dispatch-level catch below instead of floating.
@@ -771,11 +1337,12 @@ export function createBrowserGateway(
           case "rename_session":
             handleRenameSession(msg, ctx);
             break;
-          case "hide_session":
-            handleHideSession(msg, ctx);
+          case "archive_session":
+            // Async: an idle-alive archive terminates the process first.
+            await handleArchiveSession(msg, ctx);
             break;
-          case "unhide_session":
-            handleUnhideSession(msg, ctx);
+          case "unarchive_session":
+            handleUnarchiveSession(msg, ctx);
             break;
           case "attach_proposal":
             handleAttachProposal(msg, ctx);
@@ -806,6 +1373,12 @@ export function createBrowserGateway(
             break;
           case "list_sessions":
             handleListSessions(msg, ctx);
+            break;
+          // Explicit case (D5): the default arm would misroute `sessions_page`
+          // to the bridge forwarder. Unicast reply via `sendTo` → `sendState`.
+          // See change: fix-connect-snapshot-frame-loss.
+          case "sessions_page":
+            handleSessionsPage(msg, ctx);
             break;
           case "resume_session":
             // Reopen resolves a pending recovery offer (null it so onConnect
@@ -868,6 +1441,12 @@ export function createBrowserGateway(
           case "move_folder_to_workspace":
             handleMoveFolderToWorkspace(msg, ctx);
             break;
+          // Explicit case (D6): the default arm would misroute `openspec_get`
+          // to the bridge forwarder. Unicast replies via `sendTo` → `sendState`.
+          // See change: fix-connect-snapshot-frame-loss.
+          case "openspec_get":
+            handleOpenSpecGet(msg, ctx);
+            break;
           case "openspec_refresh":
             handleOpenSpecRefresh(msg, ctx);
             break;
@@ -893,12 +1472,9 @@ export function createBrowserGateway(
             break;
           }
           case "extension_ui_response": {
-            // Clear pending UI request tracking
-            const sessionMap = pendingUiRequests.get(msg.sessionId);
-            if (sessionMap) {
-              sessionMap.delete(msg.requestId);
-              if (sessionMap.size === 0) pendingUiRequests.delete(msg.sessionId);
-            }
+            // Clear pending UI request tracking, then forward on the shared
+            // path the REST twin uses too (D3).
+            clearUiRequestImpl(msg.sessionId, msg.requestId);
             handleExtensionUiResponse(msg, ctx);
             break;
           }
@@ -1069,6 +1645,11 @@ export function createBrowserGateway(
       console.error(`[browser-gw] browser client disconnected (remaining: ${subscriptions.size - 1})`);
       subscriptions.delete(ws);
       replayingSessions.delete(ws);
+      // A closed socket can never flush; discard its pending state (D2).
+      dropPendingState(ws);
+      // …nor its owed status reconciles; release the set AND its timer.
+      dropStatusDebt(ws);
+      closeOccupancySpan(ws);
       // A disconnected requester can never receive its reply; drop its tokens
       // so the map cannot accumulate them. See change: reduce-subagent-details-payload.
       resyncRequesters.forget(ws);
@@ -1084,6 +1665,14 @@ export function createBrowserGateway(
           console.error("[browser-gw] disconnect handler error:", err);
         }
       }
+    });
+
+    // An errored socket will close, but clear the pending state immediately —
+    // its timer must not outlive the socket (D2).
+    ws.on("error", () => {
+      dropPendingState(ws);
+      dropStatusDebt(ws);
+      closeOccupancySpan(ws);
     });
   });
 
@@ -1215,23 +1804,88 @@ export function createBrowserGateway(
       return sessionMap !== undefined && sessionMap.size > 0;
     },
 
-    getDroppedFrameStats() {
+    getDroppedFrameStats(): DroppedFrameStats {
       return {
         total: droppedFramesTotal,
         bySession: Object.fromEntries(droppedFramesBySession),
+        blocking: {
+          total: droppedBlockingTotal,
+          bySession: Object.fromEntries(droppedBlockingBySession),
+        },
+        coalescedState,
+        stalledSocketsTerminated,
+        statusReconcileQueued,
+        statusReconcileSent,
       };
+    },
+
+    getPendingStateInfo(ws: WebSocket): { entries: number; bytes: number } | undefined {
+      const pending = pendingState.get(ws);
+      if (!pending) return undefined;
+      return { entries: pending.map.size, bytes: pending.bytes };
+    },
+
+    getStatusReconcileInfo(ws: WebSocket): { owed: string[]; timerActive: boolean } | undefined {
+      const debt = statusDebt.get(ws);
+      if (!debt) return undefined;
+      return { owed: [...debt.ids], timerActive: debt.timer !== undefined };
+    },
+
+    setTestForceShed(enabled: boolean): boolean {
+      if (!FORCE_SHED_AVAILABLE) return false;
+      forceShedTranscript = enabled;
+      // Releasing the injected saturation must not wait for the next 250 ms
+      // tick to START — the timer is already running; this just makes the
+      // observed convergence window the spec's 1 s rather than 1 s + jitter.
+      if (!enabled) for (const [ws] of subscriptions) flushStatusDebt(ws);
+      return enabled;
+    },
+
+    getSocketBufferOccupancy(): SocketBufferOccupancy {
+      // Accrual otherwise happens only on the above→below transition, so during
+      // an active stall — the exact case this metric exists to size — every
+      // sample is above and the reported duration would stay 0 for the whole
+      // incident. So open spans are added here too.
+      //
+      // First SETTLE spans whose socket has since drained (or closed) without
+      // another sampled send. Sampling is event-driven, so such a span would
+      // otherwise stay open forever and grow on EVERY health read — an
+      // unbounded over-report. Settling is idempotent: the entry is deleted, so
+      // a later exit cannot accrue it twice.
+      const now = Date.now();
+      for (const [ws, since] of [...occupancyAboveSince]) {
+        const stillAbove =
+          ws.readyState === WebSocket.OPEN && MAX_WS_BUFFER > 0 && ws.bufferedAmount > MAX_WS_BUFFER;
+        if (stillAbove) continue;
+        occupancyMsAboveThreshold += now - since;
+        occupancyAboveSince.delete(ws);
+      }
+      let msAboveThreshold = occupancyMsAboveThreshold;
+      for (const since of occupancyAboveSince.values()) msAboveThreshold += now - since;
+      if (occupancySamples.length === 0) return { max: occupancyMax, p95: 0, msAboveThreshold };
+      const sorted = [...occupancySamples].sort((a, b) => a - b);
+      const idx = Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1);
+      return { max: occupancyMax, p95: sorted[Math.max(0, idx)], msAboveThreshold };
+    },
+
+    deliverPromptResyncReply(msg: ServerToBrowserMessage, sessionId: string): boolean {
+      const requestId = resyncRequestIdOf(msg as unknown as Record<string, unknown>);
+      if (!requestId) return false;
+      const requester = resyncRequesters.peek(requestId);
+      if (!requester || requester.readyState !== WebSocket.OPEN) return false;
+      if (!getSubscribers(sessionId).includes(requester)) return false;
+      sendTo(requester, msg, {
+        sessionId,
+        critical: true,
+        criticalBudget: { remaining: CRITICAL_FRAMES_PER_DELIVERY },
+      });
+      return true;
     },
 
     trackUiRequest,
 
     clearUiRequest(sessionId: string, requestId: string) {
-      const sessionMap = pendingUiRequests.get(sessionId);
-      if (sessionMap) {
-        sessionMap.delete(requestId);
-        if (sessionMap.size === 0) {
-          pendingUiRequests.delete(sessionId);
-        }
-      }
+      clearUiRequestImpl(sessionId, requestId);
     },
 
     appendNotify,

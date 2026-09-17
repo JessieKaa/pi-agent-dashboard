@@ -7,15 +7,10 @@ import type { BrowserNotifyMessage } from "@blackbelt-technology/pi-dashboard-sh
 import { loadConfig } from "@blackbelt-technology/pi-dashboard-shared/config.js";
 import { normalizeNotifyLevel } from "@blackbelt-technology/pi-dashboard-shared/notify.js";
 import { detectOpenSpecActivity, isValidOpenSpecChangeSlug } from "@blackbelt-technology/pi-dashboard-shared/openspec-activity-detector.js";
-import { mergeSessionMeta, writeSessionMeta } from "@blackbelt-technology/pi-dashboard-shared/session-meta.js";
-import { extractTurnStats } from "@blackbelt-technology/pi-dashboard-shared/stats-extractor.js";
 import type { ExtensionToServerMessage } from "@blackbelt-technology/pi-dashboard-shared/protocol.js";
+import { mergeSessionMeta, type SessionMeta, writeSessionMeta } from "@blackbelt-technology/pi-dashboard-shared/session-meta.js";
+import { extractTurnStats } from "@blackbelt-technology/pi-dashboard-shared/stats-extractor.js";
 import type { DashboardSession, NotifyLogEntry } from "@blackbelt-technology/pi-dashboard-shared/types.js";
-import {
-  customEventTypeOfEvent,
-  isGroupableCustomEvent,
-  stampEventGroup,
-} from "./session/custom-event-group-annotation.js";
 import { type PendingAttachment, prepareEventForIngest } from "./attachments/attachment-ingest.js";
 import { createAttachmentResolver } from "./attachments/attachment-resolver.js";
 import { AUTO_NAME_OUTCOMES, autoNameOutcomes } from "./auto-name-outcome-store.js";
@@ -35,9 +30,20 @@ import type { PreferencesStore } from "./persistence/preferences-store.js";
 import type { PiGateway } from "./pi/pi-gateway.js";
 import { sessionCommandRegistry } from "./pi/session-skill-registry.js";
 import { handleDispatchExtensionCommand } from "./rpc-keeper/dispatch-router.js";
+import {
+  customEventTypeOfEvent,
+  isGroupableCustomEvent,
+  stampEventGroup,
+} from "./session/custom-event-group-annotation.js";
 import type { UnreadTriggerSnapshot } from "./session/event-status-extraction.js";
-import { extractSessionUpdates, isActivityEvent, isUnreadTrigger } from "./session/event-status-extraction.js";
+import { extractSessionUpdates, isActivityEvent, isUnreadTrigger, reconcileAgentLiveness } from "./session/event-status-extraction.js";
 import type { SessionManager } from "./session/memory-session-manager.js";
+import {
+  findOpenSubagents,
+  findOpenToolCalls,
+  synthesizeSessionEndedEnd,
+  synthesizeSessionEndedSubagentFail,
+} from "./session/open-tool-calls.js";
 import {
   attachedStillExistsInCandidateRoots,
   localityGateAllows,
@@ -143,29 +149,24 @@ export interface EventWiringDeps {
    */
   pendingWorktreeBaseRegistry?: import("./pending/pending-worktree-base-registry.js").PendingWorktreeBaseRegistry;
   /**
-   * Optional pending-automation-run registry. When provided, the wiring
-   * consumes a pending run stamp on each `session_register` and stamps the
-   * in-memory `DashboardSession.kind="automation"` + `automationRun`, then
-   * persists both to the session's `.meta.json` sidecar.
-   * See change: add-automation-plugin.
+   * Optional unified token-keyed pending-plugin-ref registry. When provided, a
+   * `session_register` resolves (by spawn token) the opaque `pluginRef` a
+   * plugin (or a first-party feature spawning in core) filed before the spawn
+   * await, promotes it onto the linked `headlessPidRegistry` entry, merges its
+   * owned keys onto the session (+ `.meta.json`), applies the core-owned
+   * lifecycle (`recover` / `finalizeOnSocketClose`), then notifies the owning
+   * plugin. cwd never confers ownership. See change: detach-automation-goal-from-core.
    */
-  pendingAutomationRunRegistry?: import("./pending/pending-automation-run-registry.js").PendingAutomationRunRegistry;
+  pendingPluginRefRegistry?: import("./pending/pending-plugin-ref-registry.js").PendingPluginRefRegistry;
   /**
-   * Optional pending-goal-link registry + goal store. When both provided, the
-   * wiring consumes a pending goalId on each `session_register`, stamps
-   * `.meta.json#goalId` + in-memory `DashboardSession.goalId`, and links the
-   * new sessionId into its `GoalRecord`. See change: add-goals-folder-page.
+   * Owner-notify seam. When provided, a resolved session's owning plugin is
+   * handed its own `pluginRef` + sessionId — BEFORE first-event forwarding and
+   * pending-prompt dispatch. See change: detach-automation-goal-from-core.
    */
-  pendingGoalLinkRegistry?: import("./pending/pending-goal-link-registry.js").PendingGoalLinkRegistry;
-  goalStore?: import("./goal/goal-store.js").GoalStore;
-  /**
-   * Optional goal-session primer. When provided, a session linked to a goal on
-   * `session_register` is renamed to the objective and dispatched `/goal …` so
-   * the pi-goal-hermes loop actually starts. See change: prime-goal-linked-sessions.
-   */
-  primeGoalSession?: (
+  dispatchPluginSessionResolved?: (
+    ownerId: string,
     sessionId: string,
-    goal: { objective: string; criteria?: import("@blackbelt-technology/pi-dashboard-shared/types.js").GoalCriterion[] },
+    pluginRef: Record<string, unknown>,
   ) => void;
   /**
    * Optional viewed-session tracker. When provided, the wiring evaluates
@@ -235,6 +236,13 @@ export interface EventWiringDeps {
    * See change: add-custom-event-group-filters.
    */
   customEventGroupResolver?: import("./session/custom-event-group-resolver.js").CustomEventGroupResolver;
+  /**
+   * Archive index. Consumed in `onUnregister` to complete an idle-alive
+   * archive on the ended transition. See change: archive-sessions-lazy-load.
+   */
+  sessionArchive?: import("./session/session-archive.js").SessionArchive;
+  /** One-shot idle-alive archive intents. See change: archive-sessions-lazy-load. */
+  pendingArchiveIntents?: import("./pending/pending-archive-intent-registry.js").PendingArchiveIntentRegistry;
 }
 
 /**
@@ -261,10 +269,8 @@ export function wireEvents(deps: EventWiringDeps): void {
     pendingAttachRegistry,
     pendingInitialPromptRegistry,
     pendingWorktreeBaseRegistry,
-    pendingAutomationRunRegistry,
-    pendingGoalLinkRegistry,
-    goalStore,
-    primeGoalSession,
+    pendingPluginRefRegistry,
+    dispatchPluginSessionResolved,
     viewedSessionTracker,
     pendingClientCorrelations,
     pendingPromptAcks,
@@ -273,6 +279,8 @@ export function wireEvents(deps: EventWiringDeps): void {
     metaPersistence,
     liveEpoch,
     commitDraftRelay,
+    sessionArchive,
+    pendingArchiveIntents,
     customEventGroupResolver,
   } = deps;
 
@@ -351,6 +359,10 @@ export function wireEvents(deps: EventWiringDeps): void {
   // persist it to the session's .meta.json. See change:
   // add-worktree-spawn-dialog.
   piGateway.onSessionRegistered = (sessionId, cwd) => {
+    // Registration wins over the archive: a bridge reattaching an archived id
+    // drops its index row + broadcasts the decremented count before the live
+    // registration is reflected. See change: archive-sessions-lazy-load.
+    sessionArchive?.onBridgeRegister(sessionId);
     // ── attachProposal arm ───────────────────────────────────────────────
     let attachConsumed = false;
     if (pendingAttachRegistry) {
@@ -424,57 +436,13 @@ export function wireEvents(deps: EventWiringDeps): void {
       }
     }
 
-    // ── initial-prompt arm ────────────────────────────────────────────
-    // Consume any pending initial-prompt intent queued by the no-hook
-    // Initialize button's spawn and dispatch it as the session's first
-    // prompt (e.g. `/skill:project-init`). See change: project-init-skill-and-profiles.
-    if (pendingInitialPromptRegistry) {
-      const prompt = pendingInitialPromptRegistry.consume(cwd);
-      if (prompt) {
-        piGateway.sendToSession(sessionId, { type: "send_prompt", sessionId, text: prompt });
-      }
-    }
-
-    // ── automation-run arm ────────────────────────────────────────────
-    // Consume any pending automation-run stamp queued by the automation
-    // plugin's spawn hook for this cwd. Stamps `kind="automation"` +
-    // `automationRun` in memory and persists to `.meta.json` so the
-    // classification + effective board visibility survive restart.
-    // See change: add-automation-plugin.
-    if (pendingAutomationRunRegistry) {
-      const stamp = pendingAutomationRunRegistry.consume(cwd);
-      if (stamp) {
-        // Automation/flow-triggered spawns are machine-fronted → mark them
-        // `ephemeral` so the lifecycle reaper/caps have real producers. Human
-        // dashboard/TUI spawns never reach this arm, so they stay durable.
-        // See change: add-embed-session-lifecycle.
-        sessionManager.update(sessionId, {
-          kind: "automation",
-          automationRun: stamp,
-          lifecyclePolicy: "ephemeral",
-        });
-        const session = sessionManager.get(sessionId);
-        if (session?.sessionFile) {
-          try {
-            mergeSessionMeta(session.sessionFile, {
-              kind: "automation",
-              automationRun: stamp,
-              lifecyclePolicy: "ephemeral",
-            });
-          } catch (err) {
-            console.warn(
-              `[event-wiring] failed to persist automationRun to .meta.json for ${sessionId}:`,
-              err,
-            );
-          }
-        }
-        browserGateway.broadcastSessionUpdated(sessionId, {
-          kind: "automation",
-          automationRun: stamp,
-          lifecyclePolicy: "ephemeral",
-        });
-      }
-    }
+    // NOTE: the initial-prompt arm AND plugin-ref resolution (automation
+    // classification, goal linking, any third-party ownership) both moved to
+    // the onEvent `session_register` branch. Resolution must run AFTER
+    // `linkByToken` binds the registry entry's sessionId (a prerequisite for
+    // the token-keyed unified pending store); the initial-prompt dispatch
+    // moved with it so owner-notify + ref resolution precede any pending-prompt
+    // dispatch (task 3.1). See change: detach-automation-goal-from-core.
 
     // Push the current auto-naming preference to the freshly-registered bridge
     // so it gates naming on the right value from its first turn (config push,
@@ -519,50 +487,55 @@ export function wireEvents(deps: EventWiringDeps): void {
     // add-goal-session-supervisor (Correlation).
   };
 
-  // Link a goal-driver session to its GoalRecord: stamp in-memory + .meta.json
-  // `goalId`, broadcast, and prime the pursuit. Shared by the token path
-  // (primary) and the cwd-FIFO fallback (legacy). See change:
-  // add-goal-session-supervisor.
-  function linkGoalDriver(sessionId: string, cwd: string, goalId: string): void {
-    if (!goalStore) return;
-    const gs = goalStore;
-    // Replace the driver so a supervisor RESPAWN (dead driver still set) takes
-    // over as the live driver; for a first link this behaves like linkSession.
-    // See change: add-goal-session-supervisor (S5).
-    gs.list(cwd)
-      .then((goals) => {
-        // C2e: clear the OUTGOING driver's in-memory goalId so a late snapshot
-        // from the replaced session can't project onto the goal after handover.
-        const prevDriver = goals.find((g) => g.id === goalId)?.driverSessionId;
-        if (prevDriver && prevDriver !== sessionId) {
-          sessionManager.update(prevDriver, { goalId: undefined });
-        }
-        return gs.replaceDriver(cwd, goalId, sessionId);
-      })
-      .then((updated) => {
-        // Clear any persisted in-flight respawn now the new driver registered.
-        if (updated.inFlightSpawn) void gs.setInFlightSpawn(cwd, goalId, null);
-        sessionManager.update(sessionId, { goalId });
-        const session = sessionManager.get(sessionId);
-        if (session?.sessionFile) {
-          try {
-            mergeSessionMeta(session.sessionFile, { goalId });
-          } catch (err) {
-            console.warn(
-              `[event-wiring] failed to persist goalId to .meta.json for ${sessionId}:`,
-              err,
-            );
-          }
-        }
-        browserGateway.broadcastSessionUpdated(sessionId, { goalId });
-        primeGoalSession?.(sessionId, updated);
-      })
-      .catch((err) => {
-        console.warn(`[event-wiring] failed to link session ${sessionId} to goal ${goalId}:`, err);
-      });
-  }
 
   // Broadcast session ended to browsers when sessions are unregistered
+  sessionManager.onEnded = (sessionId) => {
+    const session = sessionManager.get(sessionId);
+    // A dead session keeps no host-pressure tracking. The gateway's own exit
+    // paths clear themselves, but a MANAGER-driven ending with the bridge
+    // socket still open (reload-spawn failure, zombie normalization, move)
+    // reaches none of them, and would leave the entry plus both timers alive.
+    // Fires on the EXACT transition from BOTH seams, like the write below.
+    // See change: fix-false-unresponsive-badge.
+    piGateway.clearHostPressure(sessionId);
+    // The eager, durable write point for the terminal `closedReason` (design
+    // D2). Fires on the EXACT transition from BOTH seams, so an `update()`-based
+    // ending (reload-spawn failure, zombie normalization, move) persists its
+    // reason too — `onUnregister` below only covers the unregister seam, and the
+    // routine `onChange` save is a full `.meta.json` overwrite that does not
+    // enumerate the field. See change: stop-discarding-known-session-state.
+    if (metaPersistence && session?.sessionFile) {
+      metaPersistence.setLiveness(session.sessionFile, {
+        live: false,
+        closedReason: session.closedReason ?? "unknown",
+      });
+    }
+
+    // Terminate every tool card + subagent the dying session left open, by
+    // writing synthesized terminal events into its own stream (design D1): the
+    // reducer's existing arms then heal live AND on every replay, and a second
+    // `onEnded` (a later `closedReason` change) finds nothing open, so
+    // idempotence comes from the store rather than a flag.
+    //
+    // A relocation is not a death: `movedTo` means the calls are still running
+    // on the destination instance, which could never correct the lie.
+    // See change: heal-orphaned-tool-cards-on-session-end.
+    if (session && session.movedTo === undefined) {
+      const stored = eventStore.getEvents(sessionId, 1);
+      const now = Date.now();
+      const healEvents = [
+        ...findOpenToolCalls(stored).map((call) => synthesizeSessionEndedEnd(call, now)),
+        ...findOpenSubagents(stored).map((id) => synthesizeSessionEndedSubagentFail(id, now)),
+      ];
+      for (const healEvent of healEvents) {
+        const seq = eventStore.insertEvent(sessionId, healEvent);
+        if (!replayingSessions.has(sessionId)) {
+          browserGateway.broadcastEvent(sessionId, seq, healEvent);
+        }
+      }
+    }
+  };
+
   sessionManager.onUnregister = (sessionId) => {
     // Turn-boundary reset (change: auto-canvas): a terminated session must not
     // leave stale candidates behind. No settle broadcast on termination.
@@ -575,20 +548,20 @@ export function wireEvents(deps: EventWiringDeps): void {
     pendingPromptAcks?.evictSession(sessionId);
     const session = sessionManager.get(sessionId);
     if (session) {
-      // Durably clear the liveness marker EAGERLY (atomic, not debounced).
-      // Every unregister path (TUI quit, heartbeat expiry, run termination)
-      // is a non-crash end: without this, `status:"ended"` rides the
-      // 1s-debounced save while `live:true` stays on disk — a host death
-      // inside that window makes the next cold start offer (or in `auto`
-      // mode, silently respawn) a session that ended cleanly.
-      // See change: reopen-sessions-after-shutdown.
-      if (metaPersistence && session.sessionFile) {
-        metaPersistence.setLiveness(session.sessionFile, { live: false });
-      }
+      // Liveness + the death reason are written eagerly by `onEnded` above (the
+      // shared terminal-transition write point for both seams).
       browserGateway.broadcastSessionUpdated(sessionId, {
         status: "ended",
         endedAt: session.endedAt,
+        closedReason: session.closedReason,
         currentTool: null,
+        // Explicit `null` for the same reason as `currentTool`: the client
+        // merges with `{ ...existing, ...updates }`, so an omitted key would
+        // leave the last verdict in browser state for a dead session. The
+        // ended card does not render it, but the row should not carry a
+        // liveness claim about a bridge that is gone.
+        // See change: fix-false-unresponsive-badge.
+        hostPressure: null,
       });
     }
     // Drop both pending registries. `pendingPromptRequests` and
@@ -604,6 +577,14 @@ export function wireEvents(deps: EventWiringDeps): void {
     // any run wedged by a lost terminal event.
     // See change: finalize-automation-run-on-session-death.
     dispatchPluginSessionEnded?.(sessionId);
+    // Idle-alive archive: the process was just ended, so complete the archive
+    // the user asked for. Consuming the one-shot intent here (rather than in a
+    // generic onChange) keeps "archived as a consequence of MY request"
+    // distinct from every other death path. See change:
+    // archive-sessions-lazy-load.
+    if (pendingArchiveIntents?.consume(sessionId)) {
+      sessionArchive?.archiveSession(sessionId, "manual");
+    }
   };
 
   // Per-event cap for `Session.uiDataMap[event]`. Phase-1 spec contract:
@@ -992,6 +973,10 @@ export function wireEvents(deps: EventWiringDeps): void {
       if (!replayingSessions.has(sessionId)) {
         const lifecycleTs = captureLifecycleTimestamp(msg.event.eventType, Date.now());
         if (lifecycleTs) sessionManager.update(sessionId, lifecycleTs);
+        // A turn started: the session is alive, so a pending idle-alive archive
+        // intent must be discarded (spec: turn start clears the intent).
+        // See change: archive-sessions-lazy-load.
+        if (msg.event.eventType === "agent_start") pendingArchiveIntents?.clear(sessionId);
       }
 
       // Auto-canvas accumulation (change: auto-canvas). Mirrors the replay +
@@ -1167,6 +1152,55 @@ export function wireEvents(deps: EventWiringDeps): void {
           if (!replayingSessions.has(sessionId)) {
             browserGateway.broadcastEvent(sessionId, statsSeq, statsEvent);
             browserGateway.broadcastSessionUpdated(sessionId, statsUpdates);
+          }
+        }
+      }
+    }
+
+    // Heartbeat-carried agent liveness. `status: "streaming"` is otherwise a
+    // one-way latch (`agent_end` is the only path back to `idle`), so a single
+    // dropped `agent_end` sticks the card on `Thinking…` until a restart. The
+    // bridge holds the truth and now reports it on every beat; here it is
+    // reconciled against the stored status.
+    //
+    // Deliberately NOT routed through `stampUnreadIfTriggered`: the exemption
+    // is by CALL PATH, not by a flag — a correction is not a finished turn, so
+    // it must not stamp unread, append an `agent_end`, or fire any other
+    // run-boundary consumer (design D3).
+    //
+    // See change: fix-stuck-streaming-status-latch.
+    if (msg.type === "session_heartbeat") {
+      // `typeof === "boolean"`, not `!== undefined`: this arrives off a socket,
+      // so a `null` would falsely settle a streaming session and a truthy
+      // `"false"` string would falsely set an idle one to `streaming`. Anything
+      // that is not a real boolean carries no liveness truth and is ignored,
+      // which is exactly the old-bridge degradation path (D5).
+      if (typeof msg.agentRunning === "boolean" && !replayingSessions.has(sessionId)) {
+        const session = sessionManager.get(sessionId);
+        if (session) {
+          const updates = reconcileAgentLiveness(session.status, msg.agentRunning);
+          if (updates) {
+            // A live `ask_user` is real truth the correction must not erase —
+            // the same gate `extractSessionUpdates` applies via
+            // `hasPendingPrompt` (design D10).
+            const applied =
+              updates.currentTool === null && browserGateway.hasPendingPromptRequests(sessionId)
+                ? { status: updates.status }
+                : updates;
+            // `streaming`/`idle` disagreements mean a run-boundary event was
+            // lost in transport — this log is the loss-rate signal the WS-churn
+            // follow-up needs. `active → streaming` is NOT that: a re-register
+            // unconditionally writes `active`, so no event need have been lost.
+            // Saying so would skew the very analysis the log exists for.
+            const cause =
+              session.status === "active"
+                ? "post-register status did not reflect the live turn"
+                : "a run-boundary event was lost in transport";
+            console.log(
+              `[reconcile] session ${sessionId}: ${session.status} -> ${applied.status} (bridge agentRunning=${msg.agentRunning}; ${cause})`,
+            );
+            sessionManager.update(sessionId, applied as Partial<DashboardSession>);
+            browserGateway.broadcastSessionUpdated(sessionId, applied);
           }
         }
       }
@@ -1357,30 +1391,91 @@ export function wireEvents(deps: EventWiringDeps): void {
         browserGateway.headlessPidRegistry.linkSession(sessionId, msg.cwd);
       }
 
-      // ── goal-driver link (token → cwd-FIFO) ──────────────────────────
-      // PRIMARY: the strong token path. A goal-driver spawn (route or
-      // supervisor respawn) stamped `goalId` onto the registry entry keyed to
-      // its spawn token; `linkByToken` above set the entry's sessionId, so
-      // `getGoalId(sessionId)` now resolves it deterministically — an unrelated
-      // same-cwd session has no goalId on its entry and is never mis-linked.
-      // FALLBACK: the legacy per-cwd FIFO for spawns that carried no token.
-      // See change: add-goal-session-supervisor (Correlation, replaces the
-      // onSessionRegistered cwd-FIFO primary).
-      if (goalStore) {
-        // Guard against a RE-REGISTER of an already-linked driver (bridge WS
-        // blip / dashboard restart while pi survives): the token path
-        // (`getGoalId`) is a non-destructive read that survives the process, so
-        // without this guard `linkGoalDriver` would re-prime `/goal` into a live
-        // conversation on every reconnect. Only link on a genuine handover —
-        // first link or a different driver taking over. The legacy cwd-FIFO is
-        // single-shot so it never re-fires. See change: add-goal-session-supervisor.
-        const alreadyLinked = sessionManager.get(sessionId)?.goalId;
-        const tokenGoalId = browserGateway.headlessPidRegistry.getGoalId(sessionId);
-        if (tokenGoalId) {
-          if (alreadyLinked !== tokenGoalId) linkGoalDriver(sessionId, msg.cwd, tokenGoalId);
-        } else if (pendingGoalLinkRegistry) {
-          const fifoGoalId = pendingGoalLinkRegistry.consume(msg.cwd);
-          if (fifoGoalId && alreadyLinked !== fifoGoalId) linkGoalDriver(sessionId, msg.cwd, fifoGoalId);
+      // ── generic plugin-ref resolution ────────────────────────────────
+      // A plugin (or a first-party feature spawning in core) filed an opaque
+      // identity/config ref against this session's spawn TOKEN before the
+      // spawn await. Now that `linkByToken` bound the entry's sessionId,
+      // resolve the ref, promote it onto the (persisted) entry, merge its
+      // owned keys onto the session (+ `.meta.json`), apply the core-owned
+      // lifecycle, and notify the owning plugin — all BEFORE first-event
+      // forwarding / pending-prompt dispatch (task 3.1). Core carries the blob;
+      // it never parses the interior. cwd never confers ownership (task 3.3).
+      // See change: detach-automation-goal-from-core.
+      {
+        const reg = browserGateway.headlessPidRegistry;
+        let ref: Record<string, unknown> | undefined;
+        let ownerId: string | undefined;
+        let lifecycle: { recover?: boolean; finalizeOnSocketClose?: boolean } | undefined;
+        const resolved = msg.spawnToken ? pendingPluginRefRegistry?.resolve(msg.spawnToken) : null;
+        if (resolved) {
+          // First register: consumed from the token store. Promote onto the
+          // persisted entry so a reconnect / keeper respawn re-resolves it.
+          ref = resolved.ref;
+          ownerId = resolved.ownerId;
+          lifecycle = resolved.lifecycle;
+          if (Object.keys(ref).length > 0) reg.setPluginRef(sessionId, ref);
+        } else {
+          // Reconnect / cold-start restore: the token was already consumed;
+          // read the ref promoted onto the entry. No owner-notify (owner
+          // already knew; ownerId is not persisted) and no lifecycle re-apply
+          // (`recover` was persisted to `.meta.json`; `finalizeOnSocketClose`
+          // is re-declared only on a fresh spawn). Merge stays idempotent.
+          ref = reg.getPluginRef(sessionId);
+        }
+        if (ref && Object.keys(ref).length > 0) {
+          const refUpdate = ref as Partial<DashboardSession>;
+          sessionManager.update(sessionId, refUpdate);
+          const session = sessionManager.get(sessionId);
+          if (session?.sessionFile) {
+            try {
+              mergeSessionMeta(session.sessionFile, ref as Partial<SessionMeta>);
+            } catch (err) {
+              console.warn(
+                `[event-wiring] failed to persist pluginRef to .meta.json for ${sessionId}:`,
+                err,
+              );
+            }
+          }
+          browserGateway.broadcastSessionUpdated(sessionId, refUpdate);
+        }
+        if (lifecycle) {
+          // Core-owned lifecycle from the DECLARATION (never the ref body).
+          // `recover` persists to `.meta.json` only when explicitly false
+          // (additive opt-out byte); `finalizeOnSocketClose` is in-memory only
+          // (read at the pi-gateway socket-close finalize branch).
+          const inMemory: Partial<DashboardSession> = {};
+          if (lifecycle.recover !== undefined) inMemory.recover = lifecycle.recover;
+          if (lifecycle.finalizeOnSocketClose !== undefined) {
+            inMemory.finalizeOnSocketClose = lifecycle.finalizeOnSocketClose;
+          }
+          if (Object.keys(inMemory).length > 0) sessionManager.update(sessionId, inMemory);
+          if (lifecycle.recover === false) {
+            const session = sessionManager.get(sessionId);
+            if (session?.sessionFile) {
+              try {
+                mergeSessionMeta(session.sessionFile, { recover: false });
+              } catch { /* best-effort */ }
+            }
+          }
+        }
+        // Owner-notify: only on a fresh resolution (carries ownerId), BEFORE
+        // first-event forwarding / pending-prompt dispatch (task 3.1).
+        if (ownerId && ref) dispatchPluginSessionResolved?.(ownerId, sessionId, ref);
+      }
+
+
+      // ── initial-prompt arm ──────────────────────────────────────────
+      // Consume any pending initial-prompt intent queued by the no-hook
+      // Initialize button's spawn (e.g. `/skill:project-init`) or a goal
+      // driver's reprime, and dispatch it as the session's first prompt.
+      // Runs AFTER ref resolution + owner-notify so an owned session's owner is
+      // always notified before its first prompt is dispatched (task 3.1).
+      // Moved here from `onSessionRegistered`. See change:
+      // detach-automation-goal-from-core (was project-init-skill-and-profiles).
+      if (pendingInitialPromptRegistry) {
+        const prompt = pendingInitialPromptRegistry.consume(msg.cwd);
+        if (prompt) {
+          piGateway.sendToSession(sessionId, { type: "send_prompt", sessionId, text: prompt });
         }
       }
 
@@ -1702,11 +1797,15 @@ export function wireEvents(deps: EventWiringDeps): void {
     if (msg.type === "git_info_update") {
       // Compose live worktree state from bridge + server-cached base ref
       // (loaded earlier from .meta.json by session-scanner / spawn flow).
-      // `null` clears, `undefined` leaves existing value untouched.
-      // See change: add-worktree-spawn-dialog.
+      // `null` clears unless parentage is already resolved (worktree removed
+      // underneath a live session — parentage is immutable once known);
+      // `undefined` leaves existing value untouched.
+      // See changes: add-worktree-spawn-dialog,
+      //               fix-worktree-grouping-lost-on-remove.
       const composedWorktree = composeWorktreePayload(
         msg.gitWorktree,
         sessionManager.get(sessionId)?.gitWorktreeBase,
+        sessionManager.get(sessionId)?.gitWorktree,
       );
       const gitUpdates: Record<string, unknown> = {
         gitBranch: msg.gitBranch,
@@ -1735,7 +1834,8 @@ export function wireEvents(deps: EventWiringDeps): void {
       }
       if (composedWorktree !== undefined) {
         // Map wire `null` → in-memory `undefined` so the field clears
-        // cleanly on the DashboardSession.
+        // cleanly on the DashboardSession (only reached when no prior
+        // parentage — a resolved value is retained by the composer).
         gitUpdates.gitWorktree = composedWorktree ?? undefined;
       }
       // Server-internal resolution signal: the bridge has reported worktree
@@ -1930,7 +2030,15 @@ export function wireEvents(deps: EventWiringDeps): void {
           moveSessionToFrontAndBroadcast(sessionId, sessionAfter);
         }
       }
-      browserGateway.sendToSubscribers(sessionId, msg as any);
+      // Requester-scoped delivery of a resync reply (D4): a token-carrying
+      // re-emission goes to the ONE browser that asked, as a critical frame —
+      // the guarded fan-out is exactly what shed the original prompt frame.
+      // Every side effect above already ran; only the final delivery swaps.
+      // No/expired token → deliverPromptResyncReply returns false → fan-out.
+      // See change: fix-pending-prompt-lost-on-replay (task 2.4).
+      if (!browserGateway.deliverPromptResyncReply(msg as any, sessionId)) {
+        browserGateway.sendToSubscribers(sessionId, msg as any);
+      }
     }
 
     // Notify: render + log only. Deliberately no `trackPromptRequest`, no

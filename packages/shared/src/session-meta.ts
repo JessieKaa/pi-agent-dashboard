@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { DisplayPrefs, PartialDisplayPrefs } from "./display-prefs.js";
-import type { AutoNamerPersistedState, NotifyLogEntry } from "./types.js";
+import type { AutoNamerPersistedState, ClosedReason, NotifyLogEntry } from "./types.js";
 
 /**
  * Session metadata stored as a sidecar `.meta.json` file
@@ -35,12 +35,39 @@ export interface SessionMeta {
   hidden?: boolean;
 
   /**
+   * Archive state (ended-only), orthogonal to `hidden`. An archived session
+   * is evicted from the live set and served from the in-memory archive index
+   * on demand. `archivedAt` records the transition instant; `restoredAt`
+   * restarts the sweeper's age clock on restore. All optional — a sidecar
+   * without them reads as not archived.
+   * See change: archive-sessions-lazy-load.
+   */
+  archived?: boolean;
+  archivedAt?: number;
+  restoredAt?: number;
+
+  /**
    * User-owned, free-form tags for classifying a session. Normalized on write
    * (trim/lowercase/dedupe/cap — see `normalizeTags`). Absent field reads as
    * untagged. Bridges SHALL NOT send this — it is dashboard-owned.
    * See change: add-session-tags.
    */
   tags?: string[];
+
+  /**
+   * Paired-device id of the host the session RAN on. Absent means local — the
+   * same encoding `DashboardSession.originDeviceId` uses, so every pre-existing
+   * sidecar keeps reading as local.
+   *
+   * Persisted because origin gates FILESYSTEM READS, and a fact that governs a
+   * read must outlive the process that derived it. Without it a restart (or an
+   * unarchive) resurrects a remote session as local, and hydration then opens
+   * its recorded `sessionFile` — a path on the ORIGIN host that a same-username
+   * machine also has (#E15). Derived from the bridge's credential, never from
+   * anything the bridge claims.
+   * See change: serve-retained-remote-transcripts.
+   */
+  originDeviceId?: string;
 
   // Cached identity & state (from .jsonl header / bridge)
   cwd?: string;
@@ -171,7 +198,21 @@ export interface SessionMeta {
    */
   live?: boolean;
   liveEpoch?: number;
-  closedReason?: string;
+  closedReason?: ClosedReason;
+
+  /**
+   * Core-owned cold-start recovery opt-out. Defaults to `true` when absent
+   * (⇒ recoverable). A plugin that owns a session and does not want it
+   * replayed after a host crash declares `recover: false` through the generic
+   * session-ownership seam; core persists the resolved boolean here. Core
+   * reads ONLY this flag in `isRecoveryCandidate` — never a plugin name, the
+   * owner `pluginRef`, or owner-key presence. User sessions never carry it and
+   * stay byte-identical; only an owned session that opts out gains this single
+   * additive byte. Both first-party features (`automation`, `goal`) opt out
+   * through this same field, symmetrically.
+   * See change: detach-automation-goal-from-core.
+   */
+  recover?: boolean;
 
   // Cache freshness — compared against .jsonl mtime
   cachedAt?: number;
@@ -198,17 +239,19 @@ export interface SessionMeta {
  * AND a still-set `live` marker. Pre-feature sidecars (no `live`) are never
  * candidates. Reads ONLY per-session meta — never the home-lock.
  * See change: reopen-sessions-after-shutdown.
+ *
+ * Plugin-owned sessions opt out of recovery through the core-owned `recover`
+ * flag (default `true`), never a plugin name. `recover: false` only governs
+ * the crash window where an owned session is still `live && !ended`; a normally
+ * closed owned session is excluded by the liveness/status halves regardless.
+ * See change: detach-automation-goal-from-core.
  */
 export function isRecoveryCandidate(meta: SessionMeta | undefined): boolean {
   return (
     meta?.live === true &&
     meta.status !== "ended" &&
     meta.closedReason !== "manual" &&
-    // Automation run sessions are FULLY exempt: respawning a headless rpc
-    // run detached from its automation (no per-fire context, no run
-    // finalization) recreates the zombie class fix-automation-stop-zombie-runs
-    // exists to kill. They normalize to `ended` like any non-candidate.
-    meta.kind !== "automation"
+    meta.recover !== false
   );
 }
 
@@ -225,10 +268,24 @@ export function metaPath(sessionFile: string): string {
  * Read session metadata from the sidecar file.
  * Returns undefined if the file doesn't exist or is invalid.
  */
+/** Closed-reason vocabulary guard for values read off disk. */
+function isClosedReason(value: unknown): boolean {
+  return value === "manual" || value === "process_gone" || value === "spawn_failed" || value === "unknown";
+}
+
 export function readSessionMeta(sessionFile: string): SessionMeta | undefined {
   try {
     const content = fs.readFileSync(metaPath(sessionFile), "utf-8");
-    return JSON.parse(content) as SessionMeta;
+    const parsed = JSON.parse(content) as SessionMeta;
+    // An unsupported persisted value (legacy/hand-edited) must not reach the
+    // renderer, where an unknown map key crashes the card. Normalize to the
+    // explicit `unknown` member — only when a value is PRESENT: a missing reason
+    // stays missing, so cold-start reconstruction still never synthesizes one.
+    // See change: stop-discarding-known-session-state.
+    if (parsed.closedReason !== undefined && !isClosedReason(parsed.closedReason)) {
+      parsed.closedReason = "unknown";
+    }
+    return parsed;
   } catch {
     return undefined;
   }

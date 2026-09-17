@@ -3,8 +3,10 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
+import { chunkAsciiDoc } from "./adoc-chunker.js";
 import { chunkMarkdown } from "./chunker.js";
-import { DEFAULT_FACET_KEYS, DEFAULT_SEARCHABLE_KEYS, type FacetKeyConfig, buildMeta, buildProperties } from "./frontmatter.js";
+import { buildMeta, buildProperties, DEFAULT_FACET_KEYS, DEFAULT_SEARCHABLE_KEYS, type FacetKeyConfig } from "./frontmatter.js";
+import { type GitignoreMatcher, loadGitignoreMatcher } from "./gitignore.js";
 import type { DocType, KbStore } from "./types.js";
 
 export interface IndexSource {
@@ -20,6 +22,13 @@ export interface IndexOptions {
   exclude?: string[]; // glob patterns to exclude
   extensions?: string[]; // e.g. [".md"]
   frontmatter?: { searchableKeys: string[]; facetKeys: FacetKeyConfig[] }; // structural indexing routing
+  /** Honour `.gitignore` in the walk (design D3, fix-dox-lint-blind-rows).
+   *  Default true — makes the long-declared `respectGitignore` config real.
+   *  A source dir absent from a fresh clone must not be indexed. */
+  respectGitignore?: boolean;
+  /** Project boundary for the gitignore up-walk (usually the resolved cwd).
+   *  Omit to seed the pattern stack from the `.git` root discovered upward. */
+  cwd?: string;
 }
 export interface IndexStats {
   scanned: number;
@@ -32,6 +41,16 @@ export interface IndexStats {
 
 const sha = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
 const DEFAULT_EXCLUDE = /(^|\/)(node_modules|\.git|dist|build|\.next|coverage|\.kb)(\/|$)/;
+/** Selectable source extensions. Widened together with `config.ts` defaults and
+ *  the per-extension chunker dispatch (design D4) — widening one gate alone
+ *  indexes zero extra files. */
+const SELECTABLE_RE = /\.(md|mdx|markdown|adoc|asciidoc)$/i;
+const ADOC_RE = /\.(adoc|asciidoc)$/i;
+/** Extension strip for the meta-chunk heading fallback. Reached only when a file
+ *  HAS frontmatter/attributes but no title; an AsciiDoc header always carries a
+ *  doctitle, so a headerless `.adoc` gets its `guide`-style heading from the
+ *  chunker's own file-name fallback, not from here. */
+const TITLE_EXT_RE = /\.(md|mdx|markdown|adoc|asciidoc)$/i;
 
 /** Files processed between event-loop yields + batch commits. A long synchronous
  *  walk would otherwise pin the single Node thread for its whole duration, so a
@@ -40,6 +59,11 @@ const DEFAULT_EXCLUDE = /(^|\/)(node_modules|\.git|dist|build|\.next|coverage|\.
  *  write lock so the reader is served. See change: fix-kb-index-feedback. */
 const YIELD_EVERY = 100;
 const yieldToEventLoop = (): Promise<void> => new Promise<void>((r) => setImmediate(r));
+
+/** Escape every RegExp metacharacter in a literal. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 /** Minimal glob → RegExp (supports **, *, ?). Good enough for include/exclude. */
 function globToRe(g: string): RegExp {
@@ -57,13 +81,17 @@ function matchAny(pats: RegExp[], rel: string): boolean {
   return pats.some((re) => re.test(rel));
 }
 
-function walk(dir: string, base: string, out: string[] = []): string[] {
+function walk(dir: string, base: string, out: string[] = [], ignore?: GitignoreMatcher): string[] {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
     const abs = join(dir, e.name);
     const rel = relative(base, abs);
     if (DEFAULT_EXCLUDE.test(rel)) continue;
-    if (e.isDirectory()) walk(abs, base, out);
-    else if (/\.(md|mdx|markdown)$/i.test(e.name)) out.push(abs);
+    if (e.isDirectory()) {
+      // Conservative dir-pruning (design D3): descend unless the dir matches
+      // AND no deeper .gitignore could negate the match.
+      if (ignore?.isIgnoredDir(rel) && !ignore.hasDeeperGitignore(rel)) continue;
+      walk(abs, base, out, ignore);
+    } else if (SELECTABLE_RE.test(e.name) && !ignore?.isIgnored(rel)) out.push(abs);
   }
   return out;
 }
@@ -86,11 +114,17 @@ export async function indexSource(store: KbStore, src: IndexSource, opts: IndexO
     console.warn(`kb index: source directory does not exist, skipping: ${src.dir}`);
     return { scanned: 0, changed: 0, deleted: 0, chunks: 0, missing: true };
   }
-  const extRe = opts.extensions?.length ? new RegExp("(" + opts.extensions.map((e) => e.replace(/\./g, "\\.")).join("|") + ")$", "i") : /\.(md|mdx|markdown)$/i;
+  // NOTE: `extRe` is dead (never applied to the file list) — kept as-is, only its
+  // default widened alongside the live gates. See design D4.
+  // Escape EVERY regex metacharacter, not just `.` — a caller-supplied extension
+  // is untrusted input and a lone `\` escape leaves the pattern injectable
+  // (`js/incomplete-sanitization`).
+  const extRe = opts.extensions?.length ? new RegExp("(" + opts.extensions.map(escapeRegExp).join("|") + ")$", "i") : SELECTABLE_RE;
   const inc = opts.include?.map(globToRe);
   const exc = opts.exclude?.map(globToRe);
   const includeSourceMd = opts.includeSourceMarkdown !== false;
-  const files = walk(src.dir, src.dir).filter((abs) => {
+  const gi = opts.respectGitignore === false ? undefined : loadGitignoreMatcher(src.dir, { cwd: opts.cwd, prune: (rel) => DEFAULT_EXCLUDE.test(rel) });
+  const files = walk(src.dir, src.dir, [], gi).filter((abs) => {
     const rel = relative(src.dir, abs);
     if (src.include && !src.include(rel)) return false;
     if (inc && !matchAny(inc, rel)) return false;
@@ -132,7 +166,9 @@ export async function indexSource(store: KbStore, src: IndexSource, opts: IndexO
       // changed → replace
       store.deleteByPath(src.root, rel);
       const dt = docTypeOf(rel, includeSourceMd);
-      const { chunks, wikilinks, mdLinks, frontmatter, parseFailed } = chunkMarkdown({ root: src.root, path: rel, text: buf.toString("utf8"), docType: dt });
+      // per-extension chunker dispatch (design D4)
+      const chunkFile = ADOC_RE.test(rel) ? chunkAsciiDoc : chunkMarkdown;
+      const { chunks, wikilinks, mdLinks, frontmatter, parseFailed } = chunkFile({ root: src.root, path: rel, text: buf.toString("utf8"), docType: dt });
       // file node
       store.addNode({ type: "file", name: rel, path: rel });
       for (const c of chunks) {
@@ -167,7 +203,7 @@ export async function indexSource(store: KbStore, src: IndexSource, opts: IndexO
           // Searchable meta needs only insertChunk (required); it must NOT be
           // gated on the optional insertProperty, or a chunk-capable store would
           // silently lose title/description search.
-          const heading = title ?? (rel.split("/").pop() ?? rel).replace(/\.(md|mdx|markdown)$/i, "");
+          const heading = title ?? (rel.split("/").pop() ?? rel).replace(TITLE_EXT_RE, "");
           store.insertChunk({ root: src.root, path: rel, chunkId: `${sha(rel).slice(0, 8)}:meta`, headingPath: heading, heading, level: 0, parentChunkId: null, docType: dt, body: metaBody, bodyHash: sha(metaText) });
           stats.chunks++;
         }

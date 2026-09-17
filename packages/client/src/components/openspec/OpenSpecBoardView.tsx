@@ -48,8 +48,6 @@ import {
   mdiCog,
   mdiDotsHorizontal,
   mdiDragVertical,
-  mdiEyeOffOutline,
-  mdiEyeOutline,
   mdiFileDocumentOutline,
   mdiPlay,
   mdiPlayCircleOutline,
@@ -63,6 +61,7 @@ import { Icon } from "@mdi/react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatRelativeTime, formatTokens } from "../../lib/util/format.js";
+import type { WorktreeAvailability } from "../../lib/git/folder-worktree-availability.js";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
 import {
   type CardRectMap,
@@ -111,16 +110,32 @@ export interface OpenSpecBoardViewProps {
   onSpawnSession: (cwd: string, attachProposal?: string, opts?: { gitWorktreeBase?: string; placeholderCwd?: string }) => void;
   onSpawnAttachedWorktree: (cwd: string, changeName: string) => void;
   onResumeSession: (sessionId: string, mode: "continue" | "fork") => void;
-  onHideSession: (sessionId: string) => void;
-  onUnhideSession: (sessionId: string) => void;
+  onArchiveSession: (sessionId: string) => void;
   onSendPrompt: (sessionId: string, text: string) => void;
   onAttachProposal: (sessionId: string, changeName: string) => void;
   onDetachProposal: (sessionId: string) => void;
   onReplaceProposal?: (sessionId: string, accept: boolean, changeName: string) => void;
   onBulkArchive: () => void;
-  isGitRepo: boolean;
-  gitWorktreeEnabled: boolean;
+  /**
+   * Folder-level worktree availability from `resolveWorktreeAvailability`
+   * (folder HEAD ∪ session `isGitRepo`, preference-gated). Replaces the old
+   * liveness-coupled `isGitRepo` + `gitWorktreeEnabled` pair: unavailability
+   * is now rendered disabled-with-reason instead of vanishing.
+   * See change: fix-openspec-board-worktree-button-gating.
+   */
+  worktreeAvailability: WorktreeAvailability;
   selectedId?: string;
+}
+
+/**
+ * Tooltip for the per-card `New worktree` action: the spawn hint when it is
+ * usable, the ACTIONABLE cause when it is not (design D7).
+ * See change: fix-openspec-board-worktree-button-gating.
+ */
+function worktreeActionTitle(availability: WorktreeAvailability): string {
+  if (availability.available) return i18nT("worktree.spawnAWorktreeForThisProposal", undefined, "Spawn a worktree for this proposal");
+  if (availability.reason === "worktrees-disabled") return i18nT("worktree.unavailableDisabled", undefined, "Worktrees are disabled in Settings");
+  return i18nT("worktree.unavailableNotGitRepo", undefined, "This folder is not a git repository");
 }
 
 const STATE_PILLS: Array<{ value: ChangeState | null; label: string }> = [
@@ -178,8 +193,8 @@ export function OpenSpecBoardView(props: OpenSpecBoardViewProps) {
   const {
     cwd, data, sessions, openspecMap, groupsState, onBack, onRefresh, onReadArtifact,
     onNavigateToSession, onOpenSpecs, onOpenArchive, onSpawnSession, onSpawnAttachedWorktree,
-    onResumeSession, onHideSession, onUnhideSession, onSendPrompt, onAttachProposal,
-    onDetachProposal, onReplaceProposal, onBulkArchive, isGitRepo, gitWorktreeEnabled, selectedId,
+    onResumeSession, onArchiveSession, onSendPrompt, onAttachProposal,
+    onDetachProposal, onReplaceProposal, onBulkArchive, worktreeAvailability, selectedId,
   } = props;
 
   const openspecConfig = useOpenSpecConfig(cwd);
@@ -542,8 +557,7 @@ export function OpenSpecBoardView(props: OpenSpecBoardViewProps) {
                     onSpawnSession={onSpawnSession}
                     onSpawnAttachedWorktree={onSpawnAttachedWorktree}
                     onResumeSession={onResumeSession}
-                    onHideSession={onHideSession}
-                    onUnhideSession={onUnhideSession}
+                    onArchiveSession={onArchiveSession}
                     onSendPrompt={onSendPrompt}
                     onAttachProposal={onAttachProposal}
                     onDetachProposal={onDetachProposal}
@@ -553,8 +567,7 @@ export function OpenSpecBoardView(props: OpenSpecBoardViewProps) {
                     groups={groups}
                     assignments={assignments}
                     openspecConfig={openspecConfig}
-                    isGitRepo={isGitRepo}
-                    gitWorktreeEnabled={gitWorktreeEnabled}
+                    worktreeAvailability={worktreeAvailability}
                   />
                 )}
               />
@@ -613,7 +626,7 @@ export function OpenSpecBoardView(props: OpenSpecBoardViewProps) {
           <NewProposalDialog
             groups={groups}
             defaultGroupId={proposalDialogGroup.groupId}
-            gitWorktreeEnabled={gitWorktreeEnabled && isGitRepo}
+            gitWorktreeEnabled={worktreeAvailability.available}
             onCancel={() => setProposalDialogGroup(null)}
             onCreate={(name, groupId, worktree) => {
               setProposalDialogGroup(null);
@@ -1034,8 +1047,7 @@ function ProposalCard(props: {
   onSpawnSession: (cwd: string, attachProposal?: string, opts?: { gitWorktreeBase?: string; placeholderCwd?: string }) => void;
   onSpawnAttachedWorktree: (cwd: string, changeName: string) => void;
   onResumeSession: (id: string, mode: "continue" | "fork") => void;
-  onHideSession: (id: string) => void;
-  onUnhideSession: (id: string) => void;
+  onArchiveSession: (id: string) => void;
   onSendPrompt: (sessionId: string, text: string) => void;
   onAttachProposal: (sessionId: string, changeName: string) => void;
   onDetachProposal: (sessionId: string) => void;
@@ -1045,8 +1057,7 @@ function ProposalCard(props: {
   groups: OpenSpecGroup[];
   assignments: Record<string, string>;
   openspecConfig: ReturnType<typeof useOpenSpecConfig>;
-  isGitRepo: boolean;
-  gitWorktreeEnabled: boolean;
+  worktreeAvailability: WorktreeAvailability;
   /** Paint the insertion marker in the gap above this card (drag-time only). */
   markerBefore?: boolean;
 }) {
@@ -1114,16 +1125,19 @@ function ProposalCard(props: {
         >
           <Icon path={mdiPlay} size={0.4} className="inline mr-0.5" />{i18nT("session.newSession", undefined, "New session")}
         </button>
-        {props.isGitRepo && props.gitWorktreeEnabled && (
-          <button
-            onClick={() => props.onSpawnAttachedWorktree(props.cwd, c.name)}
-            className="flex-1 text-[9px] px-1 py-[3px] rounded-md text-yellow-400 border border-yellow-500/30 hover:bg-yellow-500/8 whitespace-nowrap"
-            data-testid={`card-new-worktree-${c.name}`}
-            title={i18nT("worktree.spawnAWorktreeForThisProposal", undefined, "Spawn a worktree for this proposal")}
-          >
-            <Icon path={mdiSourceBranchPlus} size={0.4} className="inline mr-0.5" />{i18nT("worktree.newWorktree", undefined, "New worktree")}
-          </button>
-        )}
+        {/* Always rendered: an unavailable worktree action is disabled with an
+            explaining title, never hidden — a vanished button is
+            indistinguishable from a render bug (design D7).
+            See change: fix-openspec-board-worktree-button-gating. */}
+        <button
+          onClick={() => { if (props.worktreeAvailability.available) props.onSpawnAttachedWorktree(props.cwd, c.name); }}
+          disabled={!props.worktreeAvailability.available}
+          className={`flex-1 text-[9px] px-1 py-[3px] rounded-md text-yellow-400 border border-yellow-500/30 whitespace-nowrap ${props.worktreeAvailability.available ? "hover:bg-yellow-500/8" : "opacity-40 cursor-not-allowed"}`}
+          data-testid={`card-new-worktree-${c.name}`}
+          title={worktreeActionTitle(props.worktreeAvailability)}
+        >
+          <Icon path={mdiSourceBranchPlus} size={0.4} className="inline mr-0.5" />{i18nT("worktree.newWorktree", undefined, "New worktree")}
+        </button>
       </div>
     </div>
   );
@@ -1132,7 +1146,7 @@ function ProposalCard(props: {
 // ── Session row ───────────────────────────────────────────────────
 function BoardSessionRow({
   session: s, change: c, cwd, openspecMap, selectedId, lastClickedRef, onNavigateToSession,
-  onResumeSession, onHideSession, onUnhideSession, onSendPrompt, onReadArtifact,
+  onResumeSession, onArchiveSession, onSendPrompt, onReadArtifact,
   onAttachProposal, onDetachProposal, onReplaceProposal, onBulkArchive, allChanges, groups, assignments, openspecConfig,
 }: {
   session: DashboardSession;
@@ -1175,9 +1189,11 @@ function BoardSessionRow({
           {hasFile && (
             <button title={i18nT("session.forkSession", undefined, "Fork session")} onClick={() => onResumeSession(s.id, "fork")} className="text-[var(--text-muted)] hover:text-blue-400"><Icon path={mdiSourceFork} size={0.42} /></button>
           )}
-          {isHidden
-            ? <button title={i18nT("session.showSession", undefined, "Show session")} onClick={() => onUnhideSession(s.id)} className="text-[var(--text-muted)] hover:text-green-400"><Icon path={mdiEyeOutline} size={0.42} /></button>
-            : <button title={i18nT("session.hideSession", undefined, "Hide session")} onClick={() => onHideSession(s.id)} className="text-[var(--text-muted)] hover:text-[var(--text-secondary)]"><Icon path={mdiEyeOffOutline} size={0.42} /></button>}
+          {/* Archive (archive-sessions-lazy-load) — replaces hide/unhide:
+              ended or idle-alive only, never while running. */}
+          {(s.status === "ended" || (isAlive && s.status !== "streaming" && !s.currentTool)) && (
+            <button title={i18nT("session.archiveSession", undefined, "Archive session")} onClick={() => onArchiveSession(s.id)} className="text-[var(--text-muted)] hover:text-[var(--text-secondary)]"><Icon path={mdiArchiveOutline} size={0.42} /></button>
+          )}
           <span className="relative">
             <button title={i18nT("openspec.openspecCommands", undefined, "OpenSpec commands")} onClick={() => setMenuOpen((v) => !v)} className="text-[var(--text-muted)] hover:text-purple-400" data-testid={`session-os-menu-${s.id}`}><Icon path={mdiDotsHorizontal} size={0.5} /></button>
             {menuOpen && (

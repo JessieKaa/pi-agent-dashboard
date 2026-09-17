@@ -1,4 +1,5 @@
 import { ComposerPanelSlot } from "@blackbelt-technology/dashboard-plugin-runtime";
+import { LayerPortal } from "@blackbelt-technology/pi-dashboard-client-utils/LayerPortal";
 import type { ProviderRefreshError } from "@blackbelt-technology/pi-dashboard-shared/protocol.js";
 import type { CommandInfo, FileEntry, ImageContent, ModelInfo, ViewTarget } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import { mdiAlertOctagon, mdiClipboardText, mdiConsole, mdiDotsHorizontal, mdiEyeOutline, mdiFile, mdiFileDocumentOutline, mdiFlag, mdiFlash, mdiFolder, mdiImageOutline, mdiPlaylistPlus, mdiPlus, mdiSendVariant, mdiStop, mdiStopCircleOutline, mdiWeb, mdiWrench } from "@mdi/js";
@@ -8,6 +9,9 @@ import { useImagePaste } from "../../hooks/useImagePaste.js";
 import { LIST_POPOVER_MIN_HEIGHT, usePopoverFlip } from "../../hooks/usePopoverFlip.js";
 import type { ChatMessage, PendingPrompt } from "../../lib/chat/event-reducer.js";
 import { useI18n } from "../../lib/i18n/i18n.js";
+import {
+  CHAT_COMPOSER_BOUND,
+} from "../../lib/layout/chat-pane-row-class.js";
 import { extractRecentUrls } from "../../lib/preview/extract-urls.js";
 import { usePopoverBoundary } from "../../lib/state/PopoverBoundaryContext.js";
 import { ImagePreviewStrip } from "../preview/ImagePreviewStrip.js";
@@ -210,6 +214,11 @@ function extractAtQuery(text: string): string | null {
 /** Minimum bare-leaf length before a walk-backed `list_files` request fires. */
 const MIN_FILE_QUERY_LEN = 3;
 
+// Gap between a portaled popover and its trigger, replacing the mt-1/mb-1 a
+// flow sibling would get (a portaled panel has none). Matches ModelSelector.
+// See change: portal-composer-action-popovers.
+const POPOVER_GAP = 4;
+
 /**
  * Whether an `@`-mention query should issue a walk-backed `list_files` request.
  * A bare `@` (empty query) lists top-level entries; a slashed query is scoped
@@ -260,7 +269,10 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
   const [overflowOpen, setOverflowOpen] = useState(false);
   const attachRef = useRef<HTMLDivElement>(null);
   const attachBtnRef = useRef<HTMLButtonElement>(null);
+  const attachPanelRef = useRef<HTMLDivElement>(null);
   const overflowRef = useRef<HTMLDivElement>(null);
+  const overflowBtnRef = useRef<HTMLButtonElement>(null);
+  const overflowPanelRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // --- History recall (bash-style) ---
@@ -401,6 +413,7 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
     flipUp: ddFlipUp,
     maxHeight: ddMaxHeight,
     minHeight: ddMinHeight,
+    triggerRect: ddRect,
   } = usePopoverFlip(composerRef, {
     open: dropdownMode !== null,
     boundaryRef,
@@ -417,12 +430,40 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
   // (`anchorRight`/`maxWidth`) — its vertical placement is a hardcoded
   // `bottom-full` and it applies no height bound, so there is no floor to lose.
   // See change: fix-popover-pane-bounded-height (task 4.6).
-  const { anchorRight: attachAnchorRight, maxWidth: attachMaxWidth } = usePopoverFlip(attachBtnRef, {
+  const {
+    anchorRight: attachAnchorRight,
+    maxWidth: attachMaxWidth,
+    triggerRect: attachRect,
+  } = usePopoverFlip(attachBtnRef, {
     open: attachOpen,
     estimatedWidth: 224, // w-56
     preferredAnchor: "left",
     boundaryRef,
   });
+
+  // Overflow (⋯) menu — right-anchored, opens upward from the far-right button.
+  // Now a portaled surface, so it needs the trigger rect for fixed placement.
+  // See change: portal-composer-action-popovers.
+  const { triggerRect: overflowRect } = usePopoverFlip(overflowBtnRef, {
+    open: overflowOpen,
+    boundaryRef,
+  });
+
+  // Fixed placement for the portaled autocomplete list: it spanned the composer
+  // edges (`left-3 right-3`) and flipped above/below the composer root; reproduce
+  // that from the composer rect now that it lives in a portal. 12px == `-3`.
+  const ddPanelStyle: React.CSSProperties = ddRect
+    ? {
+        position: "fixed",
+        left: Math.round(ddRect.left + 12),
+        width: Math.max(0, Math.round(ddRect.width - 24)),
+        maxHeight: ddMaxHeight,
+        minHeight: ddMinHeight,
+        ...(ddFlipUp
+          ? { bottom: Math.round(window.innerHeight - ddRect.top + POPOVER_GAP) }
+          : { top: Math.round(ddRect.bottom + POPOVER_GAP) }),
+      }
+    : { position: "fixed", visibility: "hidden" };
 
   // Reset selectedIndex when dropdown mode or filter changes
   const dropdownKey = dropdownMode ? `${dropdownMode}:${commandFilter}` : "";
@@ -680,8 +721,12 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
   useEffect(() => {
     if (!attachOpen && !overflowOpen) return;
     function onDown(e: MouseEvent) {
-      if (attachOpen && attachRef.current && !attachRef.current.contains(e.target as Node)) setAttachOpen(false);
-      if (overflowOpen && overflowRef.current && !overflowRef.current.contains(e.target as Node)) setOverflowOpen(false);
+      const target = e.target as Node;
+      // Panel FIRST: portaled panels are no longer DOM descendants of the
+      // trigger container, so a click inside the menu would otherwise read as
+      // "outside" and close it before the item's handler runs.
+      if (attachOpen && !attachPanelRef.current?.contains(target) && !attachRef.current?.contains(target)) setAttachOpen(false);
+      if (overflowOpen && !overflowPanelRef.current?.contains(target) && !overflowRef.current?.contains(target)) setOverflowOpen(false);
     }
     document.addEventListener("mousedown", onDown);
     return () => document.removeEventListener("mousedown", onDown);
@@ -862,7 +907,15 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
     <div
       ref={composerRef}
       data-testid="composer-root"
-      className="border-t border-[var(--border-primary)] p-3 relative"
+      style={{ minHeight: `${CHAT_COMPOSER_BOUND}px` }}
+      /* Height budget (fix-quota-widget-clipping, define-chat-pane-below-floor-allocation):
+         the chat pane is `flex-col overflow-hidden`. Below the floor sum, height deficit is shared
+         between ChatView and the composer. Because composer-root has overflow: visible (for autocomplete
+         dropdowns), its min-height: auto would freeze it from shrinking in flexbox.
+         An explicit min-height: 72px (CHAT_COMPOSER_BOUND) and shrink allow it to participate in
+         below-floor allocation down to its bound.
+         The scrolling is delegated to `composer-card` instead — flex-column + `min-h-0` there. */
+      className="border-t border-[var(--border-primary)] p-3 relative flex flex-col shrink min-h-0 max-h-[40%]"
     >
       {/* Autocomplete dropdown — grouped by source with badges + arg hints.
           `left-3 right-3` pins BOTH composer edges, so it stays immune to the
@@ -870,12 +923,10 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
           height bound is boundary-measured though — see the hook call above
           (fix-popover-pane-bounded-height). */}
       {dropdownMode === "command" && (
-
+        <LayerPortal>
         <div
-          style={{ maxHeight: ddMaxHeight, minHeight: ddMinHeight }}
-          className={`absolute left-3 right-3 bg-[var(--bg-secondary)] border border-[var(--border-subtle)] rounded-xl overflow-y-auto shadow-lg z-10 ${
-            ddFlipUp ? "bottom-full mb-1" : "top-full mt-1"
-          }`}
+          style={ddPanelStyle}
+          className="bg-[var(--bg-secondary)] border border-[var(--border-subtle)] rounded-xl overflow-y-auto shadow-lg z-popover"
           data-testid="command-dropdown"
         >
           {filteredCommands.map((cmd, i) => {
@@ -911,16 +962,16 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
             );
           })}
         </div>
+        </LayerPortal>
       )}
 
-      {/* File/mention dropdown — same `left-3 right-3` dual-edge pin as the
-          command dropdown → structurally immune to the container clip. */}
+      {/* File/mention dropdown — same composer-edge span + flip as the command
+          dropdown, now portaled to escape the chat column's overflow clip. */}
       {dropdownMode === "file" && (
+        <LayerPortal>
         <div
-          style={{ maxHeight: ddMaxHeight, minHeight: ddMinHeight }}
-          className={`absolute left-3 right-3 bg-[var(--bg-secondary)] border border-[var(--border-subtle)] rounded-xl overflow-y-auto shadow-lg z-10 ${
-            ddFlipUp ? "bottom-full mb-1" : "top-full mt-1"
-          }`}
+          style={ddPanelStyle}
+          className="bg-[var(--bg-secondary)] border border-[var(--border-subtle)] rounded-xl overflow-y-auto shadow-lg z-popover"
         >
           {fileItems.map((file, i) => {
             const name = file.path.split("/").pop() ?? file.path;
@@ -961,6 +1012,7 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
             );
           })}
         </div>
+        </LayerPortal>
       )}
 
       {/* Hidden file input for the ＋ attach-image entry (same path as paste). */}
@@ -980,7 +1032,10 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
       {/* One unified bordered card: attachments → textarea → inner toolbar. */}
       <div
         data-testid="composer-card"
-        className={`@container bg-[var(--bg-tertiary)] border rounded-xl px-2.5 pt-2 pb-1.5 transition-colors ${
+        /* `min-h-0 overflow-y-auto`: absorbs the pane's height deficit by scrolling
+           its own content, so the composer honours its `max-h-[40%]` bound without
+           clipping the rows below it. See change: fix-quota-widget-clipping. */
+        className={`@container min-h-0 overflow-y-auto bg-[var(--bg-tertiary)] border rounded-xl px-2.5 pt-2 pb-1.5 transition-colors ${
           focused ? "border-[color-mix(in_srgb,var(--accent-primary)_60%,transparent)]" : "border-[var(--border-secondary)]"
         }`}
       >
@@ -1033,18 +1088,30 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
             >
               <Icon path={mdiPlus} size={0.85} />
             </button>
-            {/* Attach menu (fix-popover-container-clip): CONVERTED to a
-                boundary-aware hook consumer — a clip reproduced in a 25%-floor
-                split pane (222px < the 224px `w-56` menu). Horizontal anchor +
-                `maxWidth` come from `usePopoverFlip` against the chat pane;
-                `bottom-full` stays hardcoded (composer sits at the pane
-                bottom). */}
+            {/* Attach menu: portaled to the layer root (escapes the composer's
+                stacking context + the chat column's overflow clip) and placed
+                `fixed` from the trigger rect — up from the button, anchored to
+                the side `usePopoverFlip` chose, width capped by `maxWidth`.
+                See change: portal-composer-action-popovers (was
+                fix-popover-container-clip's inline hook consumer). */}
             {attachOpen && (
+              <LayerPortal>
               <div
-                style={{ maxWidth: attachMaxWidth }}
-                className={`absolute bottom-full mb-2 w-56 max-w-full bg-[var(--bg-secondary)] border border-[var(--border-subtle)] rounded-xl overflow-hidden shadow-lg z-20 ${
-                  attachAnchorRight ? "right-0" : "left-0"
-                }`}
+                ref={attachPanelRef}
+                style={{
+                  position: "fixed",
+                  width: Math.min(224, attachMaxWidth), // w-56, pane-capped
+                  visibility: attachRect ? "visible" : "hidden",
+                  ...(attachRect
+                    ? { bottom: Math.round(window.innerHeight - attachRect.top + POPOVER_GAP) }
+                    : {}),
+                  ...(attachRect
+                    ? attachAnchorRight
+                      ? { right: Math.max(0, Math.round(window.innerWidth - attachRect.right)) }
+                      : { left: Math.round(attachRect.left) }
+                    : {}),
+                }}
+                className="bg-[var(--bg-secondary)] border border-[var(--border-subtle)] rounded-xl overflow-hidden shadow-lg z-popover"
                 role="menu"
                 data-testid="attach-menu"
               >
@@ -1061,6 +1128,7 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
                   <span className="ml-auto text-[10px] text-[var(--text-muted)]">/view</span>
                 </button>
               </div>
+              </LayerPortal>
             )}
           </div>
 
@@ -1095,17 +1163,29 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
               aria-haspopup="menu"
               aria-expanded={overflowOpen}
               data-testid="overflow-button"
+              ref={overflowBtnRef}
             >
               <Icon path={mdiDotsHorizontal} size={0.7} />
             </button>
-            {/* Overflow (⋯) menu (fix-popover-container-clip audit): hardcoded
-                `bottom-full`, NOT a usePopoverFlip consumer. `right-0` anchors
-                at the far-right ⋯ button and extends leftward into the composer
-                — it grows toward pane-center, never past the offset pane's right
-                edge — so no container clip reproduces; stays no-clamp. */}
+            {/* Overflow (⋯) menu: portaled, placed `fixed` from the trigger
+                rect — up from and right-anchored to the far-right ⋯ button.
+                See change: portal-composer-action-popovers (was an inline
+                `absolute right-0 bottom-full` surface). */}
             {overflowOpen && (
+              <LayerPortal>
               <div
-                className="absolute right-0 bottom-full mb-2 flex flex-col gap-2 p-2 bg-[var(--bg-secondary)] border border-[var(--border-subtle)] rounded-xl shadow-lg z-20"
+                ref={overflowPanelRef}
+                style={{
+                  position: "fixed",
+                  visibility: overflowRect ? "visible" : "hidden",
+                  ...(overflowRect
+                    ? {
+                        bottom: Math.round(window.innerHeight - overflowRect.top + POPOVER_GAP),
+                        right: Math.max(0, Math.round(window.innerWidth - overflowRect.right)),
+                      }
+                    : {}),
+                }}
+                className="flex flex-col gap-2 p-2 bg-[var(--bg-secondary)] border border-[var(--border-subtle)] rounded-xl shadow-lg z-popover"
                 role="menu"
                 data-testid="overflow-menu"
               >
@@ -1113,6 +1193,7 @@ export function CommandInput({ commands: externalCommands, onSend, onListFiles, 
                 {deliveryControl}
                 {terminalButton}
               </div>
+              </LayerPortal>
             )}
           </div>
 

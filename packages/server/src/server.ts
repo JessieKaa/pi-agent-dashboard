@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
-import { createServerPluginContext, discoverPlugins, getPluginStatusStore, loadServerEntries, pluginSpawnToSessionOptions, refreshRequirementProbesFor } from "@blackbelt-technology/dashboard-plugin-runtime/server";
+import { createIsPiExtensionInstalled, createServerPluginContext, discoverPlugins, getPluginStatusStore, getWsRouteRegistry, loadServerEntries, pluginSpawnToSessionOptions, redactPluginConfigForClient, refreshRequirementProbesFor, resolvePluginEnabled } from "@blackbelt-technology/dashboard-plugin-runtime/server";
 import type { ExitIntent } from "@blackbelt-technology/pi-dashboard-shared/boot-state.js";
 import { isRecoveryAllowed } from "@blackbelt-technology/pi-dashboard-shared/boot-state.js";
 import { findBundledExtension, registerBridgeExtension } from "@blackbelt-technology/pi-dashboard-shared/bridge-register.js";
@@ -21,51 +21,82 @@ import {
   registerAllPluginBridges,
 } from "@blackbelt-technology/pi-dashboard-shared/plugin-bridge-register.js";
 import { RECOVERY_REATTACH_GRACE_MS } from "@blackbelt-technology/pi-dashboard-shared/recovery-timing.js";
-import { isRecoveryCandidate, mergeSessionMeta } from "@blackbelt-technology/pi-dashboard-shared/session-meta.js";
+import { isRecoveryCandidate, mergeSessionMeta, type SessionMeta } from "@blackbelt-technology/pi-dashboard-shared/session-meta.js";
 import { getDefaultRegistry } from "@blackbelt-technology/pi-dashboard-shared/tool-registry/index.js";
 import type { DashboardSession } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import compress from "@fastify/compress";
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
+import rateLimit from "@fastify/rate-limit";
 import Fastify from "fastify";
 import { createFitWorkerPool } from "./attachments/fit-worker-pool.js";
 import { registerAuthPlugin, validateWsUpgrade } from "./auth/auth-plugin.js";
 import { registerBearerAuth } from "./auth/bearer-auth.js";
+import { createRouteTierGate } from "./auth/route-tier-gate.js";
 import {
   computeBindReachability,
   formatBindReachabilityWarning,
   initBindReachability,
 } from "./auth/bind-reachability-service.js";
 import { decideBridgeTicketMint } from "./auth/bridge-ticket-eligibility.js";
-import { isCorsOriginAllowed } from "./auth/cors-origin.js";
+import {
+  type CorsOriginOptions,
+  isCorsOriginAllowed,
+  isPluginWsOriginAdmitted,
+  isWsOriginTrusted,
+  sanitizeHeaderForLog,
+} from "./auth/cors-origin.js";
 import { registerCsp, resolveCspMode } from "./auth/csp.js";
+import {
+  createHostGate,
+  evaluateHostGate,
+  type HostGateContext,
+  HostGateState,
+  hostGateEnvWarning,
+  resolveHostGateMode,
+} from "./auth/host-gate.js";
 import { ensureServerIdentity } from "./auth/identity.js";
 import { ensureLocalToken, verifyLocalToken } from "./auth/local-token.js";
-import { createNetworkGuard, isBypassedHost, isGenuinelyLocal } from "./auth/localhost-guard.js";
+import {
+  createNetworkGuard,
+  isBypassedHost,
+  isGenuinelyLocal,
+  isPluginScopePeerLocal,
+} from "./auth/localhost-guard.js";
+import { createMutationOriginGate } from "./auth/mutation-origin-gate.js";
 import { readAuthJson } from "./auth/provider-auth-storage.js";
 import { mintSpawnToken } from "./auth/spawn-token.js";
-import { extractTicket, routeScopeForUrl, type WsRouteScope, WsTicketStore } from "./auth/ws-ticket.js";
+import {
+  type CoreWsRouteScope,
+  extractTicket,
+  isCoreWsRouteScope,
+  routeScopeForUrl,
+  setPluginScopeResolver,
+  type WsRouteScope,
+  WsTicketStore,
+} from "./auth/ws-ticket.js";
 import {
   buildDispatchReloadContext,
+  forceKillSession,
   type ReloadHostContext,
   respawnForRuntimeSwap,
 } from "./browser-handlers/session-action-handler.js";
+import { runLifecycleAction } from "./browser-handlers/session-lifecycle.js";
 import { createCommitDraftRelay } from "./commit-draft-relay.js";
 import { writeConfigPartial } from "./config-api.js";
-import { liveCorsAllowedOrigins, liveTrustedNetworks } from "./config-snapshot.js";
+import {
+  liveAllowedHosts,
+  liveCorsAllowedOrigins,
+  liveHostGateMode,
+  livePublicBaseUrls,
+  liveTrustedNetworks,
+} from "./config-snapshot.js";
 // pending-load-manager removed — server loads sessions directly via DirectoryService
 import { createDirectoryService, type DirectoryService } from "./directory-service.js";
 import { createEmbedLifecycleController } from "./embed-lifecycle/embed-lifecycle-controller.js";
 import { wireEvents } from "./event-wiring.js";
 import { createFileWatchManager } from "./file-watch-manager.js";
 import { createWorktreeInitRegistry } from "./git-worktree/worktree-init-registry.js";
-import { decorateGoalsWithSpend } from "./goal/decorate-goals-spend.js";
-import { decideBudgetHalt } from "./goal/goal-budget-guard.js";
-import { buildGoalReprime, primeGoalSession } from "./goal/goal-session-primer.js";
-import { createGoalStatusProjector } from "./goal/goal-status-projector.js";
-import { createGoalStore } from "./goal/goal-store.js";
-import { createGoalSupervisor, type GoalDriverSpawnRequest, type GoalSupervisor } from "./goal/goal-supervisor.js";
-import { createGoalVerdictAccumulator } from "./goal/goal-verdict-accumulator.js";
 import { type ResolvedClientDist, resolveClientDist } from "./lib/client-dist.js";
 import { bootParentPid, isBootParentProvablyDead } from "./lifecycle/boot-parent-liveness.js";
 import { runBoundedStartup } from "./lifecycle/bounded-startup.js";
@@ -84,24 +115,24 @@ import { PackageManagerWrapper } from "./package/package-manager-wrapper.js";
 import { type BrowserGateway, createBrowserGateway } from "./pairing/browser-gateway.js";
 import { PairedDeviceRegistry } from "./pairing/paired-devices.js";
 import { PairingManager } from "./pairing/pairing.js";
+import { createPendingArchiveIntentRegistry } from "./pending/pending-archive-intent-registry.js";
 import { createPendingAttachRegistry } from "./pending/pending-attach-registry.js";
-import { createPendingAutomationRunRegistry } from "./pending/pending-automation-run-registry.js";
 import { createPendingClientCorrelations } from "./pending/pending-client-correlations.js";
-import { createPendingForkRegistry, type PendingForkRegistry } from "./pending/pending-fork-registry.js";
-import { createPendingGoalLinkRegistry } from "./pending/pending-goal-link-registry.js";
+import { createPendingForkRegistry } from "./pending/pending-fork-registry.js";
 import { createPendingInitialPromptRegistry } from "./pending/pending-initial-prompt-registry.js";
+import { createPendingPluginRefRegistry } from "./pending/pending-plugin-ref-registry.js";
 import { createPendingPromptAcks } from "./pending/pending-prompt-acks.js";
 import { createPendingResumeIntentRegistry } from "./pending/pending-resume-intent-registry.js";
 import { createPendingWorktreeBaseRegistry } from "./pending/pending-worktree-base-registry.js";
 import { recordExitIntent, resolveExitIntent, stampBootStart } from "./persistence/boot-state.js";
-import { createMemoryEventStore, DEFAULT_MAX_EVENT_DATA_SIZE, type EventStore } from "./persistence/memory-event-store.js";
+import { createMemoryEventStore, DEFAULT_MAX_EVENT_DATA_SIZE, DEFAULT_MAX_STRING_SIZE, type EventStore } from "./persistence/memory-event-store.js";
 import { createMetaPersistence, type MetaPersistence } from "./persistence/meta-persistence.js";
 import { migrateCustomEntryFallbackOverrides } from "./persistence/migrate-custom-entry-fallback.js";
 import { needsMigration, runMigration } from "./persistence/migrate-persistence.js";
 import { createPreferencesStore, type PreferencesStore } from "./persistence/preferences-store.js";
 import { PiCoreChecker } from "./pi/pi-core-checker.js";
 import { PiCoreUpdater } from "./pi/pi-core-updater.js";
-import { createPiGateway, type PiGateway } from "./pi/pi-gateway.js";
+import { createPiGateway } from "./pi/pi-gateway.js";
 import { pluginIntentCache } from "./plugin-intent-cache.js";
 import { registerAttachmentRoutes } from "./routes/attachment-routes.js";
 import { registerCanvasTypesRoutes } from "./routes/canvas-types-routes.js";
@@ -109,8 +140,8 @@ import { registerCustomEventGroupsRoutes } from "./routes/custom-event-groups-ro
 import { registerDoctorRoutes } from "./routes/doctor-routes.js";
 import { registerFileRoutes } from "./routes/file-routes.js";
 import { registerGitRoutes } from "./routes/git-routes.js";
-import { registerGoalRoutes } from "./routes/goal-routes.js";
 import { registerGrepRoutes } from "./routes/grep-routes.js";
+import { registerHostGateRoutes } from "./routes/host-gate-routes.js";
 import { registerKnownServersRoutes } from "./routes/known-servers-routes.js";
 import { registerLiveServerRoutes } from "./routes/live-server-routes.js";
 import { registerManifestRoute } from "./routes/manifest-route.js";
@@ -144,6 +175,7 @@ import {
   dispatchReload as dispatchReloadRaw,
   reloadTargetSessionIds,
 } from "./rpc-keeper/dispatch-reload.js";
+import { createArchiveSweeper } from "./session/archive-sweeper.js";
 import { CustomEventGroupMatcher } from "./session/custom-event-group-matcher.js";
 import { CustomEventGroupResolver } from "./session/custom-event-group-resolver.js";
 import { deriveEndedAt } from "./session/derive-ended-at.js";
@@ -153,6 +185,7 @@ import { reconcileSessionOrder } from "./session/reconcile-session-order.js";
 import { createRemoteTranscriptStore } from "./session/remote-transcript-store.js";
 import { resolveOrderKey } from "./session/resolve-order-key.js";
 import { registerSessionApi } from "./session/session-api.js";
+import { createSessionArchive } from "./session/session-archive.js";
 import { discoverAndBroadcastSessions } from "./session/session-bootstrap.js";
 import { createSessionOrderManager, type SessionOrderManager } from "./session/session-order-manager.js";
 import { scanAllSessions } from "./session/session-scanner.js";
@@ -163,8 +196,8 @@ import { createIdleTimer } from "./spawn-process/idle-timer.js";
 import { getKeeperManager, setCwdPolicyRegistry, spawnPiSession } from "./spawn-process/process-manager.js";
 import { removePid, writePid } from "./spawn-process/server-pid.js";
 import { armSpawnWatchdog } from "./spawn-process/spawn-register-watchdog.js";
-import { createTerminalGateway, type TerminalGateway } from "./terminal/terminal-gateway.js";
-import { createTerminalManager, deriveTranscriptCapBytes, type TerminalManager } from "./terminal/terminal-manager.js";
+import { createTerminalGateway } from "./terminal/terminal-gateway.js";
+import { createTerminalManager, deriveTranscriptCapBytes } from "./terminal/terminal-manager.js";
 import { cleanupStaleZrok, createTunnel, deleteTunnel, detectZrokBinary, ensureReservedName, getTunnelUrl, liveTunnelOrigins, scavengeOrphanZrokProcesses } from "./tunnel/tunnel.js";
 import { startTunnelWatchdog, stopTunnelWatchdog } from "./tunnel/tunnel-watchdog.js";
 
@@ -255,6 +288,13 @@ export interface ServerConfig {
   resolvedTrustedNetworks?: string[];
   /** CORS allowed origins from config */
   corsAllowedOrigins?: string[];
+  /**
+   * @internal Test/observability only: invoked for every route as Fastify
+   * registers it (before `listen`), so the MCP manifest completeness test can
+   * enumerate the route set R exactly as it boots. Additive; no runtime effect.
+   * See change: expand-mcp-tiered-surface (D6).
+   */
+  onRoute?: (route: { method: string | string[]; url: string }) => void;
 }
 
 export interface DashboardServer {
@@ -412,8 +452,30 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       return urls;
     },
   });
-  const sessionManager = createMemorySessionManager();
+  // Order manager FIRST: the session registry's snapshot window reads the
+  // persisted orders through it (buildSnapshot/endedSequence), so the
+  // registry takes it as a collaborator. Same underlying PreferencesStore
+  // the handlers mutate through, so both views stay live.
+  // See change: fix-connect-snapshot-frame-loss (D4).
+  const sessionOrderManager = createSessionOrderManager(preferencesStore);
+  const sessionManager = createMemorySessionManager(undefined, sessionOrderManager);
   const metaPersistence = createMetaPersistence();
+  // Archive index + one-shot idle-alive archive intents. The index is seeded
+  // from the boot scan below; its broadcast emitter is wired after the browser
+  // gateway exists. See change: archive-sessions-lazy-load.
+  // ONE retention store, shared by the write half (`transcript_chunk` frames
+  // land here), the read route, and remote-origin hydration. Two instances
+  // would be two views of the same directory and would drift the moment either
+  // grew per-instance state. Constructed here — ahead of the browser gateway —
+  // because hydration needs it. See change: serve-retained-remote-transcripts.
+  const remoteTranscriptStore = createRemoteTranscriptStore();
+
+  const sessionArchive = createSessionArchive({
+    sessionManager,
+    metaPersistence,
+    getPinnedDirs: () => preferencesStore.getPinnedDirectories(),
+  });
+  const pendingArchiveIntents = createPendingArchiveIntentRegistry();
   // Stable per-boot id stamped into the liveness marker so cold start can
   // attribute a `live:true` sidecar to a specific server run. A new value
   // each createServer() call is sufficient — the classifier needs
@@ -427,7 +489,6 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
   // intent that ended the boot which owned it.
   // See change: fix-recovery-exit-intent.
   stampBootStart(liveEpoch);
-  const sessionOrderManager = createSessionOrderManager(preferencesStore);
   const pendingForkRegistry = createPendingForkRegistry();
   // Maps spawnToken → originating browser requestId. Surfaced as
   // session_added.spawnRequestId so the client can auto-select / dismiss
@@ -444,7 +505,20 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
   const worktreeInitRegistry = createWorktreeInitRegistry();
 
   // Restore sessions from per-session .meta.json files (scans ~/.pi/agent/sessions/)
+  const scanStartedAt = Date.now();
   const scanResult = scanAllSessions();
+  const scanMs = Date.now() - scanStartedAt;
+  // Seed the archive index from the boot scan: migrated + already-archived
+  // rows are indexed, never restored. The one-shot ended+hidden migration and
+  // the scan-time age archive already ran inside the scan (no eviction frames).
+  // See change: archive-sessions-lazy-load.
+  sessionArchive.seed(scanResult.archived);
+  if (scanResult.archived.length > 0 || scanResult.migrated > 0 || scanResult.agedOut > 0) {
+    console.info(
+      `[dashboard] archive: ${scanResult.archived.length} indexed, ` +
+        `${scanResult.migrated} migrated, ${scanResult.agedOut} aged-out (${scanMs} ms)`,
+    );
+  }
   // Interrupted-session recovery candidates discovered on cold start. A
   // candidate (`live===true && status!=="ended"`, see isRecoveryCandidate)
   // was running when the host died. Candidates are NORMALIZED to `ended` on
@@ -469,7 +543,7 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       live: session.live,
       status: session.status,
       closedReason: session.closedReason,
-      kind: session.kind,
+      recover: session.recover,
     });
     const candidate = diskCandidate && isRecoveryAllowed(ownerIntent);
     if (diskCandidate && !candidate) {
@@ -690,11 +764,12 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
   // hook to write .meta.json#gitWorktreeBase.
   // See change: add-worktree-spawn-dialog.
   const pendingWorktreeBaseRegistry = createPendingWorktreeBaseRegistry();
-  // Pending automation-run stamps (cwd → { name, runId, visibility }).
-  // Populated by the automation-plugin spawn hook, consumed by event-wiring's
-  // session_register hook to stamp kind="automation" + automationRun.
-  // See change: add-automation-plugin.
-  const pendingAutomationRunRegistry = createPendingAutomationRunRegistry();
+  // Unified token-keyed session-ownership store (spawnToken → pluginRef).
+  // Replaces the two per-feature clones (automation-run + goal-link). Filed
+  // before the spawn await; resolved on register, promoted onto the linked
+  // headlessPidRegistry entry, and its owner notified.
+  // See change: detach-automation-goal-from-core.
+  const pendingPluginRefRegistry = createPendingPluginRefRegistry();
   // Pending user-initiated resume intents (sessionId → timestamp).
   // Consumed by `sessionManager.onChange` in the ended→alive branch to
   // gate the sessionOrder mutation behind explicit user intent so that
@@ -713,17 +788,6 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
   // the latter can join `groupId` into every `OpenSpecChange` it produces.
   // See change: add-openspec-change-grouping (task 4.2).
   const openspecGroupStore = createOpenSpecGroupStore();
-
-  // Folder-scoped goal store + pending-link registry. The store owns durable
-  // GoalRecords (objective, criteria, linked sessions); the pending registry
-  // correlates spawn-from-goal sessions to their goalId at session_register.
-  // See change: add-goals-folder-page.
-  const goalStore = createGoalStore();
-  const pendingGoalLinkRegistry = createPendingGoalLinkRegistry();
-  // Goal session supervisor (main-server; owns GoalStore). Assigned below once
-  // browserGateway/spawn deps exist, then rides `dispatchPluginSessionEnded`.
-  // See change: add-goal-session-supervisor.
-  let goalSupervisor: GoalSupervisor | undefined;
 
   // Process-local instrumentation for session hydration. The same instance is
   // shared with the directory-service (records per `loadSessionEvents`) and the
@@ -841,6 +905,21 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       // Windows has, since it gets no unix socket (D6, task 5.3).
       verifyLocalToken: (headers) => verifyLocalToken(headers, localToken),
     },
+    // Bridge-silence verdict. The browser cannot observe silence itself — it
+    // receives `processMetrics` once, in the connect snapshot, and nothing
+    // refreshes it — so the server derives the state and pushes it on a
+    // TRANSITION only. A healthy session still costs zero frames.
+    // See change: fix-false-unresponsive-badge.
+    onHostPressure: (sessionId, hostPressure) => {
+      const session = sessionManager.get(sessionId);
+      if (!session || session.status === "ended") return;
+      sessionManager.update(sessionId, { hostPressure });
+      browserGateway.broadcastToAll({
+        type: "session_updated",
+        sessionId,
+        updates: { hostPressure },
+      });
+    },
   });
 
   // Relay for AI-drafted commit messages (bridge fork-subagent ↔ HTTP).
@@ -905,7 +984,25 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
   // Live-server-preview manager (loopback dev-server allowlist + proxy).
   const liveServerManager = createLiveServerManager(preferencesStore);
 
-  const browserGateway = createBrowserGateway(sessionManager, eventStore, piGateway, undefined, pendingForkRegistry, sessionOrderManager, preferencesStore, directoryService, terminalManager, pendingDashboardSpawns, config.maxWsBufferBytes, pendingAttachRegistry, pendingInitialPromptRegistry, pendingResumeIntents, pendingClientCorrelations, pendingWorktreeBaseRegistry, metaPersistence, fitWorkerPool, config.maxReplayEvents, config.replayWindowMode);
+  const browserGateway = createBrowserGateway(sessionManager, eventStore, piGateway, undefined, pendingForkRegistry, sessionOrderManager, preferencesStore, directoryService, terminalManager, pendingDashboardSpawns, config.maxWsBufferBytes, pendingAttachRegistry, pendingInitialPromptRegistry, pendingResumeIntents, pendingClientCorrelations, pendingWorktreeBaseRegistry, metaPersistence, fitWorkerPool, config.maxReplayEvents, config.replayWindowMode, sessionArchive, pendingArchiveIntents, remoteTranscriptStore);
+  // Wire the archive broadcaster now that the gateway exists. `session_archived`
+  // carries the folder count for its own transition; restore/delete/re-key use
+  // `archived_count_updated`. See change: archive-sessions-lazy-load.
+  sessionArchive.setEmitter({
+    sessionArchived: (sessionId, cwd, count) =>
+      browserGateway.broadcastToAll({ type: "session_archived", sessionId, cwd, count }),
+    archivedCountUpdated: (cwd, count) =>
+      browserGateway.broadcastToAll({ type: "archived_count_updated", cwd, count }),
+    sessionAdded: (session) => browserGateway.broadcastSessionAdded(session),
+  });
+  // Runtime auto-archive sweeper. Started after boot discovery resolves (see
+  // the startup block below) so it never races the index seed. Reads config
+  // live each tick. See change: archive-sessions-lazy-load.
+  const archiveSweeper = createArchiveSweeper({
+    sessionManager,
+    sessionArchive,
+    isViewed: (id) => browserGateway.viewedSessionTracker.isViewedByAnyone(id),
+  });
 
   // Editor-pane changed-on-disk watch: the browser declares its open files via
   // `watch_files`; the server watches exactly those and pushes `file_changed`.
@@ -1036,6 +1133,21 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
   // death signal, even when no terminal pi event was forwarded.
   // See change: finalize-automation-run-on-session-death.
   const pluginSessionEndSubs = new Set<(sessionId: string) => void>();
+  // Plugin shutdown subscribers (ServerPluginContext.onShutdown). Dispatched
+  // in server stop() at the exact point the goal supervisor disposes today —
+  // BEFORE piGateway.stop() tears bridges down — so plugin backoff timers /
+  // supervisors are disposed before bridge-teardown deaths can reach them.
+  // See change: relocate-goal-product-to-plugin (D1-#8).
+  const pluginShutdownSubs = new Set<() => void>();
+  // Plugin session-ownership-resolution subscribers, keyed by owning plugin id
+  // so a plugin is notified ONLY for its own resolved sessions
+  // (ServerPluginContext.onSessionResolved). Fired by wireEvents on register,
+  // before first-event forwarding + pending-prompt dispatch.
+  // See change: detach-automation-goal-from-core.
+  const pluginSessionResolvedSubs = new Map<
+    string,
+    Set<(sessionId: string, pluginRef: Record<string, unknown>) => void>
+  >();
   // Host-owned cross-plugin service registry backing ServerPluginContext
   // provide/consume. One instance shared across every plugin context; the
   // loader's topological order guarantees a provider's registerPlugin runs
@@ -1061,7 +1173,16 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
   // See change: add-dashboard-mcp-server.
   pluginServiceRegistry.set(
     "host.verifyDeviceToken",
-    (token: string): string | null => pairedDeviceRegistry.verify(token),
+    (token: string): string | null => pairedDeviceRegistry.verify(token)?.id ?? null,
+  );
+  // Tier-aware service board entry (change: expand-mcp-tiered-surface, D1).
+  // A NEW key, not a signature change to the old one: `mcp-server-plugin` is
+  // published separately and may run against an older/newer host. The plugin
+  // consumes this when present and otherwise falls back to
+  // `host.verifyDeviceToken` with `tier: "operate"`.
+  pluginServiceRegistry.set(
+    "host.verifyDeviceTokenTier",
+    (token: string) => pairedDeviceRegistry.verify(token),
   );
   // Prefers the BOUND port, falls back to the CONFIGURED one.
   //
@@ -1093,122 +1214,33 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       try { h(sessionId, event); } catch (err) { console.error("[plugin-onEvent]", err); }
     }
   }
+  // Fan session deaths to plugin subscribers (ServerPluginContext.onSessionEnded)
+  // — including the goal plugin's supervisor, now the goal product's own sub.
   function dispatchPluginSessionEnded(sessionId: string): void {
-    // Ride the existing death fanout for the goal supervisor (main-server; it
-    // owns GoalStore, unlike the goal plugin). C2a: subscribe here, never
-    // reassign sessionManager.onUnregister. See change: add-goal-session-supervisor.
-    if (goalSupervisor) void goalSupervisor.onDriverDeath(sessionId);
     for (const h of pluginSessionEndSubs) {
       try { h(sessionId); } catch (err) { console.error("[plugin-onSessionEnded]", err); }
     }
   }
-
-  // Main-server consumer of goal_status snapshots: accumulates bounded judge
-  // verdict history onto the owning GoalRecord. The goal-plugin server can't
-  // reach the GoalStore, so retention lives here. Registered as a peer of the
-  // plugin's own goal_status handler (both fire via dispatchPluginPiMessage).
-  // See change: sophisticate-goal-authoring-and-control (task 2.2).
-  {
-    const accumulator = createGoalVerdictAccumulator({
-      store: goalStore,
-      lookupSession: (sessionId) => {
-        const s = sessionManager.get(sessionId);
-        return s ? { goalId: s.goalId, cwd: s.cwd } : null;
-      },
-    });
-    // Protocol message type mirrored by the goal-plugin bridge → server.
-    // Kept as a literal to avoid a server→goal-plugin package dependency.
-    const GOAL_STATUS_MESSAGE = "goal_status";
-    const arr = pluginPiHandlers.get(GOAL_STATUS_MESSAGE) ?? [];
-    arr.push((msg) => accumulator.handle(msg));
-
-    // Peer consumer: project the live snapshot onto the GoalRecord's durable
-    // status + turn fields so the board/budget survive a reload/restart.
-    // See change: persist-goal-status-and-progress.
-    const statusProjector = createGoalStatusProjector({
-      store: goalStore,
-      lookupSession: (sessionId) => {
-        const s = sessionManager.get(sessionId);
-        return s ? { goalId: s.goalId, cwd: s.cwd } : null;
-      },
-    });
-    arr.push((msg) => statusProjector.handle(msg));
-
-    // Dashboard-side budget enforcement (degraded tier): once a linked goal's
-    // live turnsUsed reaches GoalRecord.budget.maxTurns, dispatch /goal pause.
-    // Deduped per session so an already-capped loop isn't re-paused every
-    // snapshot. See change: sophisticate-goal-authoring-and-control (task 3.2).
-    const budgetPaused = new Set<string>();
-    arr.push((msg) => {
-      const m = msg as { sessionId?: string; payload?: { status?: string; turnsUsed?: unknown } };
-      if (!m.sessionId || !m.payload || typeof m.payload.status !== "string") return;
-      const sessionId = m.sessionId;
-      if (m.payload.status !== "active") {
-        budgetPaused.delete(sessionId);
-        return;
-      }
-      const turnsUsed = m.payload.turnsUsed;
-      if (typeof turnsUsed !== "number" || !Number.isFinite(turnsUsed)) return;
-      // Add to dedup set BEFORE the async lookup to close the race window.
-      // Removed again if the lookup shows no halt.
-      if (budgetPaused.has(sessionId)) return;
-      budgetPaused.add(sessionId);
-      const sess = sessionManager.get(sessionId);
-      if (!sess?.goalId || !sess.cwd) { budgetPaused.delete(sessionId); return; }
-      const cwd = sess.cwd;
-      const goalId = sess.goalId;
-      void goalStore
-        .list(cwd)
-        .then((goals) => {
-          const goal = goals.find((g) => g.id === goalId);
-          // Budget on CUMULATIVE turns (design D3): respawns accumulate onto
-          // `totalTurnsUsed`, so a fresh driver's low per-session count cannot
-          // reset/defeat the cap. Fall back to the live per-session count for a
-          // legacy record with no cumulative yet, and take the max to be robust
-          // against a projector write that lags this same snapshot.
-          // See change: add-goal-session-supervisor.
-          const cumulativeTurns = Math.max(goal?.totalTurnsUsed ?? 0, turnsUsed);
-          const decision = decideBudgetHalt(
-            { status: "active", turnsUsed: cumulativeTurns },
-            goal?.budget,
-          );
-          if (decision.halt && decision.command) {
-            piGateway.sendToSession(sessionId, { type: "send_prompt", sessionId, text: decision.command });
-          } else {
-            budgetPaused.delete(sessionId); // no halt → allow future checks
-          }
-        })
-        .catch((err) => { budgetPaused.delete(sessionId); console.warn(`[goal-budget-guard] budget check failed for ${goalId}:`, err); });
-    });
-    pluginPiHandlers.set(GOAL_STATUS_MESSAGE, arr);
+  // Notify a resolved session's OWNING plugin only. Routed by ownerId so no
+  // plugin sees another's ref. See change: detach-automation-goal-from-core.
+  function dispatchPluginSessionResolved(
+    ownerId: string,
+    sessionId: string,
+    pluginRef: Record<string, unknown>,
+  ): void {
+    const set = pluginSessionResolvedSubs.get(ownerId);
+    if (!set) return;
+    for (const h of set) {
+      try { h(sessionId, pluginRef); } catch (err) { console.error("[plugin-onSessionResolved]", err); }
+    }
   }
 
-  // Rename a session card + dispatch the goal kickoff so a goal-linked session
-  // actually pursues its objective. Shared by the spawn path (event-wiring
-  // goal-link arm) and the explicit link path (goal-routes).
-  const primeGoalSessionImpl = (
-    sessionId: string,
-    goal: { objective: string; criteria?: import("@blackbelt-technology/pi-dashboard-shared/types.js").GoalCriterion[] },
-  ): void => {
-    primeGoalSession(
-      {
-        sendPrompt: (sid, text) => piGateway.sendToSession(sid, { type: "send_prompt", sessionId: sid, text }),
-        renameSession: (sid, name) => {
-          const updates = { name: name || undefined };
-          sessionManager.update(sid, updates);
-          browserGateway.broadcastSessionUpdated(sid, updates);
-          piGateway.sendToSession(sid, { type: "rename_session", sessionId: sid, name });
-        },
-      },
-      sessionId,
-      goal,
-    );
-  };
+
 
   // Wire up event forwarding from pi gateway to browser gateway
   wireEvents({
     sessionManager,
-    remoteTranscriptStore: createRemoteTranscriptStore(),
+    remoteTranscriptStore,
     eventStore,
     fitWorkerPool,
     piGateway,
@@ -1223,10 +1255,8 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
     pendingDashboardSpawns,
     pendingAttachRegistry,
     pendingWorktreeBaseRegistry,
-    pendingAutomationRunRegistry,
-    pendingGoalLinkRegistry,
-    goalStore,
-    primeGoalSession: primeGoalSessionImpl,
+    pendingPluginRefRegistry,
+    dispatchPluginSessionResolved,
     pendingInitialPromptRegistry,
     viewedSessionTracker: browserGateway.viewedSessionTracker,
     pendingClientCorrelations,
@@ -1238,6 +1268,8 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
     liveEpoch,
     commitDraftRelay,
     customEventGroupResolver,
+    sessionArchive,
+    pendingArchiveIntents,
   });
 
   // Auto-shutdown idle timer
@@ -1263,6 +1295,26 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
     logger: false,
     keepAliveTimeout: 30_000,
     connectionTimeout: 10_000,
+  });
+
+  // Route inventory (test-only): fires as each route registers, before listen,
+  // so a caller can enumerate the full route set. See change:
+  // expand-mcp-tiered-surface (D6).
+  if (config.onRoute) {
+    const collect = config.onRoute;
+    fastify.addHook("onRoute", (route) => collect({ method: route.method, url: route.url }));
+  }
+
+  // Global rate limiter. Two jobs: a real remote-caller ceiling, and making the
+  // app recognizable to static analysis (`js/missing-rate-limiting` otherwise
+  // flags every authenticated route handler). Loopback is allow-listed so
+  // same-host callers (tests, CLI, local browser, pi sessions) are never
+  // throttled; `/mcp` keeps its own stricter per-(ip, credential) throttle.
+  await fastify.register(rateLimit, {
+    global: true,
+    max: 100_000,
+    timeWindow: "1 minute",
+    allowList: ["127.0.0.1", "::1"],
   });
 
   // Compression: gzip/deflate for HTTP responses. Critical for large client
@@ -1302,6 +1354,63 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
   //     config-override-oauth-redirect-base (D15).
   const corsAllowedOrigins = () => liveCorsAllowedOrigins(config.corsAllowedOrigins ?? []);
   const corsTrustedNetworks = () => liveTrustedNetworks(config.resolvedTrustedNetworks ?? []);
+  // Host-admission gate (issue #637, design D1/D4/D6) — the DNS-rebinding
+  // defence. Under rebinding the attacker page is SAME-ORIGIN with the
+  // dashboard, so its GETs carry no Origin and its peer is loopback: every
+  // Origin/peer gate passes. The `Host` header is the one signal left, so the
+  // gate keys on it — independently of Origin presence, OAuth, or network
+  // trust. One shared state (refusal ring + rate-limited log, D5) and one
+  // per-request context (mode resolved env-over-config, D4; every admission
+  // input read LIVE through the snapshot, D6).
+  const hostGateState = new HostGateState();
+  const hostGateBootWarning = hostGateEnvWarning(process.env.PI_DASHBOARD_HOST_GATE);
+  if (hostGateBootWarning) console.error(hostGateBootWarning);
+  const getHostGateCtx = (): HostGateContext => ({
+    admission: {
+      allowedHosts: liveAllowedHosts(),
+      publicBaseUrls: livePublicBaseUrls(),
+      configuredOrigins: corsAllowedOrigins(),
+      getLiveTunnelOrigins: liveTunnelOrigins,
+      // Boot-time bind address (a restart field, so captured once — D6). An
+      // IP bind is already covered by the IP-literal rule; this matters when
+      // the bind is a NAME.
+      bindHost: config.host,
+    },
+    ...resolveHostGateMode(process.env.PI_DASHBOARD_HOST_GATE, liveHostGateMode()),
+  });
+  /**
+   * The ONE origin-policy input, shared by the CORS plugin, the WS upgrade gate
+   * and the mutating-REST gate. Built per decision (never captured) so tunnel
+   * rotation and runtime config edits are seen identically by all three — a
+   * second, hand-mirrored options object is exactly how admission and
+   * readability drift apart. The host-admission fields ride the same object
+   * (D6 of add-host-allowlist-admission) so `isHostAdmitted` and the tightened
+   * `isSameOriginByHost` cannot drift from CORS either.
+   * See change: fix-ws-origin-cswsh (D1).
+   */
+  const corsOpts = (): CorsOriginOptions => ({
+    configuredOrigins: corsAllowedOrigins(),
+    trustedNetworks: corsTrustedNetworks(),
+    // The PRIMARY's URL, which is also what mints OAuth redirect URIs.
+    getTunnelUrl,
+    // Every OTHER live tunnel. Deliberately a separate input from
+    // `getTunnelUrl`: widening who may READ a response must never widen
+    // which single origin we mint OAuth URIs and set cookies for.
+    // See change: add-zrok-custom-reserved-name (D4).
+    getLiveTunnelOrigins: liveTunnelOrigins,
+    allowedHosts: liveAllowedHosts(),
+    publicBaseUrls: livePublicBaseUrls(),
+    bindHost: config.host,
+    // Env-over-config, resolved the SAME way as the hook (D4): a mixed state
+    // (env=report + config=enforce) must keep the Origin gate's report-only
+    // behaviour in step with the hook, else the escape hatch only half-engages.
+    hostGateMode: resolveHostGateMode(process.env.PI_DASHBOARD_HOST_GATE, liveHostGateMode()).mode,
+  });
+  // Registered BEFORE @fastify/cors so an enforced refusal carries no ACAO
+  // (and before every Origin gate — a rebinding page's plain GETs carry no
+  // Origin at all). Report-only default; `PI_DASHBOARD_HOST_GATE=enforce`
+  // or `hostGate.mode` flips it. See change: add-host-allowlist-admission (D1).
+  fastify.addHook("onRequest", createHostGate(getHostGateCtx, hostGateState, () => config.port));
   await fastify.register(cors, {
     // Decision extracted to a pure, unit-tested helper (cors-origin.ts) so the
     // security-critical allow/deny logic is tested against the REAL code, not a
@@ -1311,21 +1420,24 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
     // Error — the latter makes @fastify/cors 500 same-origin module-script
     // requests. See change: fix-remote-connect-cors-gates.
     origin: (origin, cb) => {
-      const allowed = isCorsOriginAllowed(origin ?? undefined, {
-        configuredOrigins: corsAllowedOrigins(),
-        trustedNetworks: corsTrustedNetworks(),
-        // The PRIMARY's URL, which is also what mints OAuth redirect URIs.
-        getTunnelUrl,
-        // Every OTHER live tunnel. Deliberately a separate input from
-        // `getTunnelUrl`: widening who may READ a response must never widen
-        // which single origin we mint OAuth URIs and set cookies for.
-        // See change: add-zrok-custom-reserved-name (D4).
-        getLiveTunnelOrigins: liveTunnelOrigins,
-      });
-      cb(null, allowed);
+      cb(null, isCorsOriginAllowed(origin ?? undefined, corsOpts()));
     },
     credentials: true,
   });
+  // Close the rate-limiter's log window on a timer so the `suppressed <n>`
+  // summary lands even when no further refusal arrives (D5). Unref'd: a
+  // quiet server must not be kept alive by its own log limiter; cleared in
+  // stop() so a create/stop cycle leaves nothing ticking.
+  const hostGateFlushTimer = setInterval(() => hostGateState.flush(), 60_000);
+  hostGateFlushTimer.unref();
+
+  // Cross-site MUTATION gate (issue #625). CORS stops an attacker page from
+  // READING a response; it does nothing to stop the request from happening, so
+  // a blind `fetch("/api/…", {method:"POST", mode:"no-cors"})` from any site
+  // reached every dashboard route. Registered AFTER the CORS plugin so a
+  // refused cross-site request still carries no ACAO.
+  // See change: fix-ws-origin-cswsh (D4).
+  fastify.addHook("onRequest", createMutationOriginGate(corsOpts));
 
   // Baseline CSP (defense in depth). Report-only by default (non-breaking);
   // `PI_DASHBOARD_CSP=enforce` flips to enforcing once report-only is clean.
@@ -1353,6 +1465,25 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
     fastify.get("/auth/status", async () => ({ authenticated: true, authEnabled: false }));
   }
 
+  // REST tier gate (change: expand-mcp-tiered-surface, D1b). Registered AFTER
+  // both admission hooks above (bearer-auth, then the cookie auth plugin) so
+  // `request.authVia`/`principalTier` are already set when it runs, and it
+  // reads the same live trusted-network source `networkGuard` does.
+  fastify.addHook(
+    "onRequest",
+    createRouteTierGate({
+      getTrustedNetworks: () => liveTrustedNetworks(config.resolvedTrustedNetworks ?? []),
+    }),
+  );
+
+  // Shared network guard (thunk, not a boot snapshot — D15): a CIDR added at
+  // runtime admits without a restart. Created BEFORE registerSessionApi so the
+  // new lifecycle/extension-ui routes can carry it as a preHandler.
+  const networkGuard = createNetworkGuard(
+    () => liveTrustedNetworks(config.resolvedTrustedNetworks ?? []),
+    { localToken },
+  );
+
   // Session control REST API (wraps WebSocket-only operations)
   registerSessionApi(fastify, {
     sessionManager,
@@ -1363,16 +1494,30 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
     pendingResumeIntents,
     pendingAttachRegistry,
     pendingPromptAcks,
+    sessionArchive,
+    pendingArchiveIntents,
+    networkGuard,
+    // Shared lifecycle handler (change: expand-mcp-tiered-surface, D3): the
+    // three bridge forwards plus the shared force-kill ladder.
+    handleLifecycle: (sessionId, action, extras) =>
+      runLifecycleAction(action, sessionId, {
+        piGateway,
+        forceKill: (sid) =>
+          forceKillSession(sid, {
+            sessionManager,
+            piGateway,
+            headlessPidRegistry: browserGateway.headlessPidRegistry,
+            broadcast: browserGateway.broadcastToAll,
+            metaPersistence,
+          }),
+      }, extras ?? {}),
+    getTrustedNetworks: () => liveTrustedNetworks(config.resolvedTrustedNetworks ?? []),
   });
 
   // Register route modules
   // Create network guard from merged trusted networks
   // Thunk, not a boot snapshot (D15): a CIDR added through the gateway action
   // must admit that range on the next request, with no restart.
-  const networkGuard = createNetworkGuard(
-    () => liveTrustedNetworks(config.resolvedTrustedNetworks ?? []),
-    { localToken },
-  );
 
   // ── Reload fan-out plumbing ───────────────────────────────────────────
   // Every automated reload trigger goes through the SAME ladder as the
@@ -1402,7 +1547,25 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       browserGateway.headlessPidRegistry,
     );
 
-  registerSessionRoutes(fastify, { sessionManager, eventStore, networkGuard });
+  registerSessionRoutes(fastify, {
+    sessionManager,
+    eventStore,
+    networkGuard,
+    sessionArchive,
+    remoteTranscriptStore,
+    // Transcript-sourced session diffs dispatch through the same pool the
+    // hydration path owns; `maxStringSize` is the store's cap so projected
+    // tool payloads match store-sourced ones. See change:
+    // fix-session-diff-durable-source.
+    loadWorkerPool: () => directoryService.ensureLoadWorkerPool(),
+    // The store's own parameter default resolves an unset cap to
+    // DEFAULT_MAX_STRING_SIZE; mirror it here so the transcript projection
+    // caps `args` with the SAME effective value the store used on ingest.
+    // Passing the raw `undefined` would make the projection's `?? 0` sentinel
+    // disable truncation and break payload/`truncated` parity.
+    // See change: fix-session-diff-durable-source.
+    maxStringSize: config.maxStringFieldSize ?? DEFAULT_MAX_STRING_SIZE,
+  });
   // pi retry policy editor. Reload fan-out dispatches `/reload` to every
   // connected session so a saved policy applies without a manual restart
   // (pi reads its settings only at session construction). See change:
@@ -1427,6 +1590,11 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
     networkGuard, sessionManager, browserGateway, worktreeInitRegistry,
     sendToSession: (id, msg) => piGateway.sendToSession(id, msg),
     commitDraftRelay,
+    // `removeBatchCap` is new in `DashboardConfig` (D8): a host whose shared
+    // build predates the field (a worktree dev server resolves shared through
+    // the workspace link) yields `undefined` — the route clamps to the
+    // default. The cast is dropped once the branch lands.
+    removeBatchCap: (loadConfig() as DashboardConfig & { removeBatchCap?: number }).removeBatchCap,
   });
 
   // Browser channel for worktree-init event subscriptions. The dialog
@@ -1492,144 +1660,6 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
     store: openspecGroupStore,
   });
 
-  // Folder-scoped goals: broadcast on mutation + REST surface.
-  // See change: add-goals-folder-page.
-  goalStore.subscribe((cwd, payload) => {
-    // Decorate with read-time spend so the WS path is not a raw second delivery
-    // path. See change: fix-goal-detail-turns-and-spend.
-    browserGateway.broadcastToAll({ type: "goals_update", cwd, goals: decorateGoalsWithSpend(payload.goals, sessionManager) });
-  });
-  // Stamp/clear goalId on a session: in-memory + .meta.json + broadcast.
-  const applyGoalIdToSession = (sessionId: string, goalId: string | null): void => {
-    const next = goalId ?? undefined;
-    sessionManager.update(sessionId, { goalId: next });
-    const session = sessionManager.get(sessionId);
-    if (session?.sessionFile) {
-      try {
-        mergeSessionMeta(session.sessionFile, { goalId: next });
-      } catch (err) {
-        console.warn(`[goal-routes] failed to persist goalId to .meta.json for ${sessionId}:`, err);
-      }
-    }
-    browserGateway.broadcastSessionUpdated(sessionId, { goalId: next });
-  };
-  registerGoalRoutes(fastify, {
-    sessionManager,
-    preferencesStore,
-    networkGuard,
-    store: goalStore,
-    applyGoalIdToSession,
-    primeGoalSession: primeGoalSessionImpl,
-    // Route clear/pause/delete through the supervisor (assigned just below,
-    // before the server listens). See change: add-goal-session-supervisor.
-    abortGoalSupervision: (cwd, goalId, terminal) =>
-      goalSupervisor ? goalSupervisor.abort(cwd, goalId, terminal) : Promise.resolve(),
-    spawnGoalSession: async (cwd, goalId, opts) => {
-      // PRIMARY correlation: mint the spawn token up front and stamp `goalId`
-      // onto the registry entry keyed to it, so `session_register` links via
-      // the strong token path (getGoalId). The cwd-FIFO enqueue stays only as
-      // a legacy fallback for bridges that don't echo the token.
-      // See change: add-goal-session-supervisor (Correlation).
-      const spawnToken = mintSpawnToken();
-      pendingGoalLinkRegistry.enqueue(cwd, goalId);
-      try {
-        const result = await spawnPiSession(cwd, {
-          strategy: "headless",
-          spawnToken,
-          ...(opts?.model ? { model: opts.model } : {}),
-        });
-        // REST/goal spawn has no browser socket; the reclaim must run anyway.
-        // See change: fix-duplicate-bridge-registration (D0/D2).
-        armSpawnWatchdog(cwd, "headless", result);
-        if (result.process && result.pid) {
-          browserGateway.headlessPidRegistry.register(
-            result.pid,
-            cwd,
-            result.process,
-            result.spawnToken ?? spawnToken,
-            keeperOptsFromSpawnResult(result),
-            goalId,
-          );
-        }
-        // On spawn failure, drop the goalId we just enqueued so it can't be
-        // mis-consumed by a later unrelated session in the same cwd.
-        if (!result.success) pendingGoalLinkRegistry.consume(cwd);
-        return { success: result.success, ...(result.message ? { message: result.message } : {}) };
-      } catch (err) {
-        pendingGoalLinkRegistry.consume(cwd);
-        return { success: false, message: err instanceof Error ? err.message : String(err) };
-      }
-    },
-  });
-
-  // ── Goal session supervisor ─────────────────────────────────────
-  // Rides the death fanout (dispatchPluginSessionEnded, wired above) and adds
-  // goal PURSUIT policy: progress-gated auto-respawn, crash-loop breaker,
-  // cumulative budget. Host owns the mechanism (spawn/token-correlate/kill/
-  // resume). See change: add-goal-session-supervisor.
-  const spawnGoalDriver = async (req: GoalDriverSpawnRequest): Promise<{ success: boolean; message?: string }> => {
-    // Fresh spawns re-prime with a verdict summary dispatched on register.
-    if (req.reason === "fresh" && req.reprime) {
-      pendingInitialPromptRegistry.enqueue(req.cwd, req.reprime);
-    }
-    pendingGoalLinkRegistry.enqueue(req.cwd, req.goalId);
-    try {
-      const result = await spawnPiSession(req.cwd, {
-        strategy: "headless",
-        spawnToken: req.spawnToken,
-        ...(req.reason === "resume" && req.sessionFile
-          ? { sessionFile: req.sessionFile, mode: "continue" as const }
-          : {}),
-      });
-      // REST resume — the path that minted the incident's duplicate.
-      armSpawnWatchdog(req.cwd, "headless", result);
-      if (result.process && result.pid) {
-        browserGateway.headlessPidRegistry.register(
-          result.pid,
-          req.cwd,
-          result.process,
-          result.spawnToken ?? req.spawnToken,
-          keeperOptsFromSpawnResult(result),
-          req.goalId,
-        );
-      }
-      if (!result.success) {
-        pendingGoalLinkRegistry.consume(req.cwd);
-        if (req.reason === "fresh" && req.reprime) pendingInitialPromptRegistry.consume(req.cwd);
-      }
-      return { success: result.success, ...(result.message ? { message: result.message } : {}) };
-    } catch (err) {
-      pendingGoalLinkRegistry.consume(req.cwd);
-      if (req.reason === "fresh" && req.reprime) pendingInitialPromptRegistry.consume(req.cwd);
-      return { success: false, message: err instanceof Error ? err.message : String(err) };
-    }
-  };
-  goalSupervisor = createGoalSupervisor({
-    store: goalStore,
-    isSessionLive: (sessionId) => {
-      const s = sessionManager.get(sessionId);
-      return !!s && s.status !== "ended";
-    },
-    resolveSessionFile: (sessionId) => sessionManager.get(sessionId)?.sessionFile,
-    spawnDriver: spawnGoalDriver,
-    killByToken: (token) => browserGateway.headlessPidRegistry.killByToken(token),
-    killBySession: (sessionId) => browserGateway.headlessPidRegistry.killBySessionId(sessionId),
-    buildReprime: (goal) => buildGoalReprime(goal),
-    // Respawn spawns force strategy:"headless" (spawnGoalDriver); the dashboard
-    // always spawns headless, so RPC control is available. See change:
-    // add-goal-session-supervisor (C2j).
-    headlessAvailable: () => true,
-    log: (msg, meta) => console.error(msg, meta ?? ""),
-  });
-  // Boot-time reconcile: classify any pursuing/respawning goal whose driver did
-  // not re-register after a restart. DEFERRED past a reconnect grace window so
-  // live drivers re-register first (else every restart would falsely see all
-  // drivers dead and respawn them). See change: add-goal-session-supervisor (S10).
-  const GOAL_BOOT_RECONCILE_DELAY_MS = 30_000;
-  const bootReconcileTimer = setTimeout(() => {
-    goalSupervisor?.reconcileOnBoot().catch((err) => console.error("[goal-supervisor] boot reconcile failed", err));
-  }, GOAL_BOOT_RECONCILE_DELAY_MS);
-  bootReconcileTimer.unref?.();
 
   // Embed-session-lifecycle: construct the reaper + observability metrics wired
   // to the live server components. Dormant unless config.embedLifecycle.enabled
@@ -1668,6 +1698,7 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       ? { dir: envClientDist, fromInstalledPackage: false }
       : resolveClientDist();
   registerSystemRoutes(fastify, { sessionManager, preferencesStore, metaPersistence, config, networkGuard, version: pkgVersion, directoryService, piGateway, browserGateway, hydrationMetrics, readEventLoopDelay, eventLoopSpikes, eventStore, embedLifecycle, clientDist: resolvedClientDist, keeperLogStats: { get: () => getKeeperManager().getKeeperLogStats() } });
+  registerHostGateRoutes(fastify, { getCtx: getHostGateCtx, state: hostGateState, networkGuard });
   // GET /api/doctor — see change: doctor-rich-output (task 4.2). Auth-gated identically to /api/config.
   registerDoctorRoutes(fastify);
   registerToolRoutes(fastify, { registry: getDefaultRegistry(), networkGuard });
@@ -1683,6 +1714,15 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
   // arms; Electron arm uses electron-updater whole-app replacement.
   // Package management
   const packageManagerWrapper = new PackageManagerWrapper();
+  // `isPiExtensionInstalled` capability (design D2): one shared, success-only
+  // cached probe over the UNION of global+local installed scopes — a superset
+  // of the requirement probe's global-only wiring. A scan failure rejects
+  // (never resolves false) and is never cached, so a recovered registry
+  // answers on the next call. See change: add-blackhole-session-pipeline.
+  const isPiExtensionInstalled = createIsPiExtensionInstalled({
+    listGlobal: () => packageManagerWrapper.listInstalled("global"),
+    listLocal: () => packageManagerWrapper.listInstalled("local"),
+  });
 
   // Forward progress events to all browser clients. The third arg
   // (`moveId`) is set when the event is part of a composite move op;
@@ -1695,6 +1735,14 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       event,
     } as any);
   });
+
+  // Boot-time `modelProxy.enabled`, captured once inside the Model Proxy block
+  // below. The `model-proxy` service probe reports this value, not a live
+  // `loadConfig()` read: `/v1/*` route registration is itself boot-frozen, so a
+  // config save without a restart must not move the probe. Declared here (at
+  // `createServer` scope) because the injection sites precede the block.
+  // See change: remove-pi-model-proxy-upstream-references (D1).
+  let modelProxyMounted = false;
 
   // On completion: broadcast to browsers + invalidate the recommended cache
   packageManagerWrapper.setCompleteListener((result) => {
@@ -1721,6 +1769,7 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
         null,
         {
           listInstalled: () => packageManagerWrapper.listInstalled("global"),
+          isModelProxyEnabled: () => modelProxyMounted,
         },
         (id) => getPluginConfigFromFile(loadConfig(), id) as Record<string, unknown>,
       ).then((changed) => {
@@ -1760,7 +1809,10 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
         .listSessions()
         .map((e) => ({ sessionId: e.sessionId, cwd: e.cwd })),
   });
-  registerRecommendedRoutes(fastify, { packageManagerWrapper });
+  registerRecommendedRoutes(fastify, {
+    packageManagerWrapper,
+    isModelProxyEnabled: () => modelProxyMounted,
+  });
 
   // Pi core version check + update (complements the extension package manager).
   const piCoreChecker = new PiCoreChecker();
@@ -1838,6 +1890,14 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
     identity: serverIdentity,
     pairing: pairingManager,
     registry: pairedDeviceRegistry,
+    localToken,
+    hostAdmission: () => getHostGateCtx().admission,
+    // Public (tunnel + configured public) base URLs, already TLS-gated.
+    getReachableUrls: () => pairingManager.reachableUrls(),
+    getPort: () => {
+      const addr = fastify.server.address();
+      return typeof addr === "object" && addr !== null ? addr.port : config.port;
+    },
   });
   // Mint a single-use WS ticket (D11). Authenticated (networkGuard: cookie,
   // trusted network, or Authorization: Bearer). The ticket is bound to a WS
@@ -1847,11 +1907,13 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
     { preHandler: networkGuard },
     async (request, reply) => {
       const scope = request.body?.scope;
+      // Core scopes only: a plugin-registered scope name is refused here —
+      // plugin scopes are structurally unticketable (add-browser-relay D1).
       // `bridge` is mintable by any authenticated caller (networkGuard: a
       // paired device's durable bearer, a cookie, or a trusted network). The
       // bearer authenticates this REST call and never rides the socket
       // (task 6.2/6.4).
-      if (scope !== "browser" && scope !== "terminal" && scope !== "live" && scope !== "bridge") {
+      if (typeof scope !== "string" || !isCoreWsRouteScope(scope)) {
         reply.code(400);
         return { success: false as const, error: "invalid scope" };
       }
@@ -1911,6 +1973,7 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
   // ── Model Proxy ───────────────────────────────────────────────────
   {
     const fullCfg = loadConfig();
+    modelProxyMounted = fullCfg.modelProxy.enabled;
     if (fullCfg.modelProxy.enabled) {
       // Register proxy auth gate (runs BEFORE JWT hook for /v1/* routes)
       const proxyAuthGate = createModelProxyAuthGate({
@@ -2090,6 +2153,9 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
         deadlineMs: opts.deadlineMs ?? null,
         core: () => server._startCore(),
         teardown: async () => {
+          // Disarm the host-gate rate-limiter window flush (created unref'd
+          // below) so a failed/aborted startup leaves nothing ticking.
+          clearInterval(hostGateFlushTimer);
           // Gateway FIRST — it is the port bound earliest and the one the
           // captured zombie held. `stop()` also clears `pingTimer`, which is
           // what actually lets the process exit.
@@ -2220,15 +2286,27 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       // register routes. Fastify rejects route registration after listen().
       // Failure-isolated per-plugin via loader; awaited so all routes are
       // mounted before requests can arrive.
+      //
+      // Plugin-owned WS routes (change: add-browser-relay D1): the runtime
+      // registry resolves plugin scopes inside routeScopeForUrl, AFTER the
+      // four core prefixes. Wired BEFORE loadServerEntries so a plugin
+      // registering during its activation is immediately routable.
+      const wsRouteRegistry = getWsRouteRegistry();
+      setPluginScopeResolver((path) => wsRouteRegistry.resolveScope(path));
       try {
         await loadServerEntries({
           isEnabled: (pluginId) => {
             const cfg = loadConfig();
             const pluginCfg = getPluginConfigFromFile(cfg, pluginId) as Record<string, unknown>;
-            return pluginCfg.enabled !== false;
+            // defaultEnabled (add-browser-relay GAP B): an explicit config
+            // `enabled` wins; else the manifest default (false = opt-in
+            // plugin, e.g. `browser`); else the historical default-allow.
+            const manifest = discoverPlugins().find((p) => p.manifest.id === pluginId)?.manifest;
+            return resolvePluginEnabled(pluginCfg, manifest?.defaultEnabled);
           },
           requirementDeps: {
             listInstalled: () => packageManagerWrapper.listInstalled("global"),
+            isModelProxyEnabled: () => modelProxyMounted,
           },
           // Supplies the validated config a `requires.paths` ${configKey}
           // placeholder resolves against. See change: add-apple-tools-imcp-plugin.
@@ -2237,6 +2315,7 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
           createContext: (plugin) => createServerPluginContext(
             {
               fastify,
+              isPiExtensionInstalled,
               sessionManager: {
                 listActive: () => sessionManager.listActive(),
                 listAll: () => sessionManager.listAll(),
@@ -2277,6 +2356,16 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
                 pluginSessionEndSubs.add(handler);
                 return () => pluginSessionEndSubs.delete(handler);
               },
+              onSessionResolved: (handler) => {
+                const id = plugin.manifest.id;
+                let set = pluginSessionResolvedSubs.get(id);
+                if (!set) {
+                  set = new Set();
+                  pluginSessionResolvedSubs.set(id, set);
+                }
+                set.add(handler);
+                return () => set.delete(handler);
+              },
               sendToSession: (sessionId, text) =>
                 piGateway.sendToSession(sessionId, { type: "send_prompt", sessionId, text }),
               // Session-spawn hook. Gated to first-party/trusted plugins
@@ -2288,7 +2377,7 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
                   return { success: false, message: `spawn not permitted for plugin "${plugin.manifest.id}"` };
                 }
                 // Validate the untrusted root options object BEFORE mapping or
-                // dereferencing `opts.automationRun`/`opts.cwd`. A JS plugin can
+                // dereferencing `opts.pluginRef`/`opts.cwd`. A JS plugin can
                 // call `spawnSession(null)` or omit `cwd`; reject both with a
                 // structured result instead of throwing.
                 if (typeof opts !== "object" || opts === null) {
@@ -2297,16 +2386,51 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
                 if (typeof opts.cwd !== "string" || opts.cwd.length === 0) {
                   return { success: false, message: "spawn options require a non-empty cwd" };
                 }
-                // Map plugin-facing options to session options BEFORE the
-                // enqueue below. The mapper is total (never throws) and
-                // sanitizes untrusted plugin input; calling it first closes the
-                // window where a mapping failure could strand a stale
-                // `automationRun` stamp keyed by `cwd`. See change:
+                // Map plugin-facing options to session options BEFORE filing
+                // the ref below. The mapper is total (never throws) and
+                // sanitizes untrusted plugin input. See change:
                 // add-plugin-spawn-scope (D7).
                 const sessionOptions = pluginSpawnToSessionOptions(opts);
-                if (opts.automationRun) {
-                  pendingAutomationRunRegistry.enqueue(opts.cwd, opts.automationRun);
+                // Honour a caller-supplied spawn token VERBATIM (trusted-only
+                // — this code only runs past the trusted gate). A token
+                // already pending for ANY owner is rejected via the
+                // non-destructive `has()` probe, leaving the prior owner's
+                // entry untouched. Otherwise mint up front so the ownership
+                // ref is filed against it BEFORE the `spawnPiSession` await
+                // (unchanged), closing the register-in-the-gap miss. See
+                // change: detach-automation-goal-from-core,
+                // relocate-goal-product-to-plugin (D1-#1).
+                const requested = typeof opts.spawnToken === "string" ? opts.spawnToken : "";
+                if (requested?.includes("\0")) {
+                  // A NUL cannot survive argv/registry round-trips — honouring
+                  // "used verbatim" means refusing, not silently re-minting a
+                  // token the caller's persisted state would never match.
+                  return { success: false, message: "spawnToken must not contain NUL" };
                 }
+                const spawnToken = requested || mintSpawnToken();
+                if (requested && pendingPluginRefRegistry.has(spawnToken)) {
+                  return {
+                    success: false,
+                    message: `spawnToken "${spawnToken}" is already pending for another spawn`,
+                  };
+                }
+                pendingPluginRefRegistry.file(
+                  spawnToken,
+                  opts.pluginRef,
+                  plugin.manifest.id,
+                  opts.lifecycle,
+                );
+                // Fresh-spawn reprime rides the per-cwd pending-initial-prompt
+                // FIFO exactly as core's own respawn path does: enqueue BEFORE
+                // the spawn await, consume on failure/throw so a dead spawn
+                // leaves no stale intent for an unrelated later register in
+                // the same cwd. See change:
+                // relocate-goal-product-to-plugin (D1-#3).
+                const initialPrompt =
+                  typeof opts.initialPrompt === "string" && opts.initialPrompt.length > 0
+                    ? opts.initialPrompt
+                    : undefined;
+                if (initialPrompt) pendingInitialPromptRegistry.enqueue(opts.cwd, initialPrompt);
                 // mode/sandbox threading (change: redesign-automation-editor-and-board).
                 // DOCUMENTED LIMITATION (task 4.2): the host hook does not yet
                 // enforce these. `worktree` would need ephemeral worktree
@@ -2321,7 +2445,7 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
                   );
                 }
                 try {
-                  const result = await spawnPiSession(opts.cwd, sessionOptions);
+                  const result = await spawnPiSession(opts.cwd, { ...sessionOptions, spawnToken });
                   // Plugin/automation spawn: transport-less, reclaim required.
                   armSpawnWatchdog(opts.cwd, "headless", result);
                   if (result.process && result.pid) {
@@ -2329,16 +2453,25 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
                       result.pid,
                       opts.cwd,
                       result.process,
-                      result.spawnToken,
+                      result.spawnToken ?? spawnToken,
                       keeperOptsFromSpawnResult(result),
                     );
+                  }
+                  // Token-keyed, idempotent rollback on failure so no later
+                  // session resolves a stale ref; the queued initial prompt
+                  // is consumed with it.
+                  if (!result.success) {
+                    pendingPluginRefRegistry.remove(spawnToken);
+                    if (initialPrompt) pendingInitialPromptRegistry.consume(opts.cwd);
                   }
                   return {
                     success: result.success,
                     message: result.message,
-                    ...(result.spawnToken ? { spawnToken: result.spawnToken } : {}),
+                    ...(result.spawnToken ? { spawnToken: result.spawnToken } : { spawnToken }),
                   };
                 } catch (err) {
+                  pendingPluginRefRegistry.remove(spawnToken);
+                  if (initialPrompt) pendingInitialPromptRegistry.consume(opts.cwd);
                   return { success: false, message: err instanceof Error ? err.message : String(err) };
                 }
               },
@@ -2394,6 +2527,87 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
                 if (!trusted) return;
                 cwdPolicyRegistry.unregister(plugin.manifest.id, cwd);
               },
+              // Mint a fresh spawn-correlation token for a caller that must
+              // KNOW it before spawnSession (persisting it as crash-recovery
+              // state). Trusted-gated: an untrusted plugin's spawns are
+              // rejected anyway, so a minter would only widen the surface —
+              // its hook THROWS instead. See change:
+              // relocate-goal-product-to-plugin (D1-#1).
+              mintSpawnToken: () => {
+                const trusted = (plugin.manifest.priority ?? 1000) <= 100;
+                if (!trusted) {
+                  throw new Error(`mintSpawnToken not permitted for plugin "${plugin.manifest.id}"`);
+                }
+                return mintSpawnToken();
+              },
+              // Rename a live session: in-memory + `session_updated` broadcast
+              // + `rename_session` to pi — the host's own rename block, lifted
+              // verbatim (the broadcast carries `{ name: name || undefined }`).
+              // Trusted-gated; false for unknown session / non-string or empty
+              // name. See change: relocate-goal-product-to-plugin (D1-#4).
+              renameSession: (sessionId, name) => {
+                const trusted = (plugin.manifest.priority ?? 1000) <= 100;
+                if (!trusted) return false;
+                if (typeof name !== "string" || name.length === 0) return false;
+                if (!sessionManager.get(sessionId)) return false;
+                // Empty names never reach here (rejected above, E9) — the
+                // host's old `name || undefined` normalization is dead by
+                // design; see relocate-goal-product-to-plugin (D1-#4 note).
+                const updates = { name };
+                sessionManager.update(sessionId, updates);
+                browserGateway.broadcastSessionUpdated(sessionId, updates);
+                piGateway.sendToSession(sessionId, { type: "rename_session", sessionId, name });
+                return true;
+              },
+              // Merge a plugin-owned ref onto a session — post-spawn sibling
+              // of the register-time pluginRef merge. Same sanitization
+              // boundary (reserved keys, cross-owner keys, first-writer-wins,
+              // warn-once) via the shared registry instance, so spawn-filed
+              // and assign-merged keys claim ownership in ONE map.
+              // `persist !== false` = memory + .meta.json + broadcast
+              // (warn-only on meta failure, same posture as the goal routes);
+              // `persist: false` = memory only (C2e). See change:
+              // relocate-goal-product-to-plugin (D1-#5).
+              assignSessionRef: (sessionId, ref, opts) => {
+                const trusted = (plugin.manifest.priority ?? 1000) <= 100;
+                if (!trusted) return false;
+                if (typeof sessionId !== "string" || !sessionManager.get(sessionId)) return false;
+                const sanitized = pendingPluginRefRegistry.sanitize(ref, plugin.manifest.id);
+                sessionManager.update(sessionId, sanitized as Partial<DashboardSession>);
+                if (opts?.persist !== false) {
+                  const session = sessionManager.get(sessionId);
+                  if (session?.sessionFile) {
+                    try {
+                      mergeSessionMeta(session.sessionFile, sanitized as Partial<SessionMeta>);
+                    } catch (err) {
+                      console.warn(
+                        `[plugin-assignSessionRef] failed to persist ref to .meta.json for ${sessionId}:`,
+                        err,
+                      );
+                    }
+                  }
+                  browserGateway.broadcastSessionUpdated(
+                    sessionId,
+                    sanitized as Partial<DashboardSession>,
+                  );
+                }
+                return true;
+              },
+              // Subscribe to server shutdown. Dispatched in stop() at the
+              // goal-supervisor dispose point (before piGateway.stop()),
+              // try/catch per sub. Not trust-gated. See change:
+              // relocate-goal-product-to-plugin (D1-#8).
+              onShutdown: (fn) => {
+                pluginShutdownSubs.add(fn);
+                return () => {
+                  pluginShutdownSubs.delete(fn);
+                };
+              },
+              // The host's network guard — the SAME instance core mounts on
+              // its own route groups. Attaching a guard only tightens, so
+              // this is NOT trust-gated. See change:
+              // relocate-goal-product-to-plugin (D1-#7).
+              networkGuard,
               // Emit a configured pi event into a session (relayed as a
               // `plugin_emit_event` control message; the in-session bridge
               // re-emits it on pi.events). Same trust gate as abortSession.
@@ -2408,6 +2622,17 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
                   eventType,
                   data: data ?? {},
                 });
+              },
+              // Raw server→extension control message to one session's bridge
+              // socket — the `credentials_updated` lane, WITHOUT the
+              // `pi.events` re-emit `plugin_emit_event` does. mcp-server-plugin
+              // delivers the minted session token over this; a credential must
+              // never ride the shared bus. Same trust gate as
+              // emitEventToSession. See change: wire-mcp-session-token (D5).
+              sendExtensionMessage: (sessionId, msg) => {
+                const trusted = (plugin.manifest.priority ?? 1000) <= 100;
+                if (!trusted) return false;
+                return piGateway.sendToSession(sessionId, msg as Parameters<typeof piGateway.sendToSession>[1]);
               },
               provide: (name, value) => { pluginServiceRegistry.set(name, value); },
               consume: <T = unknown>(name: string) =>
@@ -2448,10 +2673,16 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
                 } catch { /* start fresh */ }
                 rawConfig.plugins = { ...(rawConfig.plugins as Record<string, unknown> ?? {}), [id]: merged };
                 const fs = (await import('node:fs')).default;
-                const tmpFile = CONFIG_FILE + '.tmp.' + process.pid;
-                fs.writeFileSync(tmpFile, JSON.stringify(rawConfig, null, 2) + '\n');
+                const tmpFile = `${CONFIG_FILE}.tmp.${process.pid}`;
+                fs.writeFileSync(tmpFile, `${JSON.stringify(rawConfig, null, 2)}\n`);
                 fs.renameSync(tmpFile, CONFIG_FILE);
-                browserGateway.broadcast({ type: 'plugin_config_update', id, config: merged } as any);
+                browserGateway.broadcast({
+                  type: 'plugin_config_update',
+                  // writeOnly fields (e.g. the browser plugin's per-profile SSO
+                  // tokens) never cross to a client — spec add-browser-relay
+                  // browser-plugin-settings F2 / GAP A.
+                  config: redactPluginConfigForClient(id, merged),
+                } as any);
               },
               // In-process model runtime seam for plugin server entries (e.g. the
               // grammar plugin's llm backend) — mirrors the grammar-route wiring
@@ -2502,14 +2733,111 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       }
 
       fastify.server.on("upgrade", (request, socket, head) => {
+        // Ephemeral single-use ticket (D11) bound to the requested WS route
+        // scope. The one cheap read BEFORE the first gate — the host-admission
+        // log line names the scope.
+        const scope = routeScopeForUrl(request.url);
+
+        // Host-admission check (issue #637, D1). FIRST gate on the upgrade
+        // path, ahead of the Origin gate below: under rebinding the attacker's
+        // Origin equals its own Host, so only an ADMITTED Host may vouch for a
+        // matching Origin. Refused before any ticket is consumed.
+        // See change: add-host-allowlist-admission.
+        if (
+          evaluateHostGate(
+            request.headers.host,
+            getHostGateCtx(),
+            hostGateState,
+            `origin=${sanitizeHeaderForLog(request.headers.origin)} scope=${scope ?? "none"}`,
+          ) === "refuse"
+        ) {
+          socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+          socket.destroy();
+          return;
+        }
+
         // Access check for WebSocket upgrades
         const remoteAddress = request.socket.remoteAddress || "";
         const trusted = config.resolvedTrustedNetworks ?? [];
         const secWsProtocol = request.headers["sec-websocket-protocol"] as string | undefined;
-        // Ephemeral single-use ticket (D11) bound to the requested WS route
-        // scope. Origin check is defense-in-depth only (absent-Origin exists),
-        // never the sole gate.
-        const scope = routeScopeForUrl(request.url);
+
+        // ── Plugin-owned WS routes (change: add-browser-relay D1) ──────────
+        // A NON-core scope resolved from the plugin registry is gated
+        // STRICTER than core, and NONE of the credential branches below
+        // (cookie, local token, trusted-CIDR, ticket) run for it: the
+        // plugin's `handleUpgrade` owns its per-connection credential. Gate
+        // order: host admission (above, unchanged) → origin admission — a
+        // non-empty `admitOrigins` list REPLACES the dashboard policy →
+        // deterministic genuinely-local (loopback peer AND loopback `Host`
+        // AND none of the 8 forwarding headers), so tunnel reachability
+        // cannot depend on whether the tunnel injects markers.
+        if (scope !== null && !isCoreWsRouteScope(scope)) {
+          const registration = wsRouteRegistry.get(scope);
+          // Torn down between scope resolution and here (toggle raced the
+          // upgrade): same deliberate 404 as a tombstoned prefix below.
+          if (!registration) {
+            socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+            socket.destroy();
+            return;
+          }
+          const wsReqHeaders = request.headers as unknown as Record<string, unknown>;
+          if (
+            !isPluginWsOriginAdmitted(
+              request.headers.origin,
+              request.headers.host,
+              registration.admitOrigins,
+              corsOpts(),
+            ) ||
+            !isPluginScopePeerLocal(remoteAddress, request.headers.host, wsReqHeaders)
+          ) {
+            console.error(
+              `[ws-gate] rejected upgrade origin=${sanitizeHeaderForLog(request.headers.origin)} scope=${scope} peer=${sanitizeHeaderForLog(remoteAddress)}`,
+            );
+            socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+            socket.destroy();
+            return;
+          }
+          // A plugin's handleUpgrade is third-party code — a bug there must
+          // never escape the upgrade event listener (an uncaught throw here
+          // is fatal to the process). Refuse the socket, log, keep serving.
+          try {
+            registration.handleUpgrade(request, socket, head, {
+              pluginId: registration.pluginId,
+              scope,
+              trackSocket: (ws) => wsRouteRegistry.trackSocket(registration.pluginId, ws),
+            });
+          } catch (err) {
+            console.error(
+              `[ws-gate] plugin handleUpgrade threw scope=${scope} plugin=${registration.pluginId}:`,
+              err,
+            );
+            socket.destroy();
+          }
+          return;
+        }
+        // A prefix whose plugin was toggled off stays reachable-but-dead: a
+        // deliberate 404 (not the bare TCP destroy an unrouted path gets)
+        // lets a client tell "plugin disabled" from "wrong port".
+        if (scope === null && wsRouteRegistry.isTombstonedPath(request.url)) {
+          socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+          socket.destroy();
+          return;
+        }
+
+        // Cross-site upgrade gate (issue #625). Runs after the host-admission
+        // check and ahead of the `bridge` early-return and the auth branches,
+        // so an untrusted Origin can never consume a ticket and cannot tell a
+        // routed path from an unrouted one. A browser cannot omit or forge
+        // `Origin` on a handshake; every non-browser client sends none and is
+        // unaffected. See change: fix-ws-origin-cswsh (D1).
+        if (!isWsOriginTrusted(request.headers.origin, request.headers.host, scope, corsOpts())) {
+          console.error(
+            `[ws-gate] rejected upgrade origin=${sanitizeHeaderForLog(request.headers.origin)} scope=${scope ?? "none"} peer=${sanitizeHeaderForLog(remoteAddress)}`,
+          );
+          socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+          socket.destroy();
+          return;
+        }
         // `bridge` belongs to the pi-gateway listener, not to this one. Letting
         // it through would CONSUME the single-use ticket here and then fall to
         // the routing `default:` and destroy the socket — a bridge that dialled
@@ -2521,7 +2849,7 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
           return;
         }
         const ticket = extractTicket(request.url, secWsProtocol);
-        const consumeTicket = (t: string, s: WsRouteScope) => wsTicketStore.consume(t, s);
+        const consumeTicket = (t: string, s: CoreWsRouteScope) => wsTicketStore.consume(t, s);
         const wsHeaders = request.headers as unknown as Record<string, unknown>;
         if (config.authConfig?.secret) {
           if (!validateWsUpgrade(request.headers.cookie, remoteAddress, config.authConfig.secret, trusted, { ticket, scope, consumeTicket, headers: wsHeaders, localToken })) {
@@ -2716,11 +3044,16 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       // runs. The rejection needs an owner all the same, or a discovery failure
       // is invisible except as an anonymous crash-safety-net line.
       // See change: cleanup-async-semantics-server-extension (design D1).
-      discoverAndBroadcastSessions({ sessionManager, browserGateway, directoryService }).catch(
-        (err: unknown) => {
-          console.warn("[boot] session discovery failed:", err);
-        },
-      );
+      discoverAndBroadcastSessions({ sessionManager, browserGateway, directoryService, sessionArchive })
+        .then(() => { archiveSweeper.start(); })
+        .catch(
+          (err: unknown) => {
+            console.warn("[boot] session discovery failed:", err);
+            // Start the sweeper anyway — discovery failure must not disable
+            // automatic archiving. See change: archive-sessions-lazy-load.
+            archiveSweeper.start();
+          },
+        );
 
       // Auto-register plugin bridge entries
       const discoveredPlugins = discoverPlugins();
@@ -2889,6 +3222,9 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       } catch { /* ignore mDNS cleanup errors */ }
       removePid();
       idleTimer.cancel();
+      // Disarm the host-gate rate-limiter window flush (created with the gate
+      // wiring above; unref'd, so this is leak-hygiene not liveness).
+      clearInterval(hostGateFlushTimer);
       directoryService.stopPolling();
       // SIGTERMs every dashboard-spawned pi: after this the sessions below are
       // GONE and can never reattach.
@@ -2908,15 +3244,19 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       recordExitIntent(opts.exitIntent ?? "idle");
       metaPersistence.flushAll();
       metaPersistence.dispose();
-      // Cancel the deferred boot reconcile + dispose supervisor (pending backoff
-      // timers) so a create/stop cycle in one process leaves no stale timer.
-      // See change: add-goal-session-supervisor.
-      clearTimeout(bootReconcileTimer);
       // Cancel the recovery grace timer (ask: finalize-clear; auto: deferred
       // resume) so a create/stop cycle leaves no stale timer / late spawn.
       // See change: fix-recovery-offer-bridge-liveness-gate.
       if (recoveryGraceTimer) clearTimeout(recoveryGraceTimer);
-      goalSupervisor?.dispose();
+      // Dispatch plugin onShutdown subs (ServerPluginContext.onShutdown) at
+      // the exact point the goal supervisor disposes — BEFORE piGateway.stop()
+      // tears bridges down, so plugin supervisors / backoff timers are disposed
+      // before bridge-teardown deaths can reach them. try/catch per sub: a
+      // throwing sub never blocks the others or the shutdown.
+      // See change: relocate-goal-product-to-plugin (D1-#8).
+      for (const sub of pluginShutdownSubs) {
+        try { sub(); } catch (err) { console.error("[plugin-onShutdown]", err); }
+      }
       pendingForkRegistry.dispose();
       // Every pending ack holds a timer; a create/stop cycle must not leak them.
       // See change: fix-spawn-correlation-ttl-coupling (D7).

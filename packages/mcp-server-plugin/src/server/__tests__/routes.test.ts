@@ -6,17 +6,24 @@
  * E17 (malformed bodies), A1-A4/A7/A9 (auth), A8 (the negative control), X7
  * (concurrency) and X11 (oversized bodies).
  */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { McpTokenRegistry } from "../tokens.js";
+import { PairedDeviceRegistry } from "../../../../server/src/pairing/paired-devices.js";
 import { META_VERSION_KEY } from "../protocol.js";
-import { MCP_BODY_LIMIT_BYTES, REJECTED_METHODS, mountMcpRoutes } from "../routes.js";
+import { MCP_BODY_LIMIT_BYTES, mountMcpRoutes, REJECTED_METHODS } from "../routes.js";
 import { SubscriptionRegistry } from "../streaming.js";
+import { McpTokenRegistry } from "../tokens.js";
 
 const V = "2026-07-28";
 const meta = { _meta: { [META_VERSION_KEY]: V } };
 
 const SPA_HTML = "<!doctype html><html><body>dashboard SPA</body></html>";
+
+import type { Tier } from "@blackbelt-technology/pi-dashboard-shared/tiers.js";
+import type { GeneratedTool } from "../generated/tools.js";
 
 interface Harness {
   app: FastifyInstance;
@@ -32,7 +39,13 @@ afterEach(async () => {
   open = [];
 });
 
-async function harness(opts: { withAuth?: boolean } = {}): Promise<Harness> {
+async function harness(
+  opts: {
+    withAuth?: boolean;
+    tools?: readonly GeneratedTool[];
+    tiers?: Map<string, { id: string; tier: Tier }>;
+  } = {},
+): Promise<Harness> {
   const app = Fastify();
   open.push(app);
   const tokens = new McpTokenRegistry();
@@ -49,6 +62,8 @@ async function harness(opts: { withAuth?: boolean } = {}): Promise<Harness> {
   const deps = {
     tokens,
     verifyDeviceToken: (t: string) => deviceTokens.get(t) ?? null,
+    verifyDeviceTokenTier: opts.tiers ? (t: string) => opts.tiers!.get(t) ?? null : undefined,
+    tools: opts.tools,
     invokeTool,
     serverInfo: { name: "pi-dashboard", version: "0.7.0" },
     openSubscription: async (ids: string[]) => ({ subscribed: ids }),
@@ -58,7 +73,7 @@ async function harness(opts: { withAuth?: boolean } = {}): Promise<Harness> {
   if (opts.withAuth === false) {
     // A8's negative control: the same routes with the credential check
     // removed. Used to prove the auth assertions actually bite.
-    await mountMcpRoutes(app, { ...deps, verifyDeviceToken: () => "anyone", tokens: { resolve: () => ({ kind: "device", deviceId: "anyone" }) } });
+    await mountMcpRoutes(app, { ...deps, verifyDeviceToken: () => "anyone", tokens: { resolve: () => ({ kind: "device", deviceId: "anyone", tier: "operate" }) } });
   } else {
     await mountMcpRoutes(app, deps);
   }
@@ -629,5 +644,577 @@ describe("the throttle is wired into the route", () => {
       });
     }
     expect(invokeTool).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The dual-era contract (change: mcp-legacy-clients-and-token-issuance).
+ *
+ * Legacy requests declare a 2025-era revision: `initialize` opens with
+ * `params.protocolVersion` (no header), later requests carry only the
+ * `MCP-Protocol-Version` header. Modern requests keep the strict
+ * header + `_meta` contract.
+ */
+describe("dual era — legacy initialize handshake (E2/E3/E4)", () => {
+  const legacyInit = (protocolVersion?: unknown) => ({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: protocolVersion === undefined ? {} : { protocolVersion },
+  });
+  const legacyHeaders = (token: string) => ({
+    authorization: `Bearer ${token}`,
+    "content-type": "application/json",
+  });
+
+  it.each(["2025-03-26", "2025-06-18", "2025-11-25"])(
+    "E2 — initialize %s is answered and mints a session id",
+    async (version) => {
+      const { app, tokens } = await harness();
+      const res = await app.inject({
+        method: "POST",
+        url: "/mcp",
+        headers: legacyHeaders(tokens.mintForSession("session-a")),
+        payload: legacyInit(version),
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.error).toBeUndefined();
+      expect(body.result.protocolVersion).toBe(version);
+      expect(body.result.capabilities).toEqual({ tools: { listChanged: false } });
+      expect(body.result.serverInfo.name.length).toBeGreaterThan(0);
+      expect(res.headers["mcp-session-id"]).toMatch(/^[0-9a-f]{32}$/);
+    },
+  );
+
+  it("E3 — an unknown version negotiates down to 2025-11-25, never an error", async () => {
+    const { app, tokens } = await harness();
+    const res = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: legacyHeaders(tokens.mintForSession("session-a")),
+      payload: legacyInit("2027-01-01"),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().error).toBeUndefined();
+    expect(res.json().result.protocolVersion).toBe("2025-11-25");
+    expect(res.headers["mcp-session-id"]).toBeTruthy();
+  });
+
+  it.each([
+    ["params: {}", {}],
+    ["protocolVersion: 42", { protocolVersion: 42 }],
+  ])("E4 — initialize %s is refused with all four revisions named", async (_l, params) => {
+    const { app, tokens } = await harness();
+    const res = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: legacyHeaders(tokens.mintForSession("session-a")),
+      payload: { ...legacyInit(), params },
+    });
+    expect(res.statusCode).toBe(400);
+    const err = res.json().error;
+    expect(err.data.type).toBe("UnsupportedProtocolVersionError");
+    for (const v of ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]) {
+      expect(err.message).toContain(v);
+    }
+    expect(res.headers["mcp-session-id"]).toBeUndefined();
+  });
+
+  it("E5 — the modern era still refuses the handshake", async () => {
+    const { app, tokens } = await harness();
+    const t = tokens.mintForSession("session-a");
+    const init = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: authed(t),
+      payload: { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2026-07-28" } },
+    });
+    expect(init.statusCode).toBe(404);
+    expect(init.json().error.code).toBe(-32601);
+    expect(init.headers["mcp-session-id"]).toBeUndefined();
+
+    for (const method of ["ping", "notifications/initialized"]) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/mcp",
+        headers: authed(t),
+        payload: rpc(method),
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json().error.code).toBe(-32601);
+      expect(res.headers["mcp-session-id"]).toBeUndefined();
+    }
+  });
+});
+
+describe("dual era — legacy notifications, ping, tools (E6/E7/E8/E10)", () => {
+  /** POST one legacy-era request on a fresh harness with the given payload. */
+  async function injectLegacy(payload: Record<string, unknown>, extraHeaders: Record<string, string> = {}) {
+    const h = await harness();
+    return h.app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: {
+        authorization: `Bearer ${h.tokens.mintForSession("session-a")}`,
+        "mcp-protocol-version": "2025-06-18",
+        "content-type": "application/json",
+        ...extraHeaders,
+      },
+      payload,
+    });
+  }
+
+  it.each([
+    ["notifications/initialized", "notifications/initialized", {}],
+    ["notifications/cancelled", "notifications/cancelled", {}],
+    ["notifications/zzz", "notifications/zzz", {}],
+    ["notifications/initialized with a stray id", "notifications/initialized", { id: 7 }],
+  ])("E6 — %s is accepted with 202 and an empty body", async (_label, method, extra) => {
+    const { app, tokens } = await harness();
+    const t = tokens.mintForSession("session-a");
+    const res = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: {
+        authorization: `Bearer ${t}`,
+        "mcp-protocol-version": "2025-06-18",
+        "content-type": "application/json",
+      },
+      payload: { jsonrpc: "2.0", method, params: {}, ...extra },
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toHaveLength(0);
+  });
+
+  it("E7 — legacy ping answers an empty result object", async () => {
+    const res = await injectLegacy({ jsonrpc: "2.0", id: 1, method: "ping", params: {} });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().result).toEqual({});
+  });
+
+  it("E8 — legacy and modern tool calls return identical bodies", async () => {
+    const { app, tokens } = await harness();
+    const t = tokens.mintForSession("session-a");
+    const legacyHeaders = {
+      authorization: `Bearer ${t}`,
+      "mcp-protocol-version": "2025-06-18",
+      "content-type": "application/json",
+    };
+    const legacy = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: legacyHeaders,
+      payload: { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+    });
+    const modern = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: authed(t),
+      payload: rpc("tools/list"),
+    });
+    expect(legacy.statusCode).toBe(200);
+    expect(legacy.json()).toEqual(modern.json());
+    expect(legacy.headers["mcp-session-id"]).toBeUndefined();
+
+    const legacyCall = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: legacyHeaders,
+      payload: { jsonrpc: "2.0", id: 2, method: "server/discover", params: {} },
+    });
+    const modernCall = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: authed(t),
+      payload: rpc("server/discover"),
+    });
+    expect(legacyCall.json().result).toEqual(modernCall.json().result);
+  });
+
+  it("E10 — an unknown Mcp-Session-Id still dispatches (never 404)", async () => {
+    const res = await injectLegacy(
+      { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+      { "mcp-session-id": "deadbeef" },
+    );
+    expect(res.statusCode).toBe(200);
+    expect(Array.isArray(res.json().result.tools)).toBe(true);
+  });
+});
+
+describe("dual era — session id and version markers", () => {
+  it("E11 — the modern era ignores an inbound Mcp-Session-Id", async () => {
+    const { app, tokens } = await harness();
+    const res = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: { ...authed(tokens.mintForSession("session-a")), "mcp-session-id": "deadbeef" },
+      payload: rpc("tools/list"),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["mcp-session-id"]).toBeUndefined();
+  });
+
+  it("X3 — a repeated MCP-Protocol-Version header is refused on every method", async () => {
+    const { app, tokens } = await harness();
+    const t = tokens.mintForSession("session-a");
+    const toolsList = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: {
+        authorization: `Bearer ${t}`,
+        // light-my-request forwards array header values as distinct headers.
+        "mcp-protocol-version": ["2025-06-18", "2026-07-28"] as unknown as string,
+        "content-type": "application/json",
+      },
+      payload: { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+    });
+    expect(toolsList.statusCode).toBe(400);
+    expect(toolsList.json().error.data.type).toBe("AmbiguousHeader");
+
+    const init = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: {
+        authorization: `Bearer ${t}`,
+        "mcp-protocol-version": ["2025-06-18", "2026-07-28"] as unknown as string,
+        "content-type": "application/json",
+      },
+      payload: { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } },
+    });
+    expect(init.statusCode).toBe(400);
+    expect(init.json().error.data.type).toBe("AmbiguousHeader");
+    expect(init.headers["mcp-session-id"]).toBeUndefined();
+  });
+});
+
+describe("dual era — subscriptions/listen is subject to version resolution (E12)", () => {
+  function listenHarness() {
+    const app = Fastify();
+    open.push(app);
+    const tokens = new McpTokenRegistry();
+    const handlers = new Set<(sessionId: string, payload: unknown) => void>();
+    const registry = new SubscriptionRegistry();
+    const openSpy = vi.spyOn(registry, "open");
+    const ready = mountMcpRoutes(app, {
+      tokens,
+      verifyDeviceToken: () => null,
+      invokeTool: async () => ({}),
+      serverInfo: { name: "pi-dashboard", version: "0.7.0" },
+      log: { info: () => {}, warn: () => {}, error: () => {} },
+      streaming: {
+        registry,
+        source: {
+          onEvent(handler) {
+            handlers.add(handler);
+            return () => handlers.delete(handler);
+          },
+        },
+      },
+    });
+    return { app, tokens, open: openSpy, ready };
+  }
+
+  it.each([
+    ["header 2026-07-28 with no _meta", "2026-07-28", { _meta: {} } as Record<string, unknown>, 400, "MissingProtocolVersion"],
+    ["unsupported header 1999-01-01", "1999-01-01", { _meta: {} } as Record<string, unknown>, 400, "UnsupportedProtocolVersionError"],
+  ])("refuses with the version error any other method receives (%s)", async (_l, header, params, status, type) => {
+    const h = listenHarness();
+    await h.ready;
+    await h.app.ready();
+    const res = await h.app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: { authorization: `Bearer ${h.tokens.mintForSession("s")}`, "mcp-protocol-version": header },
+      payload: { jsonrpc: "2.0", id: 1, method: "subscriptions/listen", params },
+    });
+    expect(res.statusCode).toBe(status);
+    expect(res.json().error.data.type).toBe(type);
+    expect(h.open).not.toHaveBeenCalled();
+  });
+
+  it("a header/body mismatch is a 400 HeaderMismatch", async () => {
+    const h = listenHarness();
+    await h.ready;
+    await h.app.ready();
+    const res = await h.app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: { authorization: `Bearer ${h.tokens.mintForSession("s")}`, "mcp-protocol-version": "2026-07-28" },
+      payload: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "subscriptions/listen",
+        params: { _meta: { [META_VERSION_KEY]: "2025-06-18" }, sessionIds: ["s1"] },
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.data.type).toBe("HeaderMismatch");
+    expect(h.open).not.toHaveBeenCalled();
+  });
+
+  it("a legacy-era listen is the removed-method shape, and no stream opens (D3)", async () => {
+    const h = listenHarness();
+    await h.ready;
+    await h.app.ready();
+    const res = await h.app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: { authorization: `Bearer ${h.tokens.mintForSession("s")}`, "mcp-protocol-version": "2025-06-18" },
+      payload: { jsonrpc: "2.0", id: 1, method: "subscriptions/listen", params: { sessionIds: ["s1"] } },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe(-32601);
+    expect(h.open).not.toHaveBeenCalled();
+  });
+});
+
+describe("dual era — legacy authentication parity (X1/X2)", () => {
+  it("X1 — legacy requests are authenticated identically", async () => {
+    const { app } = await harness();
+    for (const payload of [
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } },
+      { jsonrpc: "2.0", id: 1, method: "ping", params: {} },
+      { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+    ] as const) {
+      for (const headers of [
+        { "mcp-protocol-version": "2025-06-18" },
+        { "mcp-protocol-version": "2025-06-18", authorization: "Bearer not-a-real-token" },
+      ]) {
+        const res = await app.inject({ method: "POST", url: "/mcp", headers, payload });
+        expect(res.statusCode).toBe(401);
+        expect(res.headers["www-authenticate"]).toBe("Bearer");
+        expect(res.headers["mcp-session-id"]).toBeUndefined();
+      }
+    }
+  });
+
+  it("X2 — a minted Mcp-Session-Id never substitutes for the credential", async () => {
+    const { app, tokens } = await harness();
+    const init = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: { authorization: `Bearer ${tokens.mintForSession("session-a")}` },
+      payload: { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } },
+    });
+    expect(init.statusCode).toBe(200);
+    const sessionId = init.headers["mcp-session-id"] as string;
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: { "mcp-protocol-version": "2025-06-18", "mcp-session-id": sessionId },
+      payload: { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
+describe("dual era — malformed legacy payloads (X10)", () => {
+  it("never produce a 500 or an unhandled rejection", async () => {
+    const rejections: unknown[] = [];
+    const handler = (err: unknown) => rejections.push(err);
+    process.on("unhandledRejection", handler);
+    try {
+      const { app, tokens } = await harness();
+      const t = tokens.mintForSession("session-a");
+      const headers = {
+        authorization: `Bearer ${t}`,
+        "mcp-protocol-version": "2025-06-18",
+        "content-type": "application/json",
+      };
+      for (const payload of ["not json", [], { jsonrpc: "2.0" }]) {
+        const res = await app.inject({ method: "POST", url: "/mcp", headers, payload: payload as never });
+        expect(res.statusCode).toBeGreaterThanOrEqual(400);
+        expect(res.statusCode).not.toBe(500);
+        expect(res.statusCode).toBeLessThan(500);
+        expect(res.json().error).toBeDefined();
+      }
+    } finally {
+      process.off("unhandledRejection", handler);
+    }
+    expect(rejections).toEqual([]);
+  });
+});
+
+
+// E14 (test-plan: mcp-legacy-clients-and-token-issuance) — a token minted by
+// the direct-issuance route reaches /mcp as an indistinguishable device caller.
+describe("E14 — a manually minted device token reaches /mcp", () => {
+  it("authenticates as a device caller with no originating session", async () => {
+    const app = Fastify();
+    open.push(app);
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-mcp-e14-"));
+    try {
+      const registry = new PairedDeviceRegistry(path.join(tmp, "paired.json"));
+      const invokeTool = vi.fn(async (_inv: { caller: unknown }) => ({ ok: true }));
+      await mountMcpRoutes(app, {
+        tokens: new McpTokenRegistry(),
+        verifyDeviceToken: () => null,
+        verifyDeviceTokenTier: (t: string) => registry.verify(t),
+        invokeTool,
+        serverInfo: { name: "pi-dashboard", version: "0.7.0" },
+        log: { info: () => {}, warn: () => {}, error: () => {} },
+      });
+      await app.ready();
+
+      const { device, token } = registry.add("cli", "manual", "operate");
+      const res = await app.inject({
+        method: "POST",
+        url: "/mcp",
+        headers: authed(token),
+        payload: rpc("tools/call", { name: "abort", arguments: { sessionId: "anything" } }),
+      });
+      expect(res.statusCode).toBe(200);
+      expect(invokeTool).toHaveBeenCalledOnce();
+      // Device caller: no originating session, so any session target is allowed.
+      expect(invokeTool.mock.calls[0][0].caller).toEqual({
+        kind: "device",
+        deviceId: device.id,
+        tier: "operate",
+      });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("E8 — one session's stale token never denies a healthy one (route level)", () => {
+  it("A's throttled fingerprint does not stop B's valid credential from the same ip", async () => {
+    const { app, tokens } = await harness();
+
+    // Session B holds a VALID token.
+    const bToken = tokens.mintForSession("session-b");
+
+    // Session A presents its stale token past the per-credential threshold.
+    for (let i = 0; i < 15; i += 1) {
+      await app.inject({
+        method: "POST",
+        url: "/mcp",
+        headers: { authorization: "Bearer stale-token-A", "mcp-protocol-version": V },
+        payload: rpc("tools/list"),
+      });
+    }
+
+    // A's credential bucket is exhausted — A gets 429...
+    const aRes = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: { authorization: "Bearer stale-token-A", "mcp-protocol-version": V },
+      payload: rpc("tools/list"),
+    });
+    expect(aRes.statusCode).toBe(429);
+
+    // ...while B, from the SAME 127.0.0.1, is served.
+    const bRes = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: authed(bToken),
+      payload: rpc("tools/list"),
+    });
+    expect(bRes.statusCode).toBe(200);
+  });
+
+  it("E5 — an unminted well-formed mcp_ bearer is refused and creates no row", async () => {
+    const { app, tokens } = await harness();
+    const before = tokens.size;
+    const forged = `mcp_${"A".repeat(43)}`;
+    const res = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: { authorization: `Bearer ${forged}`, "mcp-protocol-version": V },
+      payload: rpc("tools/list"),
+    });
+    expect(res.statusCode).toBe(401);
+    expect(tokens.size).toBe(before);
+  });
+});
+
+// ── E11–E13 (test-plan expand-mcp-tiered-surface): path cap + 404 discipline ─
+
+const tierFixtureTools: readonly GeneratedTool[] = [
+  mk("o_read", "observe"),
+  mk("c_write", "control"),
+  mk("p_kill", "operate"),
+];
+
+function mk(name: string, tier: Tier): GeneratedTool {
+  return {
+    name,
+    description: `${tier} tool`,
+    tier,
+    annotations: { readOnlyHint: tier === "observe", destructiveHint: false },
+    inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
+    bind: { kind: "context", member: "sessionManager" },
+    paramSplit: { path: [], bodyAll: true },
+    sessionTargeting: false,
+  };
+}
+
+async function toolsListAt(url: string, token: string, tiers: Map<string, { id: string; tier: Tier }>) {
+  const { app } = await harness({ tools: tierFixtureTools, tiers });
+  const res = await app.inject({
+    method: "POST",
+    url,
+    headers: authed(token),
+    payload: rpc("tools/list"),
+  });
+  expect(res.statusCode, url).toBe(200);
+  return (res.json() as { result: { tools: Array<{ name: string }> } }).result.tools.map((t) => t.name);
+}
+
+describe("E11/E12 — path cap", () => {
+  it("operate token at /mcp/observe, /mcp/control, /mcp → 1 / 2 / 3 tools", async () => {
+    const tiers = new Map([["op", { id: "d", tier: "operate" as Tier }]]);
+    expect(await toolsListAt("/mcp/observe", "op", tiers)).toEqual(["o_read"]);
+    expect(await toolsListAt("/mcp/control", "op", tiers)).toEqual(["o_read", "c_write"]);
+    expect(await toolsListAt("/mcp", "op", tiers)).toEqual(["o_read", "c_write", "p_kill"]);
+  });
+
+  it("the cap never raises: observe token at /mcp/control still sees the observe set", async () => {
+    const tiers = new Map([["ob", { id: "d", tier: "observe" as Tier }]]);
+    expect(await toolsListAt("/mcp/control", "ob", tiers)).toEqual(["o_read"]);
+  });
+});
+
+describe("E13 — bad suffix / method discipline", () => {
+  it("POST /mcp/operate and GET /mcp/nope are 404 JSON, never the SPA", async () => {
+    const { app } = await harness();
+    const post = await app.inject({ method: "POST", url: "/mcp/operate", headers: authed("x"), payload: rpc("tools/list") });
+    expect(post.statusCode).toBe(404);
+    expect(post.headers["content-type"]).toContain("application/json");
+    expect(post.body).not.toContain("<!doctype html");
+
+    const get = await app.inject({ method: "GET", url: "/mcp/nope" });
+    expect(get.statusCode).toBe(404);
+    expect(get.headers["content-type"]).toContain("application/json");
+    expect(get.body).not.toContain("<!doctype html");
+  });
+
+  it("PUT /mcp/observe is 405 like PUT /mcp", async () => {
+    const { app } = await harness();
+    const res = await app.inject({ method: "PUT", url: "/mcp/observe" });
+    expect(res.statusCode).toBe(405);
+  });
+});
+
+// X10 (test-plan expand-mcp-tiered-surface) — a token revoked mid-flight 401s.
+describe("X10 — revocation is checked per request", () => {
+  it("tools/list works, then the same token is revoked and tools/call is 401 (not 403)", async () => {
+    const tiers = new Map<string, { id: string; tier: Tier }>([["tok", { id: "d", tier: "observe" }]]);
+    const { app } = await harness({ tools: tierFixtureTools, tiers });
+
+    const list = await app.inject({ method: "POST", url: "/mcp", headers: authed("tok"), payload: rpc("tools/list") });
+    expect(list.statusCode).toBe(200);
+
+    tiers.delete("tok");
+
+    const call = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: authed("tok"),
+      payload: rpc("tools/call", { name: "o_read", arguments: {} }),
+    });
+    expect(call.statusCode).toBe(401);
   });
 });

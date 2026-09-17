@@ -266,11 +266,11 @@ export async function handleHeadlessReload(
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[dashboard] headless reload spawn failed: ${message}`);
     const endedAt = Date.now();
-    sessionManager.update(msg.sessionId, { status: "ended", endedAt });
+    sessionManager.update(msg.sessionId, { status: "ended", endedAt, closedReason: "spawn_failed" });
     ctx.broadcast({
       type: "session_updated",
       sessionId: msg.sessionId,
-      updates: { status: "ended", endedAt },
+      updates: { status: "ended", endedAt, closedReason: "spawn_failed" },
     });
     emitCommandFeedback(ctx, msg.sessionId, "error", message);
     return;
@@ -281,11 +281,11 @@ export async function handleHeadlessReload(
       `[dashboard] headless reload spawn failed: ${spawnResult.message}`,
     );
     const endedAt = Date.now();
-    sessionManager.update(msg.sessionId, { status: "ended", endedAt });
+    sessionManager.update(msg.sessionId, { status: "ended", endedAt, closedReason: "spawn_failed" });
     ctx.broadcast({
       type: "session_updated",
       sessionId: msg.sessionId,
-      updates: { status: "ended", endedAt },
+      updates: { status: "ended", endedAt, closedReason: "spawn_failed" },
     });
     emitCommandFeedback(ctx, msg.sessionId, "error", spawnResult.message);
     return;
@@ -339,10 +339,22 @@ export async function handleSendPrompt(
     // Normalize a zombie's stale "active" to "ended" so the rest of this block
     // drives the SAME proven ended→alive resume flow (pendingResume + continue).
     if (promptSession.status !== "ended") {
-      sessionManager.update(msg.sessionId, { status: "ended" });
+      // The process probe just returned "gone" for this zombie, so the cause is
+      // not a mystery. See change: stop-discarding-known-session-state.
+      sessionManager.update(msg.sessionId, { status: "ended", closedReason: "process_gone" });
     }
     if (!promptSession.sessionFile) {
       console.error(`[dashboard] auto-resume failed: no session file for session ${msg.sessionId}`);
+      // A server-side log is not a user-visible outcome. Surface the refusal so
+      // the browser does not blame the session after its 30 s timeout.
+      // See change: stop-discarding-known-session-state.
+      emitCommandFeedback(
+        ctx,
+        msg.sessionId,
+        "error",
+        "Can't resume this session — no saved transcript on disk.",
+        "send_prompt",
+      );
       return;
     }
     // Third continue-spawn site, so it needs D5's file guard too: a stale
@@ -393,6 +405,13 @@ export async function handleSendPrompt(
       pendingResumeRegistry.consume(promptSession.cwd);
       sessionManager.update(msg.sessionId, { resuming: false });
       broadcast({ type: "session_updated", sessionId: msg.sessionId, updates: { resuming: false } });
+      emitCommandFeedback(
+        ctx,
+        msg.sessionId,
+        "error",
+        `Restart failed — ${spawnResult.message}`,
+        "send_prompt",
+      );
     }
     if (spawnResult.dashboardSpawned && spawnResult.success) {
       pendingDashboardSpawns?.set(promptSession.cwd, (pendingDashboardSpawns?.get(promptSession.cwd) ?? 0) + 1);
@@ -416,6 +435,13 @@ export async function handleSendPrompt(
     });
     if (!sent) {
       console.error(`[dashboard] send_prompt failed: no bridge connection for session ${msg.sessionId}`);
+      emitCommandFeedback(
+        ctx,
+        msg.sessionId,
+        "error",
+        "Prompt not delivered — the session isn't connected.",
+        "send_prompt",
+      );
     }
   }
 }
@@ -475,7 +501,11 @@ export async function handleResumeSession(
   msg: Extract<BrowserToServerMessage, { type: "resume_session" }>,
   ctx: BrowserHandlerContext,
 ): Promise<void> {
-  const { ws, sessionManager, pendingForkRegistry, headlessPidRegistry, pendingDashboardSpawns, pendingResumeIntents, pendingClientCorrelations, sendTo } = ctx;
+  const { ws, sessionManager, pendingForkRegistry, headlessPidRegistry, pendingDashboardSpawns, pendingResumeIntents, pendingClientCorrelations, sendTo, pendingArchiveIntents } = ctx;
+  // A resume cancels any pending idle-alive archive intent: the user is
+  // bringing the session back, so a later `ended` must not archive it.
+  // See change: archive-sessions-lazy-load.
+  pendingArchiveIntents?.clear(msg.sessionId);
   const session = sessionManager.get(msg.sessionId);
   if (!session) {
     sendTo(ws, { type: "resume_result", sessionId: msg.sessionId, success: false, message: "Session not found", code: "resume.session_not_found", requestId: msg.requestId });
@@ -956,7 +986,7 @@ export async function shutdownSession(
     }
   }
 
-  sessionManager.unregister(msg.sessionId);
+  sessionManager.unregister(msg.sessionId, { closedReason: "manual" });
   broadcast({ type: "session_removed", sessionId: msg.sessionId });
 }
 
@@ -1112,21 +1142,69 @@ export function handleSubagentResyncRequest(
 }
 
 /**
+ * Forward a browser prompt-resync request to the owning bridge: the bridge
+ * re-emits every prompt its PromptBus is still holding, each carrying the
+ * echoed `__resyncRequestId` token, and event-wiring delivers those replies to
+ * the REQUESTER via `deliverPromptResyncReply` (D4/D5).
+ * E16 discipline: the requester is recorded ONLY when a bridge was actually
+ * reachable (`sendToSession` returns true) — recording against a dead bridge
+ * would pin a token whose reply can never come, and worse, a reply arriving
+ * under that token from a LATE reconnect would unicast to a stale context.
+ * A bridge with no pending prompts simply never replies (E10).
+ * See change: fix-pending-prompt-lost-on-replay (task 2.3, design D5/D6).
+ */
+export function handlePromptResyncRequest(
+  msg: Extract<BrowserToServerMessage, { type: "prompt_resync_request" }>,
+  ctx: BrowserHandlerContext,
+): void {
+  // The WS path casts parsed JSON straight to the message union, so the token
+  // is untrusted: validate its RUNTIME shape before it reaches the registry
+  // (same rule as handleSubagentResyncRequest). A malformed token degrades to
+  // a tokenless request whose reply takes the ordinary fan-out.
+  const requestId =
+    typeof msg.requestId === "string" && msg.requestId.length > 0 ? msg.requestId : undefined;
+  const delivered = ctx.piGateway.sendToSession(msg.sessionId, {
+    type: "prompt_resync_request",
+    sessionId: msg.sessionId,
+    ...(requestId ? { requestId } : {}),
+  });
+  if (delivered && requestId) ctx.recordResyncRequester?.(requestId, ctx.ws);
+}
+
+/**
  * Pure predicate: does a `ps`/cmdline output string look like a pi/node process?
  * Re-exported from `platform/process-identify.ts` for backwards compat with
  * any external consumer of this handler.
  */
 export { isPiCommandLine } from "@blackbelt-technology/pi-dashboard-shared/platform/process-identify.js";
 
-export async function handleForceKill(
-  msg: Extract<BrowserToServerMessage, { type: "force_kill" }>,
-  ctx: BrowserHandlerContext,
-): Promise<void> {
-  const { sessionManager, piGateway, headlessPidRegistry, broadcast, sendTo, ws, metaPersistence } = ctx;
-  const session = sessionManager.get(msg.sessionId);
+/** Result of the shared force-kill ladder. */
+export interface ForceKillResult {
+  success: boolean;
+  message: string;
+  code?: string;
+}
+
+/** Deps of {@link forceKillSession} — narrower than the full handler context. */
+export type ForceKillDeps = Pick<
+  BrowserHandlerContext,
+  "sessionManager" | "piGateway" | "headlessPidRegistry" | "broadcast" | "metaPersistence"
+>;
+
+/**
+ * The force-kill ladder, shared by the browser `force_kill` message and
+ * `POST /api/session/:id/lifecycle { action: "force_kill" }` (change:
+ * expand-mcp-tiered-surface, D3). Returns the outcome instead of sending a WS
+ * result, so the REST caller needs no browser socket.
+ */
+export async function forceKillSession(
+  sessionId: string,
+  deps: ForceKillDeps,
+): Promise<ForceKillResult> {
+  const { sessionManager, piGateway, headlessPidRegistry, broadcast, metaPersistence } = deps;
+  const session = sessionManager.get(sessionId);
   if (!session) {
-    sendTo(ws, { type: "force_kill_result", sessionId: msg.sessionId, success: false, message: "Session not found", code: "resume.session_not_found" });
-    return;
+    return { success: false, message: "Session not found", code: "resume.session_not_found" };
   }
 
   // Force-kill is an intentional close: durably clear the liveness marker
@@ -1136,45 +1214,43 @@ export async function handleForceKill(
     metaPersistence.setLiveness(session.sessionFile, { live: false, closedReason: "manual" });
   }
 
-  // Force-close the bridge WebSocket regardless of PID availability
-  piGateway.closeSession(msg.sessionId);
+  // Force-close the bridge WebSocket regardless of PID availability.
+  piGateway.closeSession(sessionId);
 
   const pid = session?.pid;
   if (!pid) {
-    // No PID — we can only close the WebSocket
-    sessionManager.update(msg.sessionId, { status: "ended", endedAt: Date.now() });
-    broadcast({ type: "session_updated", sessionId: msg.sessionId, updates: { status: "ended", endedAt: Date.now() } });
-    sendTo(ws, { type: "force_kill_result", sessionId: msg.sessionId, success: true, message: "WebSocket closed (no PID available)" });
-    return;
+    const endedAt = Date.now();
+    sessionManager.update(sessionId, { status: "ended", endedAt, closedReason: "manual" });
+    broadcast({ type: "session_updated", sessionId, updates: { status: "ended", endedAt, closedReason: "manual" } });
+    return { success: true, message: "WebSocket closed (no PID available)" };
   }
 
-  // Delegate the full SIGTERM → wait → SIGKILL escalation to the
-  // platform helper so Windows uses `taskkill /F /T /PID <pid>`
-  // (genuine tree kill) and POSIX keeps the 2s grace window.
+  // Delegate the full SIGTERM → wait → SIGKILL escalation to the platform
+  // helper so Windows uses `taskkill /F /T /PID <pid>` (genuine tree kill) and
+  // POSIX keeps the 2s grace window.
   // See change: route-kill-paths-through-platform.
-  //
-  // PID-safety check: skip SIGKILL escalation on Unix when the PID
-  // no longer resembles a pi process. We can't pass this check INTO
-  // killProcess without a plugin, so: if `killProcess` reports forced
-  // SIGKILL and isPiProcess says no, we still accept the result —
-  // the process was either a pi leaf or a recycled PID, and either
-  // way the session is ended. On Windows `taskkill /F /T` is atomic
-  // so the check isn't meaningful.
   const killResult = await killProcess(pid, { timeoutMs: 2000 });
 
   // Also kill any headless-registered siblings (same session ID).
   // See change: fix-keeper-kill-escalation (await for SIGKILL escalation).
-  await headlessPidRegistry.killBySessionId(msg.sessionId);
+  await headlessPidRegistry.killBySessionId(sessionId);
 
   const endedAt = Date.now();
-  sessionManager.update(msg.sessionId, { status: "ended", endedAt });
-  broadcast({ type: "session_updated", sessionId: msg.sessionId, updates: { status: "ended", endedAt } });
+  sessionManager.update(sessionId, { status: "ended", endedAt, closedReason: "manual" });
+  broadcast({ type: "session_updated", sessionId, updates: { status: "ended", endedAt, closedReason: "manual" } });
 
   if (!killResult.ok) {
-    // Process was already dead when the kill was issued.
-    sendTo(ws, { type: "force_kill_result", sessionId: msg.sessionId, success: true, message: "Process already exited" });
-    return;
+    return { success: true, message: "Process already exited" };
   }
   const suffix = killResult.forced ? " (SIGKILL)" : "";
-  sendTo(ws, { type: "force_kill_result", sessionId: msg.sessionId, success: true, message: `Process terminated${suffix}` });
+  return { success: true, message: `Process terminated${suffix}` };
+}
+
+export async function handleForceKill(
+  msg: Extract<BrowserToServerMessage, { type: "force_kill" }>,
+  ctx: BrowserHandlerContext,
+): Promise<void> {
+  const result = await forceKillSession(msg.sessionId, ctx);
+  const { sendTo, ws } = ctx;
+  sendTo(ws, { type: "force_kill_result", sessionId: msg.sessionId, ...result });
 }

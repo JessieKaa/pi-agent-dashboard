@@ -240,6 +240,22 @@ export interface PendingPrompt {
    * See change: optimistic-prompt-progress, fix-optimistic-prompt-stuck-sending.
    */
   status: "sending" | "sent" | "failed";
+  /**
+   * Why a failed bubble failed, when the cause is known at send time.
+   * `connection` = the browser refused the message (socket not open);
+   * `no_session_file` = the ended session cannot be resumed. Absent = unknown
+   * (the legacy 30 s timeout path, whose wording stays reserved for that case).
+   * See change: stop-discarding-known-session-state.
+   */
+  failureCause?: "connection" | "no_session_file";
+  /**
+   * The outbox entry this bubble represents, when the send was QUEUED. A late
+   * drop report (expiry/eviction) is matched on THIS id, never on text: two
+   * identical prompts queued back-to-back must not have the first entry's
+   * expiry fail the second bubble while the second entry still flushes.
+   * See change: stop-discarding-known-session-state.
+   */
+  queueId?: number;
 }
 
 /**
@@ -270,6 +286,62 @@ export function applyPromptReceived(state: SessionState, fresh: boolean): Sessio
  */
 export function carryPendingPrompt(prompt: PendingPrompt | undefined): PendingPrompt | undefined {
   return prompt && prompt.status !== "sending" ? prompt : undefined;
+}
+
+/**
+ * The `interactiveRequests` (and their paired `ui-<requestId>` message rows) a
+ * state reset may carry across a rebuild — the sibling of `carryPendingPrompt`
+ * for bridge asks. An interactive request is TWO pieces of state (design D8):
+ * the `interactiveRequests` entry AND the `role:"interactiveUi"` row pushed
+ * with it (`addInteractiveRequest`); carrying the entry alone renders
+ * nothing. Only UNANSWERED (`status === "pending"`) asks survive — answered /
+ * dismissed / cancelled ones are discarded, never resurrected. Carried rows
+ * keep their `toolCallId` and are appended at the TAIL of the rebuilt
+ * `messages` (AFTER any replay fold — the fold's `toolCallId` idempotency
+ * scans must never see them), where the assistant `message_end` reorder
+ * already places trailing `interactiveUi` rows; a later reorder re-claims a
+ * tool-paired row via its `toolCallId`.
+ * See change: fix-pending-prompt-lost-on-replay (design D8).
+ */
+export function carryInteractiveRequests(
+  state: SessionState | undefined,
+): Pick<SessionState, "interactiveRequests" | "messages"> {
+  const pending = state?.interactiveRequests.filter((r) => r.status === "pending") ?? [];
+  if (pending.length === 0) return { interactiveRequests: [], messages: [] };
+  const rowIds = new Set(pending.map((r) => `ui-${r.requestId}`));
+  const messages = (state?.messages ?? []).filter((m) => rowIds.has(m.id));
+  return { interactiveRequests: pending, messages };
+}
+
+/**
+ * Move the rows of the still-pending interactive requests back to the TAIL of
+ * `messages`.
+ *
+ * Why this is required, and not cosmetic: a full replay spans MULTIPLE
+ * `event_replay` batches. The carry lands the rows at the tail of the RESET
+ * batch, but every LATER batch folds transcript events AFTER them — burying the
+ * live dialog mid-transcript (and under virtualization, off-screen entirely)
+ * while its `interactiveRequests` entry survives and keeps the desync detector
+ * suppressed. The user then sees neither the dialog NOR the recovery pill. This
+ * is exactly the resync-reply-mid-replay shape the change targets, so the rows
+ * must be re-tailed for the whole sweep, not only at the reset batch.
+ *
+ * Idempotent and a no-op when nothing is pending or the rows are already last.
+ * See change: fix-pending-prompt-lost-on-replay (design D8).
+ */
+export function retailPendingInteractiveRows(state: SessionState): SessionState {
+  const rowIds = new Set(
+    state.interactiveRequests
+      .filter((r) => r.status === "pending")
+      .map((r) => `ui-${r.requestId}`),
+  );
+  if (rowIds.size === 0) return state;
+  const rows = state.messages.filter((m) => rowIds.has(m.id));
+  if (rows.length === 0) return state;
+  const tail = state.messages.slice(-rows.length);
+  if (tail.length === rows.length && tail.every((m) => rowIds.has(m.id))) return state;
+  const rest = state.messages.filter((m) => !rowIds.has(m.id));
+  return { ...state, messages: [...rest, ...rows] };
 }
 
 /**
@@ -1404,8 +1476,8 @@ export function reduceEvent(
     case "agent_end": {
       // agent_end fires per agent-run iteration (retries / queued follow-ups
       // still pending). It sets the INTERMEDIATE `"ended"` state and clears
-      // streaming; only `agent_settled` (real ≥ 0.80.4, or bridge-synthesized
-      // on floor pi — see bridge agent-settled.ts) resolves `"idle"`. All the
+      // streaming; only `agent_settled` (real ≥ 0.80.4, guaranteed at the
+      // 0.85.1 floor) resolves `"idle"`. All the
       // existing side-effects (last-error extraction, retry/pendingPrompt
       // clearing) stay here; only the `status:"idle"` line moved to the settle
       // arm. See change: adopt-pi-074-080-features (A.1).
@@ -1432,21 +1504,13 @@ export function reduceEvent(
     }
 
     case "agent_settled": {
-      // Floor-pi emits a compatibility settle after every agent_end. While the
-      // bridge still observes pi as busy, this is not terminal: preserve retry
-      // and abort suppression so Retry cannot overlap an automatic attempt.
-      if (data.retryPending === true) {
-        next.isStreaming = false;
-        next.status = "ended";
-        break;
-      }
-      // The single terminal signal that resolves `"idle"`. The bridge
-      // guarantees exactly one per run (real on pi ≥ 0.80.4, synthesized
-      // synchronously after `agent_end` on floor pi), so this arm needs no
-      // version / capability branch and no timer. Defensive on an illegal
-      // settle with no preceding `agent_end` (X2): still resolves idle and
-      // clears streaming without crashing. See change:
-      // adopt-pi-074-080-features (A.1).
+      // The single terminal signal that resolves `"idle"`. pi emits it
+      // exactly once per run (≥ 0.80.4, guaranteed at the 0.85.1 floor), so
+      // this arm needs no version / capability branch and no timer, and no
+      // per-attempt compatibility branch — the bridge no longer synthesizes a
+      // floor-pi settle. Defensive on an illegal settle with no
+      // preceding `agent_end` (X2): still resolves idle and clears streaming
+      // without crashing. See change: update-pi-core-0-85-adopt-apis.
       next.isStreaming = false;
       next.status = "idle";
       // Sole terminal signal for a retry chain — clear the retry state. The
@@ -2151,18 +2215,19 @@ export function reduceEvent(
 
     case "tool_execution_end": {
       const toolCallId = data.toolCallId as string;
-      // Supersede heal (`healedBy:"superseded"`) is a client-synthesized
-      // placeholder. D4: it MUST NOT clobber a real terminal row nor another
-      // superseded row — only a `running` row is eligible. A real end (no
-      // `healedBy`) always proceeds and overwrites a superseded placeholder.
-      // See change: fix-stuck-tool-card-superseded-heal.
+      // A SYNTHESIZED heal (`healedBy` set — `"superseded"` from the client,
+      // `"session_ended"` from the server) MUST NOT clobber a real terminal row
+      // nor another healed row: only a `running` row is eligible. A real end (no
+      // `healedBy`) always proceeds and overwrites a placeholder.
+      // See change: fix-stuck-tool-card-superseded-heal,
+      // heal-orphaned-tool-cards-on-session-end (design D4).
       const healedBy = data.healedBy as string | undefined;
       const existing = next.toolCalls.get(toolCallId);
       // A superseded synth may only finalize a live `running` map entry. An
       // absent entry (`existing === undefined`) is also rejected so a stray
       // synth can never mutate a message row while leaving `toolCalls`
       // inconsistent. Real ends (no `healedBy`) are unaffected.
-      if (healedBy === "superseded" && existing?.status !== "running") {
+      if (healedBy !== undefined && existing?.status !== "running") {
         break;
       }
       if (existing) {
@@ -2188,7 +2253,20 @@ export function reduceEvent(
         // so renderers (e.g. AgentToolRenderer) see the final status
         const isError = data.isError as boolean;
         let mergedDetails: Record<string, unknown> | undefined;
-        if (endDetails) {
+        if (endDetails && healedBy !== undefined) {
+          // A synthesized heal carries only `{agentId}`; replacing wholesale
+          // would drop the live Agent snapshot (status, tokens, description)
+          // the row already rendered from.
+          // See change: heal-orphaned-tool-cards-on-session-end.
+          // …but the STATUS must still go terminal: a live Agent snapshot can
+          // carry `status:"running"`, and preserving it would leave the card's
+          // details contradicting its `toolStatus`.
+          mergedDetails = {
+            ...(next.messages[idx].toolDetails ?? {}),
+            ...endDetails,
+            status: isError ? "error" : "completed",
+          };
+        } else if (endDetails) {
           mergedDetails = endDetails;
         } else if (next.messages[idx].toolDetails) {
           mergedDetails = {
@@ -2235,7 +2313,16 @@ export function reduceEvent(
         const endDetails = data.details as Record<string, unknown> | undefined;
         const agentId =
           endDetails && typeof endDetails.agentId === "string" ? endDetails.agentId : undefined;
-        if (toolName === "Agent" && agentId) {
+        const existingBackfillSub = agentId ? next.subagents.get(agentId) : undefined;
+        const subagentIsTerminal =
+          existingBackfillSub?.status === "completed" || existingBackfillSub?.status === "failed";
+        // The patch below sets `status` unconditionally and is spread AFTER
+        // `existingSub`, so a synthesized end would overwrite a REAL
+        // `completed` subagent with `failed` — reachable whenever
+        // `subagent_completed` arrived but the process died before the Agent
+        // tool's own end. A heal only reduces a non-terminal subagent.
+        // See change: heal-orphaned-tool-cards-on-session-end (design D4).
+        if (toolName === "Agent" && agentId && !(healedBy !== undefined && subagentIsTerminal)) {
           const isError = data.isError as boolean;
           const resultStr = typeof data.result === "string" ? (data.result as string) : undefined;
           const detailError =
@@ -2563,8 +2650,18 @@ export function reduceEvent(
     case "subagent_failed": {
       const id = data.id as string;
       const details = (data.details as Record<string, unknown> | undefined) ?? undefined;
+      const existingSubagent = next.subagents.get(id);
+      // Same rule as the Agent backfill: a synthesized heal never regresses a
+      // subagent that already reported a real terminal state.
+      // See change: heal-orphaned-tool-cards-on-session-end (design D4).
+      if (
+        data.healedBy !== undefined &&
+        (existingSubagent?.status === "completed" || existingSubagent?.status === "failed")
+      ) {
+        break;
+      }
       next.subagents = new Map(next.subagents);
-      const existing = next.subagents.get(id);
+      const existing = existingSubagent;
       setSubagentState(next.subagents, {
         ...(existing ?? { id, type: data.type as string ?? "unknown", description: data.description as string ?? "" }),
         status: event.eventType === "subagent_completed" ? "completed" : "failed",

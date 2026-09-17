@@ -5,7 +5,7 @@ Files in this directory. One row per source file. See change: fold-oversized-age
 | File | Purpose |
 |------|---------|
 | `LandingPage.tsx` | Onboarding landing screen. Three-step gated flow: credentials → pin folder → spawn session; step states… → see `LandingPage.tsx.AGENTS.md` |
-| `MobileActionMenu.tsx` | Kebab session-action menu for mobile. Rows: rename, hide/unhide, resume/fork, OpenSpec… Native-editor rows removed (change: remove-external-editor-integration). → see `MobileActionMenu.tsx.AGENTS.md` |
+| `MobileActionMenu.tsx` | Kebab session-action menu for mobile. Rows: rename, archive, resume/fork, OpenSpec… Native-editor rows removed (change: remove-external-editor-integration). Swaps hide/unhide for archive. See change: archive-sessions-lazy-load. → see `MobileActionMenu.tsx.AGENTS.md` |
 | `MobileOverlay.tsx` | Mobile sidebar overlay (`md:hidden`): fixed backdrop + left 72-width panel. Exports `HamburgerButton` (menu trigger) and `MobileOverlay`. |
 | `MobileShell.tsx` | Two-panel mobile shell (list + detail) with CSS-transform slide transitions and `useSwipeBack` (finger-tracked transform). Depth 0=list, 1=detail, 2=preview reuses detail panel. Exports `MobileShell`. Root is `w-full flex-1 min-h-0` — fills its flex PARENT; the App mobile root owns the `100dvh` + `overflow-hidden` bound so an in-flow banner cannot make the document scrollable (was `w-screen h-[100dvh]`). See change: fix-ux-degradation-long-session. |
 | `ResizableSidebar.tsx` | Drag-to-resize + collapse sidebar shell. Takes `SidebarState` (from `useSidebarState`). Clamp width 180–500px. Collapsed strip width 28px. Exports `ResizableSidebar`. Body drag styles via `useBodyDragStyle` (cleared on unmount mid-drag). See change: fix-ux-degradation-long-session. |

@@ -22,7 +22,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   indexSource,
@@ -32,7 +32,7 @@ import {
   SqliteFtsStore,
   validateConfig,
 } from "@blackbelt-technology/pi-dashboard-kb";
-import { execFileSync } from "@blackbelt-technology/pi-dashboard-shared/platform/exec.js";
+import { isAllowedCwd } from "@blackbelt-technology/pi-dashboard-shared/cwd-guard.js";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import type { KbConfigPatch, KbReindexResult, KbStats } from "../shared/kb-plugin-types.js";
 import type { KbJobRegistry } from "./job-registry.js";
@@ -48,55 +48,11 @@ export function projectConfigPath(cwd: string): string {
   return join(cwd, ".pi", "dashboard", "knowledge_base.json");
 }
 
-/** Canonicalize an absolute path for comparison: resolve, then follow symlinks
- *  (best-effort — a non-existent path keeps its resolved form). Pins are stored
- *  realpath-canonicalized while session cwds / the raw query string may reach
- *  the same folder via a symlink (macOS /var→/private/var, a symlinked repo
- *  root), so BOTH sides of the guard must canonicalize identically or the match
- *  spuriously fails. See change: fix-kb-worktree-cwd-guard. */
-function canonPath(p: string): string {
-  const abs = resolve(p);
-  try {
-    return realpathSync(abs);
-  } catch {
-    return abs;
-  }
-}
-
-/** If `cwd` is inside a git worktree, return its MAIN working-tree path (parent
- *  of the shared git-common-dir), else null. Server-derived via git — never a
- *  client-supplied main path — so a worktree is admitted only when its parent
- *  repo is independently a known folder. Enables reindexing a SESSION-LESS
- *  worktree that neither a live session cwd nor a pin covers.
- *  See change: fix-kb-worktree-cwd-guard. */
-function worktreeMainPath(cwd: string): string | null {
-  try {
-    const commonDir = execFileSync(
-      "git",
-      ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 2000 },
-    ).trim();
-    return commonDir ? dirname(commonDir) : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Pure cwd guard shared by the REST routes and the plugin_action handler:
- *  a cwd is allowed when it (or its git-worktree MAIN repo) is a known folder.
- *  Both sides canonicalize. See change: fix-plugin-action-fanout-and-handlers. */
-export function isAllowedCwd(cwd: string | undefined, known: () => string[]): cwd is string {
-  if (!cwd) return false;
-  const target = canonPath(cwd);
-  const knownCanon = known().map(canonPath);
-  if (knownCanon.includes(target)) return true;
-  // Admit a git worktree whose MAIN repo is a known folder (covers a
-  // session-less worktree — worktrees are never pinned and their session is
-  // transient, so the parent repo is the durable trust anchor).
-  const main = worktreeMainPath(cwd);
-  if (main && knownCanon.includes(canonPath(main))) return true;
-  return false;
-}
+/** cwd admission is owned by the shared module so kb-plugin and mcp-client
+ *  share ONE implementation. Re-exported here for the existing kb tests and the
+ *  plugin_action handler that import it from this module.
+ *  See change: extract-mcp-client-plugin. */
+export { isAllowedCwd };
 
 /** Reject a cwd that is missing or not a known folder. Returns true when handled. */
 function rejectCwd(reply: FastifyReply, cwd: string | undefined, known: () => string[]): cwd is undefined {
@@ -155,6 +111,8 @@ export async function reindexAll(cwd: string): Promise<KbReindexResult> {
           extensions: cfg.extensions,
           indexAgentsFiles: cfg.indexAgentsFiles,
           includeSourceMarkdown: cfg.includeSourceMarkdown,
+          respectGitignore: cfg.respectGitignore,
+          cwd,
         },
       );
       changed += stats.changed;

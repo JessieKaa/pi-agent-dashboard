@@ -5,6 +5,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { HostGateMode } from "./host-admission.js";
 import { DEFAULT_MEMORY_LIMITS, type MemoryLimitsConfig, MIN_REPLAY_WINDOW, type ReplayWindowMode } from "./memory-limits.js";
 import type { WindowsGitSourceSetting } from "./platform/select-git-source.js";
 import { inferPlatform, pathKey } from "./session-group-path.js";
@@ -20,6 +21,28 @@ export const CONFIG_DIR = path.join(os.homedir(), ".pi", "dashboard");
 export const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 
 export type SpawnStrategy = "tmux" | "headless";
+
+/**
+ * Host-admission rollout mode. `report` logs a would-refuse line and lets the
+ * request through; `enforce` refuses it. See change: add-host-allowlist-admission.
+ */
+export type { HostGateMode };
+
+export interface HostGateConfig {
+  mode: HostGateMode;
+}
+
+const HOST_GATE_MODES: HostGateMode[] = ["report", "enforce"];
+
+/**
+ * Validate a raw `hostGate.mode`. Absent / unrecognised → `report` (the
+ * non-breaking rollout default; see design D4).
+ */
+export function parseHostGateMode(raw: unknown): HostGateMode {
+  return typeof raw === "string" && (HOST_GATE_MODES as string[]).includes(raw)
+    ? (raw as HostGateMode)
+    : "report";
+}
 
 /**
  * Policy applied when a bridge re-registers a session after a dashboard
@@ -187,6 +210,29 @@ export const DEFAULT_SESSIONS: SessionsConfig = {
   useLoadWorker: true,
 };
 
+/**
+ * Session-list archival policy. Drives the boot scan's ended+hidden migration
+ * and the runtime auto-archive sweeper. `archiveAfterDays = 0` disables
+ * auto-archive; values are read live (no restart). See change:
+ * archive-sessions-lazy-load.
+ */
+export interface SessionListConfig {
+  /** Ended sessions whose reference age exceeds this many days are archived. `0` = never. */
+  archiveAfterDays: number;
+  /** Runtime sweep cadence in minutes. */
+  archiveSweepIntervalMinutes: number;
+}
+
+export const DEFAULT_SESSION_LIST: SessionListConfig = {
+  archiveAfterDays: 30,
+  archiveSweepIntervalMinutes: 60,
+};
+
+export const SESSION_LIST_LIMITS = {
+  archiveAfterDays: { min: 0, max: 3650 },
+  archiveSweepIntervalMinutes: { min: 1, max: 1440 },
+} as const;
+
 export interface KeeperLogConfig {
   /**
    * When `true`, per-session keepers archive pi's stdout/stderr (including full
@@ -327,7 +373,72 @@ export const DEFAULT_MODEL_PROXY: ModelProxyConfig = {
  * Plugin-specific config namespace.
  * Lives at ~/.pi/dashboard/config.json#plugins.<id>.*
  */
+export interface KrokiConfig {
+  /** Base URL of a Kroki instance used for diagram rendering. */
+  url?: string;
+  /** Opt-in to rendering via the public kroki.io when no URL is configured. Default false. */
+  allowRemote: boolean;
+}
+
+export const DEFAULT_KROKI_CONFIG: KrokiConfig = {
+  allowRemote: false,
+};
+
+export function parseKrokiConfig(raw: unknown): KrokiConfig {
+  if (!raw || typeof raw !== "object") return { ...DEFAULT_KROKI_CONFIG };
+  const r = raw as Record<string, unknown>;
+  const url = typeof r.url === "string" && r.url.trim() ? r.url.trim() : undefined;
+  const allowRemote = r.allowRemote === true;
+  return {
+    ...(url ? { url } : {}),
+    allowRemote,
+  };
+}
+
+/**
+ * Resolve the effective Kroki endpoint URL according to the resolution ladder (design D5):
+ * 1. Live KROKI_URL env override (highest precedence)
+ * 2. Explicitly configured kroki.url
+ * 3. https://kroki.io if allowRemote is true
+ * 4. null (declined)
+ */
+export function resolveKrokiEndpoint(
+  krokiConfig?: KrokiConfig,
+  envOverride: string | undefined = process.env.KROKI_URL,
+): string | null {
+  const sanitize = (url: string | undefined) => {
+    if (!url || typeof url !== "string") return undefined;
+    const trimmed = url.trim();
+    if (!/^https?:\/\//i.test(trimmed)) return undefined;
+    return trimmed.replace(/\/+$/, "");
+  };
+
+  const envUrl = sanitize(envOverride);
+  if (envUrl) return envUrl;
+  const cfgUrl = sanitize(krokiConfig?.url);
+  if (cfgUrl) return cfgUrl;
+  if (krokiConfig?.allowRemote) return "https://kroki.io";
+  return null;
+}
+
 export type PluginsConfig = Record<string, Record<string, unknown>>;
+
+/**
+ * Resource-saturation thresholds consulted by subagent admission. Each metric is
+ * optional and names the domain it measures — mixing the domains up makes a
+ * threshold silently never fire on a machine loaded by *many* sessions whose
+ * parent process reads low.
+ *
+ * See change: bound-subagent-fanout-under-host-pressure (D5).
+ */
+export interface SubagentSaturationThresholds {
+  /** PROCESS domain: event-loop delay max (ms) over the admission window. */
+  eventLoopDelayMs?: number;
+  /** PROCESS domain: this process's CPU share (percent). */
+  cpuPercent?: number;
+  /** MACHINE domain: the system 1-minute load average. */
+  loadAvg1m?: number;
+}
 
 export interface DashboardConfig {
   port: number;
@@ -344,6 +455,25 @@ export interface DashboardConfig {
   autoShutdown: boolean;
   shutdownIdleSeconds: number;
   /**
+   * Cold-start readiness budget (ms) the bridge's auto-spawn allows before
+   * giving up its health poll and reporting "readiness timeout". The spawned
+   * server keeps booting regardless — the timeout only controls how long the
+   * bridge waits before surfacing a warning, so a value below the real cold
+   * start produces a spurious error next to a healthy server. Slow hosts
+   * (large session histories make the startup scan the dominant cost) can
+   * raise this. A positive number is clamped into
+   * [`READINESS_TIMEOUT_MIN_MS`, `READINESS_TIMEOUT_MAX_MS`]; anything else
+   * falls back to the default. The clamp exists because both ends are
+   * failure modes, not preferences: a sub-second value reproduces the
+   * spurious timeout it is meant to cure, and an unbounded one leaves the
+   * bridge's launch spinner running for the session's lifetime.
+   *
+   * The auto-start lock's staleness bound is DERIVED from this value
+   * (`spawnReadinessBudgetMs`), so raising it cannot invert the
+   * budget > poll invariant. See change: add-configurable-readiness-timeout.
+   */
+  readinessTimeoutMs: number;
+  /**
    * Coalescing window (ms) the bridge applies to subagent `Agent` ticks on the
    * `tool_execution_update` carrier. `0` disables the throttle entirely and is
    * the byte-identical rollback path. Only Agent updates carrying a
@@ -352,6 +482,45 @@ export interface DashboardConfig {
    * See change: reduce-bridge-tick-bandwidth (D2/D3/D4).
    */
   subagentTickThrottleMs: number;
+  /**
+   * Effective cap on concurrently in-flight `Agent` children in one session.
+   * `0` disables admission entirely and is the exact-no-op rollback path.
+   * Absent resolves to `DEFAULT_MAX_CONCURRENT_SUBAGENTS` (active by default).
+   * A negative / non-integer / non-numeric value is malformed and resolves to
+   * the fail-open (uncapped) path — NOT to the disable path: a malformed gate
+   * must never refuse a call.
+   * See change: bound-subagent-fanout-under-host-pressure (D1/D6).
+   */
+  maxConcurrentSubagents: number;
+  /**
+   * Optional resource-saturation thresholds. Any metric at/above its threshold
+   * narrows the effective cap to 1 (never 0). Absent metric = "no signal".
+   * See change: bound-subagent-fanout-under-host-pressure (D5).
+   */
+  subagentSaturation?: SubagentSaturationThresholds;
+  /**
+   * One-shot marker: the boot migration has already rewritten a materialized
+   * `0` to the current default. Declared here so the settings round-trip
+   * PRESERVES it — a stripped marker re-runs the migration and silently undoes
+   * a deliberate `0`. See change: heal-orphaned-tool-cards-on-session-end (D5).
+   */
+  subagentTickThrottleMigrated?: boolean;
+  /**
+   * Max items per `POST /api/git/worktree/remove-batch` request. Each item is
+   * a synchronous, blocking removal on the event loop (D7), so the item count
+   * is the knob that bounds one HTTP request's worst-case stall.
+   *
+   * A positive integer is clamped into [`REMOVE_BATCH_CAP_MIN`,
+   * `REMOVE_BATCH_CAP_MAX`]; anything else — non-numeric, non-positive,
+   * non-integer — falls back to the default (50, so an unset config is
+   * byte-identical to the previous hard-coded cap). The bounds are failure
+   * modes, not preferences: a cap of 0 would disable the batch endpoint the
+   * manage-worktrees UI depends on, and an unbounded cap turns one request
+   * into an unbounded run of blocking removals.
+   *
+   * See change: apply-checkout-root-to-worktree-ops (D8).
+   */
+  removeBatchCap: number;
   spawnStrategy: SpawnStrategy;
   tunnel: {
     enabled: boolean;
@@ -417,6 +586,8 @@ export interface DashboardConfig {
   openspec: OpenSpecPollConfig;
   /** Session behavior — hydration worker offload toggle. */
   sessions: SessionsConfig;
+  /** Session-list archival policy (age threshold + sweep interval). */
+  sessionList: SessionListConfig;
   /** Embed/ephemeral session lifecycle controls (reaper, caps, acquire). Off by default. */
   embedLifecycle: EmbedLifecycleConfig;
   /** Keeper log behavior — gates capture of pi stdout/stderr into keeper-<id>.log. */
@@ -428,6 +599,22 @@ export interface DashboardConfig {
    * If the key is absent from config.json the default of 300 s applies.
    */
   askUserPromptTimeoutSeconds: number;
+  /**
+   * Hostnames the dashboard may answer on that are NOT already implied by
+   * `publicBaseUrls`, `cors.allowedOrigins`, a live tunnel, an IP literal,
+   * loopback, or `.local` — e.g. an internal reverse-proxy name. Bare
+   * hostnames only (no scheme/port); compared case-insensitively. Default `[]`;
+   * never seeded by `ensureConfig()`. Read live through the snapshot.
+   * See change: add-host-allowlist-admission.
+   */
+  allowedHosts: string[];
+  /**
+   * Host-admission rollout mode + the shape Settings ▸ Security writes. Default
+   * `{ mode: "report" }`; env `PI_DASHBOARD_HOST_GATE` overrides it at read
+   * time. Never seeded by `ensureConfig()`.
+   * See change: add-host-allowlist-admission.
+   */
+  hostGate: HostGateConfig;
   /** Networks trusted for full access without authentication (CIDR, wildcard, exact IP) */
   trustedNetworks: string[];
   /** Merged trustedNetworks + auth.bypassHosts (deduplicated). Computed at load time. */
@@ -527,6 +714,8 @@ export interface DashboardConfig {
    * until each extract-*-as-plugin change migrates them.
    */
   plugins: PluginsConfig;
+  /** Kroki diagram render proxy settings. */
+  kroki: KrokiConfig;
   /** Model proxy configuration (OpenAI/Anthropic-compatible /v1/* endpoints). */
   modelProxy: ModelProxyConfig;
   /**
@@ -670,6 +859,46 @@ export const SPAWN_READINESS_BUDGET_MS = HEALTH_CHECK_TIMEOUT_MS * 3;
 export const SERVER_STARTUP_DEADLINE_MS = SPAWN_READINESS_BUDGET_MS * 4;
 
 /**
+ * Default + clamp bounds for `removeBatchCap`. See change:
+ * apply-checkout-root-to-worktree-ops (D8).
+ */
+export const DEFAULT_REMOVE_BATCH_CAP = 50;
+export const REMOVE_BATCH_CAP_MIN = 1;
+export const REMOVE_BATCH_CAP_MAX = 500;
+export function clampRemoveBatchCap(v: unknown): number {
+  if (typeof v !== "number" || !Number.isInteger(v) || v <= 0) return DEFAULT_REMOVE_BATCH_CAP;
+  return Math.min(REMOVE_BATCH_CAP_MAX, Math.max(REMOVE_BATCH_CAP_MIN, v));
+}
+
+/** Clamp bounds for `readinessTimeoutMs` (see the field's doc comment). */
+export const READINESS_TIMEOUT_MIN_MS = 1_000;
+export const READINESS_TIMEOUT_MAX_MS = 600_000;
+
+/**
+ * The auto-start lock staleness bound (and the lock loser's wait) for a given
+ * configured readiness window.
+ *
+ * `SPAWN_READINESS_BUDGET_MS` is a CONSTANT floor, so a configurable health
+ * poll would otherwise invert the invariant documented above: the lock carries
+ * no `childPid` for the whole readiness window (`server-auto-start.ts` records
+ * it only on readiness success), so `isLockStale` falls through to pure age.
+ * With a 60 s poll and a 30 s bound, a second session breaks the winner's lock
+ * mid-spawn and starts a COMPETING server → `PortConflictError`, on exactly the
+ * slow hosts a raised window targets. Keeping the same ×3 ratio preserves
+ * "budget > poll" for every configured value.
+ * See change: add-configurable-readiness-timeout.
+ */
+export function spawnReadinessBudgetMs(readinessTimeoutMs?: number): number {
+  const poll =
+    typeof readinessTimeoutMs === "number" &&
+    Number.isFinite(readinessTimeoutMs) &&
+    readinessTimeoutMs > 0
+      ? readinessTimeoutMs
+      : HEALTH_CHECK_TIMEOUT_MS;
+  return Math.max(poll * 3, SPAWN_READINESS_BUDGET_MS);
+}
+
+/**
  * The shared production ports. Exported because the bridge's worktree
  * auto-start refusal keys on them (`autostart-guard.ts`) and a silent desync
  * between the two would let a worktree take the host's ports again.
@@ -719,8 +948,68 @@ export function resolveDashboardPorts(
   return { port, piPort };
 }
 
+/**
+ * Throttle ON by default: the un-throttled Agent tick stream is what starves a
+ * fan-out parent. Existing installs carry a materialized `0` from
+ * `ensureConfig`, rewritten once by the server-boot migration.
+ * See change: reduce-bridge-tick-bandwidth (D4),
+ * heal-orphaned-tool-cards-on-session-end (D5).
+ */
+export const DEFAULT_SUBAGENT_TICK_THROTTLE_MS = 500;
+
+/**
+ * Default cap on concurrently in-flight `Agent` children per session.
+ *
+ * Fixed by Decision 1's measurement table in the change's `design.md`: it must
+ * sit below every observed fatal fan-out width (3, 4, 7) so the default admits
+ * no census batch unchanged, and the spec asserts the property "defined, at
+ * least 2, below 3" rather than a literal so the constant survives that
+ * measurement. The value is therefore 2.
+ * See change: bound-subagent-fanout-under-host-pressure (D1/D6).
+ */
+export const DEFAULT_MAX_CONCURRENT_SUBAGENTS = 2;
+
+/**
+ * Resolve `maxConcurrentSubagents` from a raw config value.
+ *
+ * Absent → the active default. An explicit non-negative integer (including the
+ * `0` disable value) is honoured. Anything else is MALFORMED and resolves to
+ * the fail-open (uncapped) path — never to the disable path and never to a
+ * refusal, because a broken gate refusing every `Agent` call is strictly worse
+ * than the crash this capability mitigates.
+ * See change: bound-subagent-fanout-under-host-pressure (D6).
+ */
+export function resolveMaxConcurrentSubagents(raw: unknown): number {
+  if (raw === undefined) return DEFAULT_MAX_CONCURRENT_SUBAGENTS;
+  if (typeof raw === "number" && Number.isInteger(raw) && raw >= 0) return raw;
+  return Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Parse the optional saturation thresholds. A threshold that is not a positive
+ * finite number is dropped (absent = "no signal from that metric", not zero);
+ * an object with no usable threshold at all collapses to `undefined`.
+ * See change: bound-subagent-fanout-under-host-pressure (D5).
+ */
+export function parseSubagentSaturation(raw: any): SubagentSaturationThresholds | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const positive = (v: unknown): number | undefined =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+  const thresholds: SubagentSaturationThresholds = {
+    eventLoopDelayMs: positive(raw.eventLoopDelayMs),
+    cpuPercent: positive(raw.cpuPercent),
+    loadAvg1m: positive(raw.loadAvg1m),
+  };
+  return thresholds.eventLoopDelayMs === undefined &&
+    thresholds.cpuPercent === undefined &&
+    thresholds.loadAvg1m === undefined
+    ? undefined
+    : thresholds;
+}
+
 const DEFAULTS: DashboardConfig = {
   plugins: {},
+  kroki: { ...DEFAULT_KROKI_CONFIG },
   modelProxy: { ...DEFAULT_MODEL_PROXY },
   port: DEFAULT_DASHBOARD_PORT,
   piPort: DEFAULT_GATEWAY_PORT,
@@ -728,9 +1017,13 @@ const DEFAULTS: DashboardConfig = {
   autoStart: true,
   autoShutdown: false,
   shutdownIdleSeconds: 300,
-  // Rollout default `0` (off). Flipped to 500 once the throttle's suites are
-  // green. See change: reduce-bridge-tick-bandwidth (D4, task 6.1).
-  subagentTickThrottleMs: 0,
+  // Historical hardcoded value of the bridge cold-start health window — the
+  // shared health-poll constant, referenced rather than respelled so the two
+  // cannot drift. See change: add-configurable-readiness-timeout.
+  readinessTimeoutMs: HEALTH_CHECK_TIMEOUT_MS,
+  subagentTickThrottleMs: DEFAULT_SUBAGENT_TICK_THROTTLE_MS,
+  maxConcurrentSubagents: DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+  removeBatchCap: DEFAULT_REMOVE_BATCH_CAP,
   spawnStrategy: "headless",
   tunnel: {
     enabled: true,
@@ -748,8 +1041,11 @@ const DEFAULTS: DashboardConfig = {
   memoryLimits: { ...DEFAULT_MEMORY_LIMITS },
   openspec: { ...DEFAULT_OPENSPEC_POLL },
   sessions: { ...DEFAULT_SESSIONS },
+  sessionList: { ...DEFAULT_SESSION_LIST },
   embedLifecycle: { ...DEFAULT_EMBED_LIFECYCLE },
   keeperLog: { ...DEFAULT_KEEPER_LOG },
+  allowedHosts: [],
+  hostGate: { mode: "report" },
   trustedNetworks: [],
   resolvedTrustedNetworks: [],
   cors: { allowedOrigins: [] },
@@ -870,6 +1166,61 @@ function parseSessionsConfig(raw: any): SessionsConfig {
     useLoadWorker:
       typeof raw.useLoadWorker === "boolean" ? raw.useLoadWorker : DEFAULT_SESSIONS.useLoadWorker,
   };
+}
+
+/**
+ * Effective session-list archival policy. Out-of-range / non-integer values
+ * fall back to the default (never clamp a negative into a valid `0`, which
+ * would silently turn an invalid setting into "disabled"). Never throws —
+ * `loadConfig` must survive a hand-edited config.
+ * See change: archive-sessions-lazy-load.
+ */
+export function parseSessionListConfig(raw: any): SessionListConfig {
+  if (!raw || typeof raw !== "object") return { ...DEFAULT_SESSION_LIST };
+  const days = raw.archiveAfterDays;
+  const interval = raw.archiveSweepIntervalMinutes;
+  return {
+    archiveAfterDays:
+      Number.isInteger(days) && days >= SESSION_LIST_LIMITS.archiveAfterDays.min && days <= SESSION_LIST_LIMITS.archiveAfterDays.max
+        ? days
+        : DEFAULT_SESSION_LIST.archiveAfterDays,
+    archiveSweepIntervalMinutes:
+      Number.isInteger(interval) &&
+      interval >= SESSION_LIST_LIMITS.archiveSweepIntervalMinutes.min &&
+      interval <= SESSION_LIST_LIMITS.archiveSweepIntervalMinutes.max
+        ? interval
+        : DEFAULT_SESSION_LIST.archiveSweepIntervalMinutes,
+  };
+}
+
+/**
+ * Validate a raw `sessionList` patch for the config write path. An absent
+ * section is valid (defaults apply). Returns human-readable errors so the
+ * write endpoint can answer 400 without persisting an out-of-range value.
+ * See change: archive-sessions-lazy-load.
+ */
+export function validateSessionListConfig(raw: unknown): { ok: boolean; errors: string[] } {
+  if (raw === undefined || raw === null) return { ok: true, errors: [] };
+  if (typeof raw !== "object") return { ok: false, errors: ["sessionList must be an object"] };
+  const errors: string[] = [];
+  const { archiveAfterDays, archiveSweepIntervalMinutes } = raw as Record<string, unknown>;
+  if (archiveAfterDays !== undefined) {
+    const { min, max } = SESSION_LIST_LIMITS.archiveAfterDays;
+    if (!Number.isInteger(archiveAfterDays) || (archiveAfterDays as number) < min || (archiveAfterDays as number) > max) {
+      errors.push(`sessionList.archiveAfterDays must be an integer between ${min} and ${max}`);
+    }
+  }
+  if (archiveSweepIntervalMinutes !== undefined) {
+    const { min, max } = SESSION_LIST_LIMITS.archiveSweepIntervalMinutes;
+    if (
+      !Number.isInteger(archiveSweepIntervalMinutes) ||
+      (archiveSweepIntervalMinutes as number) < min ||
+      (archiveSweepIntervalMinutes as number) > max
+    ) {
+      errors.push(`sessionList.archiveSweepIntervalMinutes must be an integer between ${min} and ${max}`);
+    }
+  }
+  return { ok: errors.length === 0, errors };
 }
 
 function parseOpenSpecPollConfig(raw: any): OpenSpecPollConfig {
@@ -1254,6 +1605,7 @@ export function loadConfig(): DashboardConfig {
     const rawStrategy = parsed.spawnStrategy;
     const spawnStrategy: SpawnStrategy =
       VALID_SPAWN_STRATEGIES.includes(rawStrategy) ? rawStrategy : defaults.spawnStrategy;
+    const subagentSaturation = parseSubagentSaturation(parsed.subagentSaturation);
 
     const result: DashboardConfig = {
       port: parsed.port ?? defaults.port,
@@ -1262,12 +1614,25 @@ export function loadConfig(): DashboardConfig {
       autoStart: parsed.autoStart ?? defaults.autoStart,
       autoShutdown: parsed.autoShutdown ?? defaults.autoShutdown,
       shutdownIdleSeconds: parsed.shutdownIdleSeconds ?? defaults.shutdownIdleSeconds,
+      readinessTimeoutMs:
+        typeof parsed.readinessTimeoutMs === "number" &&
+        Number.isFinite(parsed.readinessTimeoutMs) &&
+        parsed.readinessTimeoutMs > 0
+          ? Math.min(
+              READINESS_TIMEOUT_MAX_MS,
+              Math.max(READINESS_TIMEOUT_MIN_MS, parsed.readinessTimeoutMs),
+            )
+          : defaults.readinessTimeoutMs,
       subagentTickThrottleMs:
         typeof parsed.subagentTickThrottleMs === "number" &&
         Number.isFinite(parsed.subagentTickThrottleMs) &&
         parsed.subagentTickThrottleMs >= 0
           ? parsed.subagentTickThrottleMs
           : defaults.subagentTickThrottleMs,
+      maxConcurrentSubagents: resolveMaxConcurrentSubagents(parsed.maxConcurrentSubagents),
+      ...(subagentSaturation ? { subagentSaturation } : {}),
+      ...(parsed.subagentTickThrottleMigrated === true ? { subagentTickThrottleMigrated: true } : {}),
+      removeBatchCap: clampRemoveBatchCap(parsed.removeBatchCap),
       spawnStrategy,
       tunnel: normalizeTunnelConfig(parsed.tunnel, defaults.tunnel),
       devBuildOnReload: parsed.devBuildOnReload ?? defaults.devBuildOnReload,
@@ -1278,8 +1643,13 @@ export function loadConfig(): DashboardConfig {
       memoryLimits: parseMemoryLimits(parsed.memoryLimits),
       openspec: parseOpenSpecPollConfig(parsed.openspec),
       sessions: parseSessionsConfig(parsed.sessions),
+      sessionList: parseSessionListConfig(parsed.sessionList),
       embedLifecycle: parseEmbedLifecycleConfig(parsed.embedLifecycle),
       keeperLog: parseKeeperLogConfig(parsed.keeperLog),
+      allowedHosts: Array.isArray(parsed.allowedHosts)
+        ? parsed.allowedHosts.filter((h: unknown): h is string => typeof h === "string")
+        : defaults.allowedHosts,
+      hostGate: { mode: parseHostGateMode(parsed.hostGate?.mode) },
       trustedNetworks: parseTrustedNetworks(parsed.trustedNetworks),
       resolvedTrustedNetworks: [],
       cors: {
@@ -1325,6 +1695,7 @@ export function loadConfig(): DashboardConfig {
           ? parsed.windowsGitSource
           : defaults.windowsGitSource,
       modelProxy: parseModelProxyConfig(parsed.modelProxy),
+      kroki: parseKrokiConfig(parsed.kroki),
       ...(typeof parsed.piSessionsDir === "string" && parsed.piSessionsDir.trim()
         ? { piSessionsDir: parsed.piSessionsDir }
         : {}),
@@ -1360,7 +1731,13 @@ export function ensureConfig(): void {
     autoStart: DEFAULTS.autoStart,
     autoShutdown: DEFAULTS.autoShutdown,
     shutdownIdleSeconds: DEFAULTS.shutdownIdleSeconds,
+    readinessTimeoutMs: DEFAULTS.readinessTimeoutMs,
     subagentTickThrottleMs: DEFAULTS.subagentTickThrottleMs,
+    // Seeded unconditionally: a fresh install is already AT the new default, so
+    // a later deliberate `0` must not be re-migrated on the next boot.
+    // See change: heal-orphaned-tool-cards-on-session-end (D5).
+    subagentTickThrottleMigrated: true,
+    removeBatchCap: DEFAULTS.removeBatchCap,
     spawnStrategy: DEFAULTS.spawnStrategy,
     tunnel: DEFAULTS.tunnel,
     devBuildOnReload: DEFAULTS.devBuildOnReload,

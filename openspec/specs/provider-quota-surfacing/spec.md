@@ -76,18 +76,37 @@ tokens and API keys SHALL NOT appear in `/api/quota`, any broadcast, or any log 
 - **THEN** no substring of any provider token/key SHALL appear in the output or log
 
 ### Requirement: Client SHALL render a per-provider quota widget and degrade gracefully
-The client entry SHALL render one quota mini-slider per enabled provider (matching
-the context slider's shape), driven by `/api/quota`, and SHALL claim
-`settings-section` for the ToS gate + master enable + per-provider toggles.
+The client entry SHALL claim the `composer-context-group` slot and render a `Quota` context group holding one chip per provider present in `/api/quota` `providers[]` with at least one window, and SHALL claim `settings-section` for the ToS gate + master enable + per-provider toggles. Each chip SHALL show the provider name followed by **every** window inline as `<window label> <pace bar> <used %>`, with the bar fill coloured by pace severity and a `now` tick. When the provider is flagged `stale` by the server the chip SHALL render its bars muted and append a dashed `not live` tag. When no provider has windows the client SHALL render nothing — no chip, no group, no note, no error. The label, note and chip accessible names SHALL be localized like the plugin's other strings.
+
+When the filtered provider list (entries in `/api/quota` `providers[]` with at least one window) is non-empty, the session's model provider is the prefix of `session.model` before the first `/` (undefined when `session.model` is undefined or has no `/`). The chip matching that provider SHALL render first with an accent ring and full opacity; other chips SHALL follow at reduced opacity. The chip SHALL NOT repeat the model id. When the provider is defined but absent from `providers[]`, a non-interactive dashed note `<model id> · no quota` (model id = the part after the first `/`) SHALL precede the chips, all of which SHALL render un-ringed at reduced opacity. When the provider is undefined, no chip SHALL be ringed or dimmed and no note SHALL render. Emphasis SHALL be derived on every render from the session, so a model change re-orders the chips without user action.
 
 #### Scenario: Widget renders from /api/quota
 - **WHEN** `/api/quota` returns a provider with windows
-- **THEN** the client SHALL render that provider's mini-slider with a fill coloured
-  by pace severity
+- **THEN** the client SHALL render that provider's chip in the `Quota` context group with one labelled pace bar per window, each fill coloured by pace severity
 
 #### Scenario: No data shows no widget
 - **WHEN** `/api/quota` returns no providers (disabled or none enabled)
-- **THEN** the client SHALL render no quota widget and no error
+- **THEN** the client SHALL render no quota chip, no `Quota` group and no error
+
+#### Scenario: Session provider chip leads with ring
+- **WHEN** `session.model` is `anthropic/claude-x` and `/api/quota` returns `anthropic` and `openai-codex`
+- **THEN** the `anthropic` chip SHALL render first with the accent ring, followed by the dimmed `openai-codex` chip
+
+#### Scenario: Session provider without quota shows a note
+- **WHEN** `session.model` is `google-vertex/gemini-x` and `/api/quota` returns only `anthropic`
+- **THEN** a dashed non-interactive note `gemini-x · no quota` SHALL precede the un-ringed, dimmed `anthropic` chip
+
+#### Scenario: Model switch moves the ring
+- **WHEN** the session's model changes from `anthropic/…` to `openai-codex/…`
+- **THEN** the `openai-codex` chip SHALL become first and ringed on the next render, with no user interaction
+
+#### Scenario: Model without provider prefix gets no emphasis
+- **WHEN** `session.model` is `my-alias` (no `/`) and `/api/quota` returns `anthropic`
+- **THEN** the `anthropic` chip SHALL render un-ringed and no note SHALL render
+
+#### Scenario: Stale provider is tagged
+- **WHEN** `/api/quota` returns a provider with `stale: true`
+- **THEN** the chip SHALL render its bars muted and append a `not live` tag
 
 ### Requirement: Client SHALL warn when usage outruns elapsed time, with safe math
 The client SHALL derive pace per window using consistent units
@@ -114,12 +133,13 @@ emit `Infinity`/`NaN` or a spurious warning.
 - **THEN** a `now` tick SHALL sit at `elapsed × 100`% of the track
 
 ### Requirement: Clicking a slider SHALL open the shared Dialog primitive with a provider selector
-Clicking a mini-slider SHALL open the dashboard's shared `Dialog` primitive
+Clicking a provider chip SHALL open the dashboard's shared `Dialog` primitive
 (`useUiPrimitive(UI_PRIMITIVE_KEYS.dialog)`), pre-selected to that provider, with a
-selector to switch provider or show all. The plugin SHALL NOT hand-roll a modal.
+selector to switch provider or show all. The plugin SHALL NOT hand-roll a modal. The
+`no quota` note SHALL NOT be clickable.
 
 #### Scenario: Click opens dialog pre-selected to the provider
-- **WHEN** the user clicks the Codex mini-slider
+- **WHEN** the user clicks the Codex chip
 - **THEN** the shared `Dialog` SHALL open centered and modal, showing the Codex
   card (its windows with pace bars, `now` tick, projected %)
 
@@ -249,3 +269,73 @@ SHALL preserve the retry configuration alongside the existing enablement fields.
   exists
 - **THEN** the persisted config SHALL retain the retry settings and SHALL NOT
   erase them
+
+### Requirement: Server SHALL fetch opencode-go Go-subscription quota
+When the plugin is enabled and `opencode-go` is enabled, the server SHALL fetch
+the OpenCode **Go subscription** usage from `GET https://opencode.ai/zen/go/v1/usage`
+with the `opencode-go` credential as `Authorization: Bearer <token>`, resolved
+through the host auth abstraction (never a hardcoded auth.json path). The request
+SHALL carry a non-default `User-Agent` header, because the default client
+fingerprint is rejected by the endpoint's edge (Cloudflare 1010 → HTTP 403) in a
+way indistinguishable from an auth failure. The response's `usage.rolling`,
+`usage.weekly`, and `usage.monthly` — each `{ status, percent, resetsAt }` — SHALL
+map to normalized quota windows. A window SHALL be emitted whenever it carries a
+finite `percent` AND a usable reset stamp, REGARDLESS of its `status` (so an
+`exceeded`/throttled cadence is still shown, not hidden). `percent` SHALL be
+treated as percent USED and clamped to `0..100`.
+
+#### Scenario: Go usage exposed
+- **WHEN** `opencode-go` is enabled and the endpoint returns
+  `{ usage: { rolling: { status:"ok", percent, resetsAt }, weekly:{…}, monthly:{…} } }`
+- **THEN** `GET /api/quota` SHALL include `opencode-go` with three normalized
+  windows carrying `usedPercent` (0..100) and `resetsAt`
+
+#### Scenario: User-Agent required
+- **WHEN** the server fetches opencode-go quota
+- **THEN** the request SHALL send a non-default `User-Agent` header so the edge
+  does not reject it as a bot (which would surface as a false auth failure)
+
+#### Scenario: No Go subscription on the key
+- **WHEN** the endpoint returns 403 `EntitlementError` (valid key, not on Go)
+- **THEN** the server SHALL treat it as a terminal failure, SHALL NOT retry, and
+  SHALL report `opencode-go` as unavailable rather than a stale or zero window
+
+#### Scenario: Edge block is not misread as no-subscription
+- **WHEN** the endpoint returns a 403 whose body signals a Cloudflare 1010 edge
+  block (not an entitlement error)
+- **THEN** the server SHALL report `opencode-go` unavailable with a DISTINCT
+  detail identifying the edge block, so it is not conflated with "no subscription"
+
+#### Scenario: Non-ok window still emitted
+- **WHEN** a returned window has a finite `percent` and reset stamp but a `status`
+  other than `"ok"`
+- **THEN** that window SHALL still be exposed with its real `percent`, NOT dropped
+
+#### Scenario: Malformed percent dropped
+- **WHEN** a returned window has a non-finite/absent `percent` or no reset stamp
+- **THEN** that window SHALL be omitted rather than exposed as a misleading 0%
+
+#### Scenario: Credential is header-only and correctly identified
+- **WHEN** the opencode-go quota is fetched, exposed, or its error logged
+- **THEN** the token SHALL be resolved for the `opencode-go` credential id (NOT
+  the Zen `opencode` id), SHALL appear only in the request `Authorization`
+  header, and no substring of it SHALL appear in `/api/quota`, any broadcast, or
+  any log line
+
+### Requirement: Wallet-balance and cookie-gated providers SHALL remain unsupported
+The plugin SHALL NOT attempt a quota fetch for providers that expose only a wallet
+balance with no resetting window (`deepseek`, `minimax`) or whose usage is reachable
+only behind a browser-session cookie plus a workspace id — specifically the
+OpenCode **Zen** pay-as-you-go gateway (`opencode`), whose balance requires the
+`server.queryBilling` console RPC. This exclusion SHALL NOT apply to the OpenCode
+**Go subscription** (`opencode-go`), which exposes a key-authenticated resetting-
+window usage API and IS supported.
+
+#### Scenario: Zen wallet not fetched
+- **WHEN** the plugin is enabled
+- **THEN** the server SHALL NOT call any `opencode` (Zen) balance/console endpoint
+  and SHALL NOT list `opencode`, `deepseek`, or `minimax` as supported providers
+
+#### Scenario: Go distinguished from Zen
+- **WHEN** the supported-provider list is computed
+- **THEN** it SHALL include `opencode-go` and SHALL NOT include `opencode`

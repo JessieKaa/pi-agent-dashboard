@@ -1,6 +1,6 @@
 /**
  * Session action callbacks extracted from App.tsx.
- * Handles send, abort, resume, spawn, hide, rename, shutdown, terminal, and selection actions.
+ * Handles send, abort, resume, spawn, archive, rename, shutdown, terminal, and selection actions.
  */
 
 import type { TerminalSession } from "@blackbelt-technology/pi-dashboard-shared/terminal-types.js";
@@ -8,10 +8,11 @@ import type { DashboardSession, ImageContent } from "@blackbelt-technology/pi-da
 import { useCallback } from "react";
 import { createInitialState, resolveInteractiveRequest, type SessionState } from "../lib/chat/event-reducer.js";
 import { encodePromptAnswer } from "../lib/chat/prompt-answer-encoder.js";
+import type { SendVerdict } from "./useWebSocket.js";
 
 export interface SessionActionDeps {
   selectedId: string | undefined;
-  send: (msg: any) => void;
+  send: (msg: any) => SendVerdict | void;
   navigate: (to: string) => void;
   setMobileOpen: React.Dispatch<React.SetStateAction<boolean>>;
   /**
@@ -197,7 +198,25 @@ export function useSessionActions(deps: SessionActionDeps) {
 
   const handleSend = useCallback((text: string, images?: ImageContent[], delivery?: "steer" | "followUp") => {
     if (selectedId) {
-      send({ type: "send_prompt", sessionId: selectedId, text, images, delivery });
+      // An ended session with no saved transcript can NEVER be resumed OR
+      // forked — the server's `sessionFile` guard runs before any mode
+      // branching. Detect it here so the bubble offers a fresh session in the
+      // same folder ("Fork instead") rather than a doomed Retry.
+      // See change: stop-discarding-known-session-state (task 2.3a).
+      const target = sessions.get(selectedId);
+      const cannotResume = target?.status === "ended" && !target.sessionFile;
+      const verdict = cannotResume
+        ? undefined
+        : send({ type: "send_prompt", sessionId: selectedId, text, images, delivery });
+      // A verdict that says the message never left the browser is a KNOWN
+      // failure: mark the bubble failed immediately and skip the 30 s safety
+      // path entirely (a `failed` bubble never arms it).
+      // See change: stop-discarding-known-session-state.
+      const rejected = verdict?.status === "rejected";
+      const failureCause = cannotResume ? ("no_session_file" as const) : rejected ? ("connection" as const) : undefined;
+      // Correlate a queued send with its outbox entry so a late drop report
+      // matches THIS bubble, not one carrying the same text.
+      const queueId = verdict?.status === "queued" ? verdict.entryId : undefined;
       // Optimistic feedback, scoped to idle / fresh-turn sends only. Mid-turn
       // sends are governed by `mid-turn-prompt-queue` (authoritative
       // `pendingQueues` chips) and SHALL NOT write `pendingPrompt`. The bridge
@@ -218,13 +237,15 @@ export function useSessionActions(deps: SessionActionDeps) {
             images,
             ...(images && images.length > 0 ? { imageCount: images.length } : {}),
             delivery,
-            status: "sending",
+            status: failureCause ? "failed" : "sending",
+            ...(failureCause ? { failureCause } : {}),
+            ...(queueId !== undefined ? { queueId } : {}),
           },
         });
         return next;
       });
     }
-  }, [selectedId, send, setSessionStates]);
+  }, [selectedId, send, setSessionStates, sessions]);
 
   const handleSelect = useCallback((id: string) => {
     navigate(`/session/${id}`);
@@ -268,7 +289,9 @@ export function useSessionActions(deps: SessionActionDeps) {
 
   const handleSendPromptToSession = useCallback(
     (sessionId: string, text: string, images?: ImageContent[]) => {
-      send({ type: "send_prompt", sessionId, text, images });
+      const verdict = send({ type: "send_prompt", sessionId, text, images });
+      const rejected = verdict?.status === "rejected";
+      const queueId = verdict?.status === "queued" ? verdict.entryId : undefined;
       // Same idle-scoped optimistic write as handleSend, for the card/board
       // quick-send path. The session may not be selected, so we read its state
       // from the map; if absent or streaming, skip the optimistic write and let
@@ -285,7 +308,9 @@ export function useSessionActions(deps: SessionActionDeps) {
             text,
             images,
             ...(images && images.length > 0 ? { imageCount: images.length } : {}),
-            status: "sending",
+            status: rejected ? "failed" : "sending",
+            ...(rejected ? { failureCause: "connection" as const } : {}),
+            ...(queueId !== undefined ? { queueId } : {}),
           },
         });
         return next;
@@ -293,6 +318,28 @@ export function useSessionActions(deps: SessionActionDeps) {
     },
     [send, setSessionStates],
   );
+
+  /**
+   * A queued prompt that was dropped undelivered (outbox expiry/eviction). The
+   * `send` verdict said `queued`, so nothing failed at call time; this is the
+   * late, honest correction. Matches the send-time `rejected` arm: cause is the
+   * dashboard connection, never the session. Only flips a prompt still in
+   * `sending` with the SAME text, so a later retype is not clobbered.
+   * See change: stop-discarding-known-session-state (test-plan Q1).
+   */
+  const markPromptUndelivered = useCallback((sessionId: string, queueId: number) => {
+    setSessionStates((prev) => {
+      const current = prev.get(sessionId);
+      const pending = current?.pendingPrompt;
+      if (!current || !pending || pending.status !== "sending" || pending.queueId !== queueId) return prev;
+      const next = new Map(prev);
+      next.set(sessionId, {
+        ...current,
+        pendingPrompt: { ...pending, status: "failed", failureCause: "connection" },
+      });
+      return next;
+    });
+  }, [setSessionStates]);
 
   const handleRetrySession = useCallback((sessionId: string) => {
     // A click can race with recovery after the button rendered. Re-read the
@@ -397,25 +444,18 @@ export function useSessionActions(deps: SessionActionDeps) {
     });
   }, [send, clearSpawningCwd, setSpawningCwds, spawnTimeoutsRef, pendingSpawnsRef]);
 
-  const handleHideSession = useCallback((sessionId: string) => {
-    setSessions((prev) => {
-      const next = new Map(prev);
-      const existing = next.get(sessionId);
-      if (existing) next.set(sessionId, { ...existing, hidden: true });
-      return next;
-    });
-    send({ type: "hide_session", sessionId });
-  }, [send, setSessions]);
+  // archive-sessions-lazy-load: manual archive replaces manual hide. The
+  // server owns eligibility (ended → immediate; idle-alive → pending intent
+  // + end; running → error), so the client just sends — the `session_archived`
+  // broadcast deletes the card and sets the folder count. No optimistic
+  // write: unlike hide, archiving removes the row entirely.
+  const handleArchiveSession = useCallback((sessionId: string) => {
+    send({ type: "archive_session", sessionId });
+  }, [send]);
 
-  const handleUnhideSession = useCallback((sessionId: string) => {
-    setSessions((prev) => {
-      const next = new Map(prev);
-      const existing = next.get(sessionId);
-      if (existing) next.set(sessionId, { ...existing, hidden: false });
-      return next;
-    });
-    send({ type: "unhide_session", sessionId });
-  }, [send, setSessions]);
+  const handleUnarchiveSession = useCallback((sessionId: string) => {
+    send({ type: "unarchive_session", sessionId });
+  }, [send]);
 
   // Optimistic tag write: mirror the new array locally, then send
   // set_session_tags (server normalizes + rebroadcasts). See change: add-session-tags.
@@ -490,7 +530,8 @@ export function useSessionActions(deps: SessionActionDeps) {
     handleAbort, handleForceKill, handleStopAfterTurn, handleCancelPending, handleRespondToUi, handleFlowAction, handleSend,
     handleSelect, handleRenameSession, handleShutdownSession, handleKillProcess,
     handleSendPromptToSession, handleRetrySession, handleResumeSession, handleResumeSessionKeepPosition, handleSpawnSession,
-    handleHideSession, handleUnhideSession, handleSetSessionTags, removeTagGlobally,
+    markPromptUndelivered,
+    handleArchiveSession, handleUnarchiveSession, handleSetSessionTags, removeTagGlobally,
     handleCreateTerminal, handleKillTerminal, handleRenameTerminal, handleTerminalTitle,
     handleOpenInlineTerminal, handleCloseInlineTerminal,
     handleListFiles,

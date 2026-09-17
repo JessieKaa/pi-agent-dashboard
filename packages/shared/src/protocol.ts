@@ -76,7 +76,17 @@ export interface InboundDropReportMessage {
 }
 
 /** Which transport fact a bridge is reporting. */
-export type BridgeDiagnosticEvent = "endpoint_resolved" | "retarget_refused" | "retarget_accepted";
+export type BridgeDiagnosticEvent =
+  | "endpoint_resolved"
+  | "retarget_refused"
+  | "retarget_accepted"
+  /**
+   * The bridge's liveness watchdog force-closed a socket. Without this, a
+   * client-initiated close is indistinguishable in server.log from a network
+   * drop or a server reap — all three read as `connection closed` followed by
+   * a re-register, so a reconnect storm cannot be attributed.
+   */
+  | "watchdog_force_close";
 
 /**
  * Bridge -> server: how this bridge chose its endpoint, and every refusal to
@@ -243,6 +253,20 @@ export interface ProcessMetrics {
   tickCoalesced?: number;
   tickDiscardedAtTerminal?: number;
   tickDroppedNotReady?: number;
+  /**
+   * Subagent fan-out admission counters (change:
+   * bound-subagent-fanout-under-host-pressure, D7). Cumulative for the bridge's
+   * lifetime. `fanoutAdmitted` are calls the gate admitted; `fanoutRefused` are
+   * refusals by any cause, of which `fanoutSaturationRefused` were caused by
+   * resource saturation rather than the static cap. The refusals are ALSO
+   * written to the durable session record, because the failure mode this
+   * capability addresses ends with the process gone and these live counters
+   * vanish with it. Ride the existing heartbeat metrics transport rather than a
+   * new one.
+   */
+  fanoutAdmitted?: number;
+  fanoutRefused?: number;
+  fanoutSaturationRefused?: number;
 }
 
 export interface SessionHeartbeatMessage {
@@ -250,6 +274,22 @@ export interface SessionHeartbeatMessage {
   sessionId: string;
   /** Process metrics from the pi agent process */
   metrics?: ProcessMetrics;
+  /**
+   * Bridge-reported agent liveness (`getBridgeState().isAgentStreaming`).
+   *
+   * `status: "streaming"` is otherwise a one-way latch — `agent_end` is the
+   * only path back to `idle`, so a single dropped `agent_end` sticks a card on
+   * `Thinking…` forever. The server reconciles session status against this on
+   * each beat (`reconcileAgentLiveness`).
+   *
+   * OPTIONAL by design (D5): absent ⇒ no liveness truth ⇒ no reconcile ⇒
+   * exactly the pre-change behaviour, so an old bridge against a new server
+   * degrades rather than breaks. Advisory for the watchdog: it MUST NOT alter
+   * the existing timeout/grace behaviour.
+   *
+   * See change: fix-stuck-streaming-status-latch.
+   */
+  agentRunning?: boolean;
 }
 
 export interface EventForwardMessage {
@@ -319,9 +359,13 @@ export interface GitInfoUpdateMessage {
   gitPrUrl?: string;
   /**
    * Set when the session's cwd is a git worktree. `null` clears any
-   * previously-stored worktree state on the server (e.g. cwd switched
-   * to a non-worktree). Absent on older bridges — server treats as
-   * "no change". See change: add-worktree-spawn-dialog.
+   * previously-stored worktree state on the server — UNLESS parentage was
+   * already resolved for the session, in which case it is retained (a `null`
+   * after set means the worktree was removed underneath a live session, not
+   * that the cwd switched to a plain checkout). Absent on older bridges —
+   * server treats as "no change".
+   * See changes: add-worktree-spawn-dialog,
+   *               fix-worktree-grouping-lost-on-remove.
    */
   gitWorktree?: import("./types.js").GitWorktreeInfo | null;
   /**
@@ -584,6 +628,13 @@ export interface PromptRequestMessage {
     props: Record<string, unknown>;
   };
   placement: string;
+  /**
+   * Correlation token echoed by the bridge on a `prompt_resync_request` reply,
+   * so the server routes the re-emitted prompt to the requesting socket as a
+   * blocking frame instead of the guarded fan-out. Absent on a live prompt.
+   * See change: fix-pending-prompt-lost-on-replay (D4).
+   */
+  __resyncRequestId?: string;
 }
 
 /**
@@ -1046,6 +1097,22 @@ export interface CredentialsUpdatedMessage {
   type: "credentials_updated";
 }
 
+/**
+ * Server → extension: the plaintext MCP bearer minted for THIS session, sent
+ * only on the session's own bridge socket (the `credentials_updated` lane).
+ *
+ * The bridge assigns it to its own `process.env.PI_DASHBOARD_MCP_TOKEN` so the
+ * provisioned `pi-dashboard` entry's `requestHeadersCommand` can echo it per
+ * HTTP request. NEVER re-emitted onto `pi.events` — that bus is shared with
+ * every extension, and `plugin_emit_event` was measured to deliver payloads to
+ * unrelated subscribers (see change: wire-mcp-session-token, design D5).
+ */
+export interface McpTokenMintedExtensionMessage {
+  type: "mcp_token_minted";
+  /** Plaintext `mcp_`-prefixed bearer. Held in memory only — never logged. */
+  token: string;
+}
+
 export interface FlowManagementExtensionMessage {
   type: "flow_management";
   sessionId: string;
@@ -1110,7 +1177,9 @@ export interface RequestRolesMessage {
 export interface KillProcessMessage {
   type: "kill_process";
   sessionId: string;
-  pgid: number;
+  /** Optional: the REST/MCP lifecycle path may not know the pgid; the bridge
+   *  no-ops on a falsy value. See change: expand-mcp-tiered-surface. */
+  pgid?: number;
 }
 
 export interface ExtensionUiResponseMessage {
@@ -1298,6 +1367,7 @@ export type ServerToExtensionMessage =
   | RegisterRejectedExtensionMessage
   | RequestFlowsRefreshMessage
   | CredentialsUpdatedMessage
+  | McpTokenMintedExtensionMessage
   | FlowManagementExtensionMessage
   | ArchitectPromptResponseExtensionMessage
   | PromptResponseServerMessage
@@ -1318,7 +1388,8 @@ export type ServerToExtensionMessage =
   | PluginEmitEventExtensionMessage
   | PreferencesUpdateExtensionMessage
   | GitCommitDraftMessage
-  | SubagentResyncRequestExtensionMessage;
+  | SubagentResyncRequestExtensionMessage
+  | PromptResyncRequestExtensionMessage;
 
 /**
  * Server → extension: request an AI-drafted commit message. The bridge builds
@@ -1370,6 +1441,25 @@ export interface SubagentResyncRequestExtensionMessage {
    * See change: reduce-subagent-details-payload (D6, task 9.4).
    */
   reason?: "open" | "cadence";
+}
+
+/**
+ * Server → extension: ask the session's bridge to re-emit every prompt it is
+ * still awaiting an answer for, so a dialog lost to transcript back-pressure or
+ * a client state reset can be rebuilt without a page reload. The bridge replies
+ * with ordinary `prompt_request` frames carrying `__resyncRequestId` = the
+ * echoed token. See change: fix-pending-prompt-lost-on-replay (B).
+ */
+export interface PromptResyncRequestExtensionMessage {
+  type: "prompt_resync_request";
+  sessionId: string;
+  /**
+   * Correlation token from the requesting browser, echoed by the bridge onto
+   * each re-emitted `prompt_request` (`__resyncRequestId`) so the server can
+   * route the reply back to that one connection. Optional: an older browser
+   * omits it and every reply falls back to the ordinary fan-out.
+   */
+  requestId?: string;
 }
 
 

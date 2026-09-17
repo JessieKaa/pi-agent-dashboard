@@ -1,7 +1,9 @@
 ## Purpose
 
 Bridge extension behavior: forwards pi session events to the dashboard, tracks model and thinking-level changes, manages session lifecycle, and handles server→bridge control messages (abort, shutdown, stop-after-turn).
+
 ## Requirements
+
 ### Requirement: Relay plugin-emitted events into the session bus
 
 The bridge SHALL handle a `plugin_emit_event` control message from the server: when `pi.events` is available and the message carries a non-empty string `eventType`, it SHALL call `pi.events.emit(eventType, data)` where `data` is the message's `data` object (or `{}` when absent). The bridge SHALL NOT restrict `eventType` to a known set — it relays whatever the server-side plugin requested. A missing or non-string `eventType` SHALL be ignored (no emit).
@@ -673,9 +675,11 @@ The transport for a forwarded `ctx.ui.notify` is the `notify` message, NOT `prom
 
 ### Requirement: Bridge listens to thinking_level_select
 
-The bridge SHALL register a `pi.on("thinking_level_select", ...)` listener (pi 0.71+) and SHALL push a `model_update` message via the existing `sendModelUpdateIfChanged` debouncer whenever the listener fires. The bridge SHALL NOT rely on `model_select` to surface thinking-level changes.
+The bridge SHALL register a `pi.on("thinking_level_select", ...)` listener and SHALL push a `model_update` message via the existing `sendModelUpdateIfChanged` debouncer whenever the listener fires. The bridge SHALL NOT rely on `model_select` to surface thinking-level changes.
 
 The model-tracker's equality check that gates `model_update` pushes SHALL consider both `model` and `thinkingLevel` — a change in thinkingLevel alone (model unchanged) SHALL still produce a push.
+
+Supported Anthropic transports now persist per-turn thinking effort themselves and recover from signed-thinking mismatches. The bridge SHALL therefore remain a pure observer of thinking level: it SHALL report the level pi reports and SHALL NOT re-apply, cache-and-replay, or otherwise re-assert a thinking level onto the session. Where the dashboard derives selectable levels (`deriveSupportedThinkingLevels`), that derivation SHALL remain a read-only capability projection and SHALL NOT double-handle effort that pi already persists.
 
 #### Scenario: Thinking level change without model change
 - **WHEN** the user changes thinking level from `medium` to `high` (model unchanged)
@@ -686,9 +690,22 @@ The model-tracker's equality check that gates `model_update` pushes SHALL consid
 - **WHEN** `thinking_level_select` fires twice with the same value
 - **THEN** the bridge SHALL push at most one `model_update` for that value (the second is suppressed by the existing debouncer)
 
-#### Scenario: Pre-0.71 pi (unlikely under 0.73 floor)
-- **WHEN** the bridge runs against a pi that does NOT emit `thinking_level_select`
-- **THEN** the listener registration SHALL be a no-op and the bridge SHALL still operate (no crash, no error)
+#### Scenario: Bridge does not re-assert persisted effort
+- **GIVEN** pi persists thinking effort across turns on a supported Anthropic transport
+- **WHEN** a new turn begins
+- **THEN** the bridge SHALL NOT write a thinking level back onto the session
+- **AND** the level surfaced to the dashboard SHALL be the one pi reports
+
+#### Scenario: No version gate on the thinking-level listener
+- **WHEN** the bridge registers its `thinking_level_select` listener
+- **THEN** the registration SHALL be unconditional
+- **AND** SHALL NOT read the reported pi version to decide whether to register
+
+#### Scenario: Signed-thinking mismatch is handled upstream
+- **GIVEN** a provider returns a signed-thinking mismatch that pi recovers from internally
+- **WHEN** the turn completes
+- **THEN** the bridge SHALL NOT implement its own mismatch recovery
+- **AND** SHALL forward the resulting events unchanged
 
 ### Requirement: Bridge handles stop_after_turn for graceful exit
 
@@ -755,17 +772,26 @@ On receipt of `pi_version_update`, the server SHALL store `version` as `Dashboar
 
 ### Requirement: Bridge normalizes agent_settled to one terminal signal per run
 
-The bridge SHALL subscribe to pi's `agent_settled` event (pi 0.80.4+) and forward it as an `event_forward`, setting `getBridgeState().isAgentStreaming = false`. When the running pi does NOT emit `agent_settled` natively (pi < 0.80.4, determined from the pi version the bridge already reports in `session_register`), the bridge SHALL synthesize an `agent_settled` event synchronously immediately after each forwarded `agent_end`, so the dashboard receives exactly one terminal `agent_settled` per run on every supported pi. The bridge SHALL NOT require or advertise a `session_register` capability flag for this.
+The bridge SHALL subscribe to pi's native `agent_settled` event and forward it as an `event_forward`, setting `getBridgeState().isAgentStreaming = false`. Because `piCompatibility.minimum` now tracks the pinned runtime in lockstep, every pi whose version is known and at or above the floor emits `agent_settled` natively; the bridge SHALL NOT synthesize an `agent_settled` event, SHALL NOT gate this behavior on the reported pi version, and SHALL NOT carry a version-comparison helper for this purpose. The bridge SHALL NOT require or advertise a `session_register` capability flag for this.
+
+**Unknown-version carve-out.** `pi-runtime-selection` exempts a candidate whose version cannot be determined from the floor check, so such a runtime remains selectable and could in principle predate native `agent_settled` (pi < `0.80.4`). The "exactly one terminal settle per run" contract is therefore guaranteed only for known-version runtimes at or above the floor. This is accepted deliberately: an unknown-version runtime is outside every other guarantee the floor provides, and restoring synthesis for it would reintroduce the untestable below-floor branch class the lockstep floor exists to remove.
+
+Removing the synthesis path also removes a latent defect: the retired comparator evaluated the major component first and returned "supported" for any major ≥ 1, so the gate would have silently mis-answered on a future pi `1.x`.
 
 #### Scenario: Native agent_settled forwarded, streaming cleared
-- **WHEN** the bridge runs against pi ≥ 0.80.4 and pi emits `agent_settled`
+- **WHEN** pi emits `agent_settled`
 - **THEN** the bridge SHALL forward one `event_forward{eventType:"agent_settled"}` and set `isAgentStreaming=false`
-- **AND** SHALL NOT synthesize an additional `agent_settled`
+- **AND** SHALL NOT emit any additional `agent_settled`
 
-#### Scenario: Floor pi gets a synthesized settle after agent_end
-- **WHEN** the bridge runs against pi < 0.80.4 (no native `agent_settled`)
-- **THEN** the bridge SHALL synthesize one `agent_settled` synchronously after each forwarded `agent_end`
-- **AND** SHALL set `isAgentStreaming=false` on that synthesized settle
+#### Scenario: agent_end alone does not produce a settle
+- **WHEN** the bridge forwards an `agent_end`
+- **THEN** the bridge SHALL NOT emit a synthesized `agent_settled` alongside or after it
+- **AND** the dashboard SHALL receive exactly one terminal `agent_settled` per run, sourced from pi
+
+#### Scenario: No version gate on the settle path
+- **WHEN** the bridge initializes its event subscriptions
+- **THEN** the `agent_settled` subscription SHALL be unconditional
+- **AND** SHALL NOT read the reported pi version to decide its behavior
 
 ### Requirement: Bridge pushes external renames from session_info_changed via the auto-namer's self-filter
 
@@ -852,3 +878,56 @@ buffer, and cleaning up per-session ask_user attachments — SHALL run on **ever
 - **WHEN** `session_shutdown` fires with any `reason`, including a replacement reason
 - **THEN** the bridge SHALL send `session_unregister`, stop the metrics/heartbeat/git-poll timers, reset the subagent frame buffer, and clean up the session's ask_user attachments
 
+### Requirement: Reconnect heal reports agent liveness symmetrically
+
+On completing a reconnect handshake, the bridge SHALL report its authoritative agent-liveness truth (`getBridgeState().isAgentStreaming`) to the server in BOTH directions, not only when the agent is mid-turn.
+
+- When the agent IS mid-turn, the bridge SHALL cause the server to hold `streaming` (today's synthetic `agent_start` satisfies this).
+- When the agent is NOT mid-turn, the bridge SHALL send one immediate `session_heartbeat` carrying `agentRunning: false`. No new message type is introduced for this purpose. It SHALL NOT send a synthetic `agent_end`, because `agent_end` carries server-side run-boundary side effects (unread stamping, completed-first card reordering, attach-proposal clearing) that a correction must not fire.
+- The heal SHALL be sent AFTER the connection has flushed frames buffered during the disconnect. Sending it earlier would let the correction overtake a buffered real `agent_end`, which would then observe a `streaming`→`idle` edge that no longer exists and would fail to stamp unread — a regression against current behaviour.
+
+#### Scenario: Reconnect while mid-turn holds streaming
+
+- **WHEN** the bridge completes a reconnect with `isAgentStreaming === true`
+- **THEN** the server's status for the session is `streaming`
+
+#### Scenario: Reconnect while idle clears a stale streaming
+
+- **WHEN** the bridge completes a reconnect with `isAgentStreaming === false` and the server's status for the session is `streaming`
+- **THEN** the bridge sends a `session_heartbeat` carrying `agentRunning: false`
+- **AND** the server's status for the session becomes `idle`
+
+#### Scenario: Buffered agent_end is processed before the heal
+
+- **GIVEN** a real `agent_end` was buffered while the connection was down
+- **WHEN** the connection reopens and the bridge performs the idle heal
+- **THEN** the buffered `agent_end` reaches the server before the heal heartbeat
+- **AND** the session is stamped unread exactly as it would have been without this change
+
+#### Scenario: Idle reconnect sends no synthetic agent_end
+
+- **WHEN** the bridge completes a reconnect with `isAgentStreaming === false`
+- **THEN** no `agent_end` event is forwarded
+- **AND** the session's unread state and name are unchanged by the reconnect
+
+### Requirement: Heartbeat carries agent liveness
+
+Each periodic `session_heartbeat` the bridge sends SHALL carry `agentRunning: boolean` reflecting `getBridgeState().isAgentStreaming` at send time. This heals a lost run-boundary event on a socket that never closes, which the reconnect path cannot reach.
+
+The field SHALL be optional in the protocol so a bridge that predates this change still validates against a newer server; a heartbeat without the field SHALL be treated as carrying no liveness truth and SHALL trigger no reconcile.
+
+#### Scenario: Heartbeat heals a stale streaming without a reconnect
+
+- **GIVEN** the server's status for a session is `streaming` and the WebSocket has stayed open
+- **WHEN** the bridge sends a heartbeat with `agentRunning: false`
+- **THEN** the server's status for the session becomes `idle`
+
+#### Scenario: Heartbeat during a real turn is inert
+
+- **WHEN** the bridge sends a heartbeat with `agentRunning: true` while the server's status is `streaming`
+- **THEN** the session's status, `currentTool`, and unread state are unchanged
+
+#### Scenario: Heartbeat without the field changes nothing
+
+- **WHEN** the server receives a heartbeat with no `agentRunning` field
+- **THEN** no reconcile is performed and the session's status is unchanged

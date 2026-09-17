@@ -11,6 +11,12 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import {
+  defaultTierForSource,
+  isTier,
+  type Tier,
+  TIERS,
+} from "@blackbelt-technology/pi-dashboard-shared/tiers.js";
 import { readJsonFile, writeJsonFile } from "../persistence/json-store.js";
 
 const REGISTRY_FILENAME = "paired-devices.json";
@@ -30,6 +36,14 @@ export interface PairedDevice {
   createdAt: string;
   /** ISO timestamp of most recent authenticated request, or null. */
   lastSeen: string | null;
+  /** How the token was issued: the QR pairing ceremony, or direct operator
+   * issuance via `POST /api/paired-devices`. Rows written before the field
+   * existed read as `"pairing"` (E15). */
+  source: "pairing" | "manual";
+  /** Capability tier decided at mint (see change: expand-mcp-tiered-surface,
+   * D1). Rows written before the field existed read as `"operate"` — they
+   * were minted with full access and keep it. */
+  tier: Tier;
 }
 
 /** Public view of a device (no token material) for Settings / listing. */
@@ -38,6 +52,8 @@ export interface PairedDeviceView {
   label: string;
   createdAt: string;
   lastSeen: string | null;
+  source: "pairing" | "manual";
+  tier: Tier;
 }
 
 export function defaultRegistryPath(): string {
@@ -66,7 +82,14 @@ export class PairedDeviceRegistry {
 
   constructor(filePath = defaultRegistryPath()) {
     this.filePath = filePath;
-    this.devices = readJsonFile<PairedDevice[]>(filePath, []);
+    // Loader default, not a migration script (D4): a row written before
+    // `source`/`tier` existed reads as `"pairing"` / `"operate"`, and the next
+    // write back normalises it in place.
+    this.devices = readJsonFile<PairedDevice[]>(filePath, []).map((d) => ({
+      ...d,
+      source: d.source === "manual" ? "manual" : "pairing",
+      tier: isTier(d.tier) ? d.tier : "operate",
+    }));
   }
 
   private persist(): void {
@@ -82,8 +105,23 @@ export class PairedDeviceRegistry {
   /**
    * Register a new device, returning the plaintext bearer token (shown once).
    * The token is never persisted in plaintext.
+   *
+   * @param source issuance path: `"pairing"` (QR ceremony, the default so the
+   *   existing caller needs no edit) or `"manual"` (direct operator mint).
+   * @param tier capability tier. Defaults by source: `pairing` → `operate`,
+   *   `manual` → `observe` (D1). An explicit value must be a valid `Tier`;
+   *   `add` throws BEFORE minting or persisting otherwise, so a bad tier leaves
+   *   the registry byte-identical (E3).
    */
-  add(label: string): { device: PairedDeviceView; token: string } {
+  add(
+    label: string,
+    source: "pairing" | "manual" = "pairing",
+    tier?: Tier,
+  ): { device: PairedDeviceView; token: string } {
+    if (tier !== undefined && !isTier(tier)) {
+      throw new Error(`invalid tier: ${String(tier)} (expected one of ${TIERS.join(", ")})`);
+    }
+    const resolvedTier: Tier = tier ?? defaultTierForSource(source);
     const token = crypto.randomBytes(TOKEN_BYTES).toString("base64url");
     const device: PairedDevice = {
       id: crypto.randomUUID(),
@@ -91,6 +129,8 @@ export class PairedDeviceRegistry {
       tokenHash: hashToken(token),
       createdAt: new Date().toISOString(),
       lastSeen: null,
+      source,
+      tier: resolvedTier,
     };
     this.devices.push(device);
     this.persist();
@@ -99,9 +139,11 @@ export class PairedDeviceRegistry {
 
   /**
    * Verify a presented bearer token. On success updates last-seen and returns
-   * the device id; on failure returns null. Constant-time hash comparison.
+   * the device id AND its tier; on failure returns null. Constant-time hash
+   * comparison. The tier is read from the row on EVERY call (no caching), so a
+   * tier change takes effect on the next request.
    */
-  verify(token: string | undefined | null): string | null {
+  verify(token: string | undefined | null): { id: string; tier: Tier } | null {
     if (!token) return null;
     const presented = hashToken(token);
     const now = Date.now();
@@ -116,7 +158,7 @@ export class PairedDeviceRegistry {
           this.lastPersistedAt.set(d.id, now);
           this.persist();
         }
-        return d.id;
+        return { id: d.id, tier: d.tier };
       }
     }
     return null;
@@ -136,6 +178,13 @@ export class PairedDeviceRegistry {
   }
 
   private toView(d: PairedDevice): PairedDeviceView {
-    return { id: d.id, label: d.label, createdAt: d.createdAt, lastSeen: d.lastSeen };
+    return {
+      id: d.id,
+      label: d.label,
+      createdAt: d.createdAt,
+      lastSeen: d.lastSeen,
+      source: d.source,
+      tier: d.tier,
+    };
   }
 }

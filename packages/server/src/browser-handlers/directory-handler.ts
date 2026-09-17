@@ -44,6 +44,10 @@ export function pinDirectorySideEffects(
 ): void {
   const { preferencesStore, directoryService, sessionManager, broadcast } = ctx;
   if (!preferencesStore) return;
+  // Pin change re-keys the archive index (worktree sessions move to/from their
+  // parent repo) and broadcasts the changed folder counts.
+  // See change: archive-sessions-lazy-load.
+  ctx.sessionArchive?.rekey();
   broadcast({ type: "pinned_dirs_updated", paths: preferencesStore.getPinnedDirectories() });
   if (directoryService) {
     directoryService.onDirectoryAdded(resolved).then(({ sessions, openspecData }) => {
@@ -64,7 +68,9 @@ export function pinDirectorySideEffects(
           // the evidence-derived time rather than the moment the directory was
           // added. See change: fix-ended-session-missing-endedat.
           sessionManager.unregister(hist.id, { witnessed: false });
-          sessionManager.update(hist.id, { hidden: true });
+          // Discovered history is a visible ended session — `hidden` now means
+          // "auto-hidden headless worker" only. See change:
+          // archive-sessions-lazy-load.
           const s = sessionManager.get(hist.id);
           if (s) broadcast({ type: "session_added", session: s });
         }
@@ -80,6 +86,7 @@ export function handleUnpinDirectory(
 ): void {
   if (ctx.preferencesStore) {
     ctx.preferencesStore.unpinDirectory(canonicalizePath(msg.path));
+    ctx.sessionArchive?.rekey();
     ctx.broadcast({ type: "pinned_dirs_updated", paths: ctx.preferencesStore.getPinnedDirectories() });
   }
 }
@@ -242,6 +249,58 @@ export function handleOpenSpecRefresh(
   }
 }
 
+/**
+ * `openspec_get { requestId, cwd }` — unicast-only on-demand fetch (D6).
+ * A gated or cached answer replies once with `final:true`. A cold tracked cwd
+ * replies immediately with the PENDING placeholder (`final:false`), then a
+ * `final:true` reply carrying the poll outcome — or, if the poll itself
+ * rejects (an unexpected throw; `pollDirectoryGated` normally RESOLVES the
+ * fold's finalized payload even on CLI failure), a `BROKEN · cli-failed`
+ * placeholder, so the requester always receives its final reply (X1).
+ * NEVER broadcasts: the shared poll broadcasts via the service when the
+ * payload changed. Delivery rides `sendTo` (state class → `sendState`, key
+ * `openspec_get_result:<cwd>`), and `sendTo`'s readyState guard makes a
+ * closed requester socket a silent drop (X2).
+ * See change: fix-connect-snapshot-frame-loss (D6).
+ */
+export function handleOpenSpecGet(
+  msg: Extract<BrowserToServerMessage, { type: "openspec_get" }>,
+  ctx: BrowserHandlerContext,
+): void {
+  const { ws, sendTo, directoryService } = ctx;
+  // Hand-built `DirectoryService` fakes may lack the method (see the
+  // `refreshFolderHeadsForEnteringKeys` note); absent service/method is a
+  // silent no-op like the other openspec handlers.
+  if (!directoryService?.getOrPollOpenSpec) return;
+  const { hit, poll } = directoryService.getOrPollOpenSpec(msg.cwd);
+  if (hit) {
+    sendTo(ws, { type: "openspec_get_result", requestId: msg.requestId, cwd: msg.cwd, data: hit, final: !poll });
+  }
+  if (poll !== undefined) {
+    poll.then(
+      (data) => {
+        sendTo(ws, { type: "openspec_get_result", requestId: msg.requestId, cwd: msg.cwd, data, final: true });
+      },
+      () => {
+        sendTo(ws, {
+          type: "openspec_get_result",
+          requestId: msg.requestId,
+          cwd: msg.cwd,
+          data: {
+            initialized: false,
+            pending: false,
+            changes: [],
+            // The cwd passed the root gate to have a poll at all.
+            hasOpenspecDir: true,
+            readiness: { state: "BROKEN", reason: "cli-failed" },
+          },
+          final: true,
+        });
+      },
+    );
+  }
+}
+
 export function handleOpenSpecBulkArchive(
   msg: Extract<BrowserToServerMessage, { type: "openspec_bulk_archive" }>,
   ctx: BrowserHandlerContext,
@@ -272,12 +331,26 @@ export function handleOpenSpecBulkArchive(
   }
 }
 
+export function forwardExtensionUiResponse(
+  piGateway: BrowserHandlerContext["piGateway"],
+  args: { sessionId: string; requestId: string; result: unknown; cancelled?: boolean },
+): void {
+  piGateway.sendToSession(args.sessionId, {
+    type: "extension_ui_response",
+    sessionId: args.sessionId,
+    requestId: args.requestId,
+    result: args.result,
+    // Normalise to a boolean so the REST and WS entry points emit an
+    // identical message (E27).
+    cancelled: args.cancelled === true,
+  });
+}
+
 export function handleExtensionUiResponse(
   msg: Extract<BrowserToServerMessage, { type: "extension_ui_response" }>,
   ctx: BrowserHandlerContext,
 ): void {
-  ctx.piGateway.sendToSession(msg.sessionId, {
-    type: "extension_ui_response",
+  forwardExtensionUiResponse(ctx.piGateway, {
     sessionId: msg.sessionId,
     requestId: msg.requestId,
     result: msg.result,

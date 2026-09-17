@@ -19,8 +19,10 @@ function deps(abortSession: ServerContextDeps["abortSession"]): ServerContextDep
     registerBrowserHandler: () => {},
     onEvent: () => () => {},
     onSessionEnded: () => () => {},
+    onSessionResolved: () => () => {},
     sendToSession: () => true,
     emitEventToSession: () => true,
+    sendExtensionMessage: () => false,
     consumeAll: () => [],
     spawnSession: async () => ({ success: true }),
     abortSession,
@@ -31,6 +33,11 @@ function deps(abortSession: ServerContextDeps["abortSession"]): ServerContextDep
     consume: () => undefined,
     getPluginConfig: () => ({}),
     updatePluginConfig: async () => {},
+    mintSpawnToken: () => "tok-test",
+    renameSession: () => false,
+    assignSessionRef: () => false,
+    networkGuard: async () => {},
+    onShutdown: () => () => {},
   };
 }
 

@@ -5,7 +5,9 @@
 This capability covers the **plugin loader runtime**: monorepo manifest discovery, server-side dynamic-import bootstrap, client-side static-registry generation (Vite plugin), bridge entry auto-register/deregister into pi's `~/.pi/agent/settings.json`, plugin context API (`PluginContext` / `ServerPluginContext`), the `plugins.<id>.*` config namespace with JSON-Schema validation and reactive broadcast, and `/api/health.plugins[]` status reporting.
 
 The requirements below are layered: the design-level (contract) requirements come from change `dashboard-plugin-architecture`, and the implementation-level (runtime) requirements come from change `add-dashboard-shell-slots-runtime`. The motivating design notes live in `openspec/changes/dashboard-plugin-architecture/design.md`.
+
 ## Requirements
+
 ### Requirement: Emit a configured event into a session
 
 `ServerPluginContext` SHALL expose `emitEventToSession(sessionId: string, eventType: string, data?: Record<string, unknown>): boolean`. It SHALL relay a `plugin_emit_event` control message to the target session over the bridge so the in-session bridge re-emits `eventType` with `data` on `pi.events`. It SHALL be gated to first-party / trusted plugins using the same gate as `spawnSession`/`abortSession`: an untrusted plugin SHALL receive a hook that returns `false` and sends nothing. A non-string or empty `eventType` SHALL return `false` without sending. It SHALL return `true` only when the control message is dispatched to a connected session.
@@ -1109,17 +1111,29 @@ The settings page of a plugin that is installed but disabled SHALL still resolve
 
 The `PluginManifest` type SHALL accept an optional `requires?: PluginRequirements` field, where `PluginRequirements` declares three optional string arrays: `piExtensions` (pi extension package identifiers), `binaries` (executables that must resolve on PATH), and `services` (named service probes from a closed built-in registry). The manifest validator SHALL reject duplicate, empty, or whitespace-only entries in any of the three arrays.
 
-The closed built-in service-probe registry SHALL ship with exactly one entry in this change: `pi-model-proxy`. Plugins SHALL NOT register additional service-probe names.
+The closed built-in service-probe registry SHALL ship with exactly one entry: `model-proxy`. It SHALL be satisfied iff the dashboard's own model proxy routes were mounted at server boot (`modelProxy.enabled` as read at startup — the same boot-frozen value that gates `/v1/*` registration; a config change after boot takes effect at restart, for the probe and the routes alike); it SHALL NOT perform network I/O and SHALL NOT probe the upstream `@blackbelt-technology/pi-model-proxy` extension. The former name `pi-model-proxy` is NOT an alias and SHALL be reported as an unknown service name. Plugins SHALL NOT register additional service-probe names.
 
 #### Scenario: Valid requires field accepted
 
-- **WHEN** a plugin declares `requires: { piExtensions: ["@blackbelt-technology/pi-dashboard-subagents"], services: ["pi-model-proxy"] }`
+- **WHEN** a plugin declares `requires: { piExtensions: ["@blackbelt-technology/pi-dashboard-subagents"], services: ["model-proxy"] }`
 - **THEN** the validator SHALL accept the manifest.
 
 #### Scenario: Empty string entries rejected
 
 - **WHEN** a plugin declares `requires: { binaries: [""] }`
 - **THEN** the validator SHALL throw `ManifestValidationError`.
+
+#### Scenario: model-proxy service satisfied by dashboard config
+- **WHEN** a plugin declares `requires: { services: ["model-proxy"] }` and the server booted with `modelProxy.enabled: true`
+- **THEN** the probe runtime SHALL record `{ name: "model-proxy", satisfied: true }` without issuing any HTTP request.
+
+#### Scenario: model-proxy probe never reports unwired in a running server
+- **WHEN** a plugin manifest or a recommended-extensions entry declares `requires: { services: ["model-proxy"] }` and its requirements are read via `GET /api/health` (plugin `requirements`), the post-install refresh, or `GET /api/packages/recommended`
+- **THEN** the recorded service entry SHALL be `satisfied: true` or `satisfied: false` with a proxy-state reason; it SHALL NOT carry `error: "probe not wired"`.
+
+#### Scenario: model-proxy service unsatisfied when disabled
+- **WHEN** a plugin declares `requires: { services: ["model-proxy"] }` and the server booted with `modelProxy.enabled: false`
+- **THEN** the probe runtime SHALL record `{ name: "model-proxy", satisfied: false, error: <reason> }` and `missingRequirements` SHALL include `"model-proxy"`.
 
 #### Scenario: Unknown service name rejected at probe time but not at validate time
 
@@ -1238,8 +1252,8 @@ The flat `missingRequirements` SHALL list the `name` of every unsatisfied entry 
 
 #### Scenario: Mixed-satisfaction report
 
-- **WHEN** plugin `subagents` declares `requires: { piExtensions: ["@blackbelt-technology/pi-dashboard-subagents"], services: ["pi-model-proxy"] }`, `@blackbelt-technology/pi-dashboard-subagents` is installed, and `pi-model-proxy` is not reachable
-- **THEN** `/api/health.plugins[]` SHALL include `subagents` with `requirements.piExtensions = [{ name: "@blackbelt-technology/pi-dashboard-subagents", satisfied: true }]`, `requirements.services = [{ name: "pi-model-proxy", satisfied: false, error: <reason> }]`, and `missingRequirements = ["pi-model-proxy"]`.
+- **WHEN** plugin `subagents` declares `requires: { piExtensions: ["@blackbelt-technology/pi-dashboard-subagents"], services: ["model-proxy"] }`, `@blackbelt-technology/pi-dashboard-subagents` is installed, and the dashboard model proxy is disabled
+- **THEN** `/api/health.plugins[]` SHALL include `subagents` with `requirements.piExtensions = [{ name: "@blackbelt-technology/pi-dashboard-subagents", satisfied: true }]`, `requirements.services = [{ name: "model-proxy", satisfied: false, error: <reason> }]`, and `missingRequirements = ["model-proxy"]`.
 
 ### Requirement: `RecommendedExtension` SHALL support a companion-plugin field
 
@@ -1466,6 +1480,144 @@ Unsatisfied `paths` requirements SHALL flow through the same `PluginStatus.requi
 
 - **WHEN** a plugin's requirements are probed twice inside the cache window
 - **THEN** the second call returns the cached report without re-checking the filesystem
+
+### Requirement: `ServerPluginContext` exposes an installed-extension probe
+
+`ServerPluginContext` SHALL expose `isPiExtensionInstalled?(name: string): Promise<boolean>`, answering whether a pi extension is installed from the host's package registry (`packageManagerWrapper.listInstalled`, union of global and local scopes — deliberately a superset of the `piExtensions` probe's current global-only wiring), matched with the probe's `installedMatchesName` logic (id/name/displayName/source, including `sourcesMatch`). The capability SHALL be optional on the type so contexts constructed without it (older hosts, injected test contexts) remain valid.
+
+#### Scenario: Registry union across scopes
+
+- **WHEN** a plugin calls `isPiExtensionInstalled("pi-blackhole")`
+- **THEN** the host SHALL answer from the union of `listInstalled("global")` and `listInstalled("local")`
+- **AND** matching SHALL use the same `installedMatchesName` logic as the `piExtensions` requirement probe, not a weaker source-only comparison
+
+#### Scenario: Answer is boolean-only and ungated
+
+- **WHEN** any plugin, trusted or not, invokes the capability
+- **THEN** it SHALL receive only a boolean
+- **AND** no installed-package records SHALL be exposed through this capability
+
+#### Scenario: A registry scan failure rejects rather than resolving false
+
+- **WHEN** the underlying package-manager scan throws
+- **THEN** the capability's promise SHALL reject
+- **AND** SHALL NOT resolve `false`, which callers could not distinguish from an authoritative not-installed answer
+
+#### Scenario: Answers are cached
+
+- **WHEN** the capability is invoked repeatedly within the cache window
+- **THEN** the host SHALL NOT re-run the package-manager scan on every call
+- **AND** the cache duration SHALL be comparable to the requirement-probe cache (~30 s)
+- **AND** only successful scans SHALL be cached — a rejection SHALL NOT occupy the cache, so a recovered registry answers on the next call
+
+#### Scenario: Absent capability degrades, never throws
+
+- **WHEN** a plugin runs against a context that does not provide the capability
+- **THEN** reading the property SHALL yield `undefined` rather than throwing
+- **AND** the calling plugin remains responsible for a fallback
+
+### Requirement: Client runtime provides a slot-claims invalidation store
+
+The client-side plugin runtime SHALL provide a module-level slot-claims version store with an exported `bumpSlotClaimsVersion(): void`. `useSlotHasClaimsForSession` and slot consumers that evaluate `shouldRender` SHALL subscribe to the store (via `useSyncExternalStore`) so that a bump re-evaluates every gate, including for sessions that emit no further broadcasts.
+
+#### Scenario: Bump re-evaluates gates without a session broadcast
+
+- **WHEN** a plugin's late-arriving global signal resolves and the plugin calls `bumpSlotClaimsVersion()`
+- **THEN** every mounted gate wrapper SHALL re-invoke `shouldRender`
+- **AND** this SHALL occur for idle and ended sessions that will never emit `session_updated`
+
+#### Scenario: Unbumped store changes nothing
+
+- **WHEN** no plugin ever calls `bumpSlotClaimsVersion()`
+- **THEN** gate evaluation behaviour SHALL be identical to the pre-change behaviour
+
+#### Scenario: `shouldRender` stays synchronous
+
+- **WHEN** a gate is re-evaluated after a bump
+- **THEN** `shouldRender` SHALL still be called synchronously during render
+- **AND** the store SHALL NOT introduce an async gate path
+
+### Requirement: Generic session-ownership seam on `ServerPluginContext`
+
+`ServerPluginContext` SHALL expose a generic session-ownership seam so any plugin can stamp its own identity onto a session it spawns, without core naming the plugin. When a plugin spawns a session, it files an opaque `pluginRef` — a plugin-namespaced value core carries but never parses — plus an optional lifecycle declaration `{ recover?: boolean; finalizeOnSocketClose?: boolean }`. When the spawned session registers, the host resolves the ref and notifies the owning plugin.
+
+Core SHALL NOT read the interior of `pluginRef`. Core SHALL make lifecycle decisions only from the declared `{ recover, finalizeOnSocketClose }` values, never from the plugin's name, from any field inside `pluginRef`, or from the presence of an owner ref.
+
+The first-party features `automation` and `goal` SHALL each own their identity through this seam as ordinary contributions (built-ins are peers, not privileged): `automation` files `{ kind: "automation", automationRun: {...} }`, `goal` files `{ goalId }`. The emitted `.meta.json`, wire protocol, and `DashboardSession` field names and values SHALL be byte-identical to before this change, except that a session whose owner declares `recover: false` gains that single additive core-owned boolean (see the recovery requirement); user sessions never carry it and stay byte-identical.
+
+`pluginRef` SHALL be boundary-validated on receipt, following the publish/collect doctrine's fail-open rule: core SHALL accept only a plain object, SHALL reject (drop + warn once, without throwing) a malformed ref, and SHALL NOT let a ref overwrite a reserved session field it does not own. A plugin's ref merges only the keys that plugin owns; it cannot set another plugin's `goalId`/`automationRun` or a core-reserved field.
+
+#### Scenario: Malformed ref is dropped fail-open
+
+- **WHEN** a plugin files a non-object or otherwise malformed `pluginRef`
+- **THEN** core SHALL drop it and warn once for that key, without throwing
+- **AND** the session SHALL register with no owner ref rather than crashing the spawn
+
+#### Scenario: Ref cannot overwrite a field it does not own
+
+- **WHEN** a plugin files a ref containing a reserved key it does not own (e.g. another plugin's `goalId`)
+- **THEN** core SHALL NOT apply that key to the session
+
+#### Scenario: Plugin files an opaque ref and is notified on register
+
+- **WHEN** a plugin spawns a session through the seam with a `pluginRef` and the session later registers
+- **THEN** the owning plugin SHALL be notified with its own `pluginRef` and the resolved sessionId
+- **AND** core SHALL NOT have parsed the interior of that `pluginRef`
+
+#### Scenario: Two plugins own two sessions independently
+
+- **WHEN** two different plugins each spawn a session with their own `pluginRef`
+- **THEN** each plugin SHALL be notified only for its own session, with its own ref
+
+#### Scenario: Emitted keys are unchanged
+
+- **WHEN** `automation` files `{ kind: "automation", automationRun }` and `goal` files `{ goalId }` through the seam
+- **THEN** the resulting `.meta.json` and `DashboardSession` SHALL carry the same `kind` / `automationRun` / `goalId` field names and values as before this change
+
+### Requirement: Core lifecycle decisions read a generic flag, not the plugin name
+
+Core lifecycle decisions SHALL be derived from a generic core-owned flag, never from a hardcoded `kind === "automation"` branch, never from the plugin's name, and never from reading or detecting an owner ref. Core SHALL contain no branch that names a specific plugin, and no branch that reads `pluginRef` or enumerates owner keys, to make a lifecycle decision.
+
+**Recovery (cold start).** Recovery candidacy SHALL be governed by a single core-owned boolean `recover` on the session sidecar, defaulting to `true` when absent. `isRecoveryCandidate` SHALL read `meta.recover !== false`, replacing the `kind !== "automation"` guard. Core SHALL NOT read `pluginRef`, enumerate owner keys, or test for owner-ref presence to make this decision. A plugin that owns a session and does not want it replayed SHALL declare `recover: false`; core persists that resolved boolean onto the sidecar. Because the predicate already requires `live && status !== "ended"`, a session closed normally (not live / `ended`) is never a recovery candidate regardless of `recover`; the persisted `recover: false` only governs the crash window where an owned session is still `live && !ended`. User sessions never carry the field (absent ⇒ recoverable) and stay byte-identical; only an owned session that opts out gains the additive `recover: false` byte. Both first-party features `automation` and `goal` SHALL declare `recover: false` through this same generic field — neither is named in core, and their opt-out is symmetric.
+
+**Socket-close finalization.** A session whose owner declares `finalizeOnSocketClose: true` SHALL be finalized on socket close; a session with no such declaration SHALL NOT be. Core reads the declared value, not the plugin name.
+
+#### Scenario: Owned session in the crash window is not a recovery candidate
+
+- **WHEN** cold-start recovery scans a still-`live`, non-`ended` session whose sidecar carries `recover: false`
+- **THEN** `isRecoveryCandidate` SHALL return false for it
+- **AND** the decision SHALL read only the core-owned `recover` flag, referencing no plugin name and no owner ref
+
+#### Scenario: Both first-party features opt out through the same flag
+
+- **WHEN** the `automation` and `goal` contributions are inspected
+- **THEN** each SHALL declare `recover: false` through the same generic lifecycle field
+- **AND** core SHALL treat both identically, naming neither
+
+#### Scenario: Unowned session recovery is unchanged
+
+- **WHEN** cold-start recovery scans a still-`live` session whose sidecar carries no `recover` field
+- **THEN** `isRecoveryCandidate` SHALL treat it as `recover !== false` and return the same verdict it returned before this change
+
+#### Scenario: finalizeOnSocketClose:true session finalizes on socket close
+
+- **WHEN** a session whose owner ref declares `finalizeOnSocketClose: true` loses its socket
+- **THEN** core SHALL run the finalization path
+- **AND** a session that made no such declaration SHALL NOT be finalized on socket close
+
+#### Scenario: No plugin name remains in a core lifecycle branch
+
+- **WHEN** the core recovery and finalization paths are inspected
+- **THEN** neither SHALL contain a literal `"automation"` (or any other plugin name) as a lifecycle condition
+
+### Requirement: `automationRun` is removed from the generic plugin API surface
+
+The generic plugin runtime surface (`ServerPluginContext` / `server-context.ts`) SHALL NOT expose an `automationRun` field. Automation-specific identity SHALL travel only inside `automation`'s own `pluginRef`, not on the shared context type every plugin sees.
+
+#### Scenario: automationRun absent from the generic context type
+
+- **WHEN** the `ServerPluginContext` surface is inspected
+- **THEN** it SHALL NOT declare an `automationRun` field
 
 ## Related Capabilities
 

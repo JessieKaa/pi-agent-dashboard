@@ -39,7 +39,9 @@ export {
   useCurrentPluginId,
   useLanguage,
   usePluginConfig,
+  usePluginConfigOf,
   usePluginLogger,
+  usePluginMessage,
   usePluginRouter,
   usePluginSend,
   useSessionData,
@@ -79,6 +81,13 @@ export {
   useShellSession,
   useShellSessionOrNull,
 } from "./shell-sessions-context.js";
+export {
+  __resetSlotClaimsVersionForTests,
+  bumpSlotClaimsVersion,
+  getSlotClaimsVersion,
+  subscribeSlotClaimsVersion,
+  useSlotClaimsVersion,
+} from "./slot-claims-invalidation.js";
 export * from "./slot-consumers.js";
 export * from "./slot-error-boundary.js";
 export * from "./slot-registry.js";

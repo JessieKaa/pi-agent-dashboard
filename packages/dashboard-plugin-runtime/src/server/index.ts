@@ -11,9 +11,13 @@ export * from "./build-declaration-sdk.js";
 // Served-artifact build declaration (emit at build time, read by the server).
 // See change: optimize-client-bootstrap-and-bundle-coherence (P0).
 export * from "./build-metadata.js";
+export * from "./config-redact.js";
 export * from "./config-validator.js";
+export * from "./installed-probe.js";
 export * from "./loader.js";
+export * from "./plugin-enabled.js";
 export * from "./plugin-status-store.js";
 export * from "./requirement-probes.js";
 export * from "./server-context.js";
-export * from "./service-probes/pi-model-proxy.js";
+export * from "./service-probes/model-proxy.js";
+export * from "./ws-route-registry.js";

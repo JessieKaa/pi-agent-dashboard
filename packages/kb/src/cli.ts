@@ -5,9 +5,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { frontmatterConfigHash, loadConfig, type ResolvedConfig, type ResolvedSource } from "./config.js";
-import { agentsChain, doxInit, doxLint } from "./dox.js";
+import { agentsChain, doxInit, doxLint, listEmptyPurposeRows } from "./dox.js";
 import { ackTargets, applyDecisions, buildWorkItems } from "./dox-triage.js";
-import { readStaleness } from "./staleness.js";
 import { evaluate, loadGolden } from "./eval.js";
 import { runIndexAtomic } from "./index-run.js";
 import { indexSource } from "./indexer.js";
@@ -16,6 +15,7 @@ import { renderHits } from "./render.js";
 import { searchOptsFromConfig } from "./search-opts.js";
 import { classifyRef, type ResolvedSource as RResolvedSource, resolveAll } from "./sources.js";
 import { SCHEMA_VERSION, SqliteFtsStore } from "./sqlite-store.js";
+import { readStaleness } from "./staleness.js";
 import { defaultPromptTrust } from "./trust.js";
 import type { DocType, SearchOpts } from "./types.js";
 import { enrichHits } from "./verdict.js";
@@ -83,7 +83,7 @@ async function runIndex(cfg: ResolvedConfig, store: SqliteFtsStore, sources: RRe
   const eff = force || stale;
   let scanned = 0, changed = 0, deleted = 0, chunks = 0;
   for (const s of sources) {
-    const st = await indexSource(store, { root: s.id, dir: s.dir }, { force: eff, indexAgentsFiles: cfg.indexAgentsFiles, includeSourceMarkdown: cfg.includeSourceMarkdown, include: cfg.include, exclude: cfg.exclude, extensions: cfg.extensions, frontmatter: cfg.frontmatter });
+    const st = await indexSource(store, { root: s.id, dir: s.dir }, { force: eff, indexAgentsFiles: cfg.indexAgentsFiles, includeSourceMarkdown: cfg.includeSourceMarkdown, include: cfg.include, exclude: cfg.exclude, extensions: cfg.extensions, frontmatter: cfg.frontmatter, respectGitignore: cfg.respectGitignore, cwd: cfg.cwd });
     scanned += st.scanned; changed += st.changed; deleted += st.deleted; chunks += st.chunks;
   }
   store.setUserVersion?.(SCHEMA_VERSION);
@@ -123,6 +123,7 @@ Usage:
                                     (--source-rows also reports undocumented .ts/.tsx)
   kb dox triage [--json] [--limit N]  triage STALE rows vs the git diff since ack
               [--apply <d.json> [--write]] [--ack <targets.json>]
+  kb dox describe --list [--json] [--dir <path>]   list rows with an empty Purpose cell
   kb eval    --golden <file.json> [--limit N] [--doc-type ...] [--no-reindex]
              [--allow-zero] [--verbose] [--json]
              (--golden accepts a bare array of {q, expect} or an {"items": [...]} object;
@@ -181,7 +182,12 @@ function main() {
       // so an existing tree adopts it incrementally). See change: fix-kb-search-retrieval-quality.
       const r = doxLint({ cwd, json: !!flags.json, fix: !!flags.fix, sourceFileRows: !!flags["source-rows"] });
       if (flags.json) console.log(JSON.stringify(r, null, 2));
-      else for (const i of r.issues) console.log(`${i.kind}\t${i.agentsFile}${i.path ? "\t" + i.path : ""}\t${i.detail}`);
+      else {
+        // Coverage line (design D4, fix-dox-lint-blind-rows): a clean verdict
+        // must be distinguishable from an unread file.
+        console.log(`${r.filesScanned} files, ${r.rowsScanned} rows scanned, ${r.issues.length} findings`);
+        for (const i of r.issues) console.log(`${i.kind}\t${i.agentsFile}${i.path ? "\t" + i.path : ""}\t${i.detail}`);
+      }
       if (r.issues.length) process.exit(1);
       return;
     }
@@ -210,6 +216,24 @@ function main() {
       for (const i of items) console.log(`  ${i.baselineFound ? "diff" : "????"}\t${i.agentsFile}\t${i.row}`);
       return;
     }
+    if (sub === "describe") {
+      // --list is the only v1 op; accept it (and its absence) uniformly.
+      const r = listEmptyPurposeRows({ cwd, dir: typeof flags.dir === "string" ? flags.dir : undefined });
+      if (flags.json) {
+        console.log(JSON.stringify(r, null, 2));
+        return;
+      }
+      if (r.total === 0) {
+        console.log("no empty-purpose rows");
+        return;
+      }
+      console.log(`${r.total} empty-purpose row(s) across ${r.groups.length} AGENTS.md file(s)`);
+      for (const g of r.groups) {
+        console.log(g.agentsPath);
+        for (const s of g.subjects) console.log(`  ${s}`);
+      }
+      return;
+    }
     console.error(`unknown dox subcommand: ${sub}`); process.exit(2);
   }
 
@@ -236,7 +260,7 @@ async function runCmd(cmd: string, flags: Flags): Promise<void> {
     const s = await runIndexAtomic({
       dbPath: cfg.dbAbsPath,
       sources: sources.map((x) => ({ id: x.id, dir: x.dir })),
-      indexOpts: { force: !!flags.force, indexAgentsFiles: cfg.indexAgentsFiles, includeSourceMarkdown: cfg.includeSourceMarkdown, include: cfg.include, exclude: cfg.exclude, extensions: cfg.extensions, frontmatter: cfg.frontmatter },
+      indexOpts: { force: !!flags.force, indexAgentsFiles: cfg.indexAgentsFiles, includeSourceMarkdown: cfg.includeSourceMarkdown, include: cfg.include, exclude: cfg.exclude, extensions: cfg.extensions, frontmatter: cfg.frontmatter, respectGitignore: cfg.respectGitignore, cwd: cfg.cwd },
       facetConfigHash: frontmatterConfigHash(cfg.frontmatter),
       explicit,
     });

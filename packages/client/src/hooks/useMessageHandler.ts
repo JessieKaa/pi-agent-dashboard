@@ -18,7 +18,7 @@ import type { DiscoveredServerInfo } from "../components/connectivity/ServerSele
 import type { ToastVariant } from "../components/primitives/Toast.js";
 import { EMPTY_CANVAS_STATE, reduceCanvasChip, reduceCanvasIntent } from "../lib/canvas/canvas-gate.js";
 import { foldLiveEvents, type QueuedLiveEvent } from "../lib/chat/coalesce-live-events.js";
-import { addInteractiveRequest, addNotify, applyPromptReceived, carryPendingPrompt, createInitialState, dismissInteractiveRequest, finalizeBackfillSegment, reduceEvent, type SessionState } from "../lib/chat/event-reducer.js";
+import { addInteractiveRequest, addNotify, applyPromptReceived, carryInteractiveRequests, carryPendingPrompt, createInitialState, dismissInteractiveRequest, finalizeBackfillSegment, reduceEvent, retailPendingInteractiveRows, type SessionState } from "../lib/chat/event-reducer.js";
 import {
   createHistoryGapRow,
   createHistoryGapState,
@@ -30,7 +30,8 @@ import { dispatchInitEvent } from "../lib/git/worktree-init-bus.js";
 import { t } from "../lib/i18n/i18n.js";
 import { clearLoadingHistory, HYDRATE_CEILING_MS, rearmLoadingHistory } from "../lib/replay/loading-history.js";
 import type { ReplayPersister } from "../lib/replay/replay-persist.js";
-import { inferPlatform, pathKey } from "../lib/session/session-grouping.js";
+import { inferPlatform, pathKey, resolveSessionGroupPath } from "../lib/session/session-grouping.js";
+import type { OpenSpecGetInflight } from "./useOpenSpecReconcile.js";
 import { clearRecoveryOffer, setRecoveryOffer } from "../lib/state/recovery-offer-bus.js";
 import { pushSpawnErrorToast } from "../lib/state/spawn-error-toast-bus.js";
 import { isVisibleCwd } from "../lib/util/cwd-visibility.js";
@@ -40,6 +41,26 @@ type ReplayEvent = Extract<ServerToBrowserMessage, { type: "event_replay" }>["ev
 interface QueuedReplayBatch {
   events: ReplayEvent[];
   shouldReset: boolean;
+}
+
+/**
+ * Merge `carryInteractiveRequests` output into a rebuilt state: pending
+ * entries + their `ui-<requestId>` rows appended at the TAIL. Returns the
+ * input unchanged when nothing is pending. Used by both reset arms here —
+ * a rebuild must not erase a rendered dialog (design D8 of
+ * fix-pending-prompt-lost-on-replay).
+ */
+function withCarriedInteractiveRequests(
+  rebuilt: SessionState,
+  prev: SessionState | undefined,
+): SessionState {
+  const carried = carryInteractiveRequests(prev);
+  if (carried.interactiveRequests.length === 0) return rebuilt;
+  return {
+    ...rebuilt,
+    interactiveRequests: carried.interactiveRequests,
+    messages: [...rebuilt.messages, ...carried.messages],
+  };
 }
 
 /**
@@ -69,6 +90,22 @@ import {
 } from "@blackbelt-technology/dashboard-plugin-runtime";
 import { applyPluginConfigUpdate, getPluginConfig } from "@blackbelt-technology/dashboard-plugin-runtime/context";
 import { scrollDebugLog } from "../lib/util/scroll-debug.js";
+
+/**
+ * Group key a session's ended count belongs under (D4/D9): the same
+ * pin > worktree-mainPath > cwd precedence the sidebar groups by and the
+ * snapshot `endedTotals` keys carry. Reads the pinned set from the live
+ * visibility ref when present (optional dependency).
+ * See change: fix-connect-snapshot-frame-loss.
+ */
+function endedTotalsGroupKey(
+  session: Pick<DashboardSession, "cwd" | "gitWorktree">,
+  pinnedDirectories: ReadonlyArray<string> | undefined,
+): string {
+  const platform = inferPlatform([session.cwd, ...(pinnedDirectories ?? [])]);
+  const pinnedKeys = new Set((pinnedDirectories ?? []).map((d) => pathKey(d, platform)));
+  return resolveSessionGroupPath(session, pinnedKeys, platform);
+}
 
 export interface MessageHandlerSetters {
   setSessions: React.Dispatch<React.SetStateAction<Map<string, DashboardSession>>>;
@@ -152,6 +189,32 @@ export interface MessageHandlerSetters {
    * See change: lazy-load-session-history (task 7.3).
    */
   setHistorySpliceRev?: React.Dispatch<React.SetStateAction<number>>;
+  /**
+   * Session group key → ended-session count from the latest
+   * `sessions_snapshot`, kept live via session_updated/removed. Drives stub
+   * groups + expander labels. Optional for lean test contexts.
+   * See change: fix-connect-snapshot-frame-loss (D9).
+   */
+  setEndedTotalsMap?: React.Dispatch<React.SetStateAction<Map<string, number>>>;
+  /**
+   * Folder group key → archived-session count from `sessions_snapshot` +
+   * `session_archived` / `archived_count_updated`. Drives the per-folder
+   * `Archive (N)` fold. Optional for lean test contexts.
+   * See change: archive-sessions-lazy-load.
+   */
+  setArchivedCountMap?: React.Dispatch<React.SetStateAction<Map<string, number>>>;
+  /**
+   * Non-window ended sessions already paged per group key — the next
+   * `sessions_page` offset. Reset by every snapshot.
+   * See change: fix-connect-snapshot-frame-loss (D9).
+   */
+  setPagedCount?: React.Dispatch<React.SetStateAction<Map<string, number>>>;
+  /**
+   * Bumped once per applied `sessions_snapshot`; `useOpenSpecReconcile`
+   * re-runs on it so a reconnect snapshot re-pulls missing entries.
+   * See change: fix-connect-snapshot-frame-loss (D7/D9).
+   */
+  setSnapshotGeneration?: React.Dispatch<React.SetStateAction<number>>;
 }
 
 export interface MessageHandlerDeps {
@@ -202,6 +265,19 @@ export interface MessageHandlerDeps {
    * See change: add-auto-session-naming.
    */
   showToast?: (text: string, variant?: ToastVariant) => void;
+  /**
+   * Live mirror of the `sessions` map. `sessions_reordered` filtering and the
+   * live `endedTotals` transitions read it synchronously (setState updaters
+   * must stay pure under StrictMode). Optional for lean test contexts.
+   * See change: fix-connect-snapshot-frame-loss (D9).
+   */
+  sessionsRef?: React.MutableRefObject<Map<string, DashboardSession>>;
+  /**
+   * Shared with `useOpenSpecReconcile` — a `final:true` `openspec_get_result`
+   * resolves the cwd's in-flight entry (timer cleared).
+   * See change: fix-connect-snapshot-frame-loss (D7).
+   */
+  openspecGetInflightRef?: React.MutableRefObject<Map<string, OpenSpecGetInflight>>;
 }
 
 export function useMessageHandler(
@@ -214,8 +290,9 @@ export function useMessageHandler(
     setSessionOrderMap, setPinnedDirectories, setFavoriteModels, setWorkspaces, setTerminals,
     setDiscoveredServers, setSpawnErrors, setResumeErrors,
     setDisplayPrefs, setLoadingHistory, setReplayInFlight, setCanvasMap, setHistoryGaps, setHistorySpliceRev, setHistoryWindows,
+    setEndedTotalsMap, setArchivedCountMap, setPagedCount, setSnapshotGeneration,
   } = setters;
-  const { send, navigate, clearSpawningCwd, spawningCwdsRef, subscribedRef, pendingTerminalCwdRef, lastCreatedTerminalIdRef, maxSeqMapRef, selectedSessionIdRef, pendingSpawnsRef, loadingHistoryTimersRef, replayInFlightTimersRef, replayPersister, showToast } = deps;
+  const { send, navigate, clearSpawningCwd, spawningCwdsRef, subscribedRef, pendingTerminalCwdRef, lastCreatedTerminalIdRef, maxSeqMapRef, selectedSessionIdRef, pendingSpawnsRef, loadingHistoryTimersRef, replayInFlightTimersRef, replayPersister, showToast, sessionsRef, openspecGetInflightRef } = deps;
   // One-shot per session: suppress a repeat auto-name toast for the same
   // session id. See change: add-auto-session-naming.
   const autoNameToastedRef = useRef<Set<string>>(new Set());
@@ -350,6 +427,7 @@ export function useMessageHandler(
         const base = next ?? prev;
         let current = base.get(sessionId) ?? createInitialState();
         for (const batch of batches) {
+          const beforeBatch = current;
           if (batch.shouldReset) {
             const carry = carryPendingPrompt(current.pendingPrompt);
             current = createInitialState();
@@ -363,6 +441,16 @@ export function useMessageHandler(
             }
             current = reduceEvent(current, event);
           }
+          // Unanswered interactive requests + their `ui-<requestId>` rows carry
+          // across a full-sweep reset — merged AFTER the fold, at the tail, so
+          // the fold's toolCallId scans never see the carried rows (design D8
+          // of fix-pending-prompt-lost-on-replay). Then re-tail the pending
+          // rows after EVERY batch, not only the reset one: a multi-batch
+          // full replay appends later transcript rows AFTER the carried dialog,
+          // burying it mid-transcript (virtualized off-screen) while its entry
+          // keeps the desync detector suppressed.
+          if (batch.shouldReset) current = withCarriedInteractiveRequests(current, beforeBatch);
+          current = retailPendingInteractiveRows(current);
         }
         if (!next) next = new Map(prev);
         next.set(sessionId, current);
@@ -500,6 +588,25 @@ export function useMessageHandler(
           // See change: show-replay-in-flight-indicator.
           clearLoadingHistory(setReplayInFlight, replayInFlightTimersRef, msg.sessionId);
         }
+        // Live endedTotals (D9): a held session transitioning to ended grows
+        // its group's count between snapshots. Read via the sessions mirror
+        // OUTSIDE the updater — updaters must stay pure under StrictMode.
+        // See change: fix-connect-snapshot-frame-loss.
+        {
+          const updates = msg.updates as Partial<DashboardSession>;
+          const existing = sessionsRef?.current.get(msg.sessionId);
+          if (existing && existing.status !== "ended" && updates.status === "ended") {
+            const groupKey = endedTotalsGroupKey(
+              { ...existing, ...updates },
+              deps.cwdVisibilityInputsRef?.current.pinnedDirectories,
+            );
+            setEndedTotalsMap?.((prev) => {
+              const next = new Map(prev);
+              next.set(groupKey, (prev.get(groupKey) ?? 0) + 1);
+              return next;
+            });
+          }
+        }
         // Mirror model/thinkingLevel into sessionStates so the bottom StatusBar
         // (which reads selectedState.thinkingLevel ?? selectedSession.thinkingLevel)
         // stays in sync with the session card. model_update events from the bridge
@@ -566,6 +673,80 @@ export function useMessageHandler(
           });
           return next;
         });
+        // Live endedTotals (D9): removing an ended session shrinks its
+        // group's count. Untracked sessions cannot be attributed — skip.
+        // See change: fix-connect-snapshot-frame-loss.
+        {
+          const existing = sessionsRef?.current.get(msg.sessionId);
+          if (existing) {
+            const groupKey = endedTotalsGroupKey(
+              existing,
+              deps.cwdVisibilityInputsRef?.current.pinnedDirectories,
+            );
+            setEndedTotalsMap?.((prev) => {
+              const count = prev.get(groupKey) ?? 0;
+              // A live session removed WITHOUT a prior `session_updated: ended`
+              // (e.g. the ghost-session cleanup) just became ended → +1.
+              if (existing.status !== "ended") {
+                const next = new Map(prev);
+                next.set(groupKey, count + 1);
+                return next;
+              }
+              // An already-ended session removed from the server registry
+              // shrinks the group's ended sequence → −1.
+              if (count <= 0) return prev;
+              const next = new Map(prev);
+              next.set(groupKey, count - 1);
+              return next;
+            });
+          }
+        }
+        break;
+
+      case "session_archived":
+        // archive-sessions-lazy-load: DELETE the id (distinct from
+        // `session_removed`, which keeps the row as ended — the archived
+        // session left the live set entirely and lives in the folder fold).
+        {
+          const existing = sessionsRef?.current.get(msg.sessionId);
+          setSessions((prev) => {
+            if (!prev.has(msg.sessionId)) return prev;
+            const next = new Map(prev);
+            next.delete(msg.sessionId);
+            return next;
+          });
+          setArchivedCountMap?.((prev) => {
+            const next = new Map(prev);
+            next.set(msg.cwd, msg.count);
+            return next;
+          });
+          // An archived session was ended and counted in `endedTotals`; it
+          // just left the live set, so shrink its group's ended count the
+          // same way `session_removed` does for registry removals.
+          if (existing && existing.status === "ended") {
+            const groupKey = endedTotalsGroupKey(
+              existing,
+              deps.cwdVisibilityInputsRef?.current.pinnedDirectories,
+            );
+            setEndedTotalsMap?.((prev) => {
+              const count = prev.get(groupKey) ?? 0;
+              if (count <= 0) return prev;
+              const next = new Map(prev);
+              next.set(groupKey, count - 1);
+              return next;
+            });
+          }
+        }
+        break;
+
+      case "archived_count_updated":
+        // Restore / delete / pin re-key — the count is authoritative.
+        setArchivedCountMap?.((prev) => {
+          if ((prev.get(msg.cwd) ?? 0) === msg.count) return prev;
+          const next = new Map(prev);
+          next.set(msg.cwd, msg.count);
+          return next;
+        });
         break;
 
       case "session_state_reset":
@@ -581,7 +762,13 @@ export function useMessageHandler(
           // …but a `sending` bubble is NOT carried: nothing in the rebuilt
           // state can settle it. See change: fix-optimistic-prompt-stuck-sending.
           const carry = carryPendingPrompt(next.get(msg.sessionId)?.pendingPrompt);
-          const fresh = createInitialState();
+          // Unanswered interactive requests + their `ui-<requestId>` rows carry
+          // the same way — a server-signalled reset must not erase a rendered
+          // dialog (design D8 of fix-pending-prompt-lost-on-replay).
+          const fresh = withCarriedInteractiveRequests(
+            createInitialState(),
+            next.get(msg.sessionId),
+          );
           if (carry) fresh.pendingPrompt = carry;
           next.set(msg.sessionId, fresh);
           return next;
@@ -1333,10 +1520,87 @@ export function useMessageHandler(
       case "sessions_reordered":
         setSessionOrderMap((prev) => {
           const next = new Map(prev);
-          next.set(msg.cwd, msg.sessionIds);
+          const held = sessionsRef?.current;
+          if (!held) {
+            // No sessions mirror (lean test context): legacy replace.
+            next.set(msg.cwd, msg.sessionIds);
+            return next;
+          }
+          // D9: incoming order first (ids the client does not hold are
+          // ignored), then held ids absent from the incoming order kept at
+          // the tail — a live reorder must not evict already-paged ids.
+          // See change: fix-connect-snapshot-frame-loss.
+          const seen = new Set<string>();
+          const incoming: string[] = [];
+          for (const id of msg.sessionIds) {
+            if (held.has(id) && !seen.has(id)) {
+              incoming.push(id);
+              seen.add(id);
+            }
+          }
+          const merged = [...incoming];
+          for (const id of prev.get(msg.cwd) ?? []) {
+            if (held.has(id) && !seen.has(id)) {
+              merged.push(id);
+              seen.add(id);
+            }
+          }
+          next.set(msg.cwd, merged);
           return next;
         });
         break;
+
+      case "sessions_page_result":
+        // D9 page merge: sessions overwrite by id; the page's order ids
+        // append after the cwd's current order (already-present ids skipped);
+        // pagedCount advances by the page size so the next offset is right.
+        // See change: fix-connect-snapshot-frame-loss.
+        setSessions((prev) => {
+          const next = new Map(prev);
+          for (const s of msg.sessions) next.set(s.id, s);
+          return next;
+        });
+        setSessionOrderMap((prev) => {
+          const next = new Map(prev);
+          const current = prev.get(msg.cwd) ?? [];
+          const seen = new Set(current);
+          const merged = [...current];
+          for (const id of msg.order) {
+            if (!seen.has(id)) {
+              merged.push(id);
+              seen.add(id);
+            }
+          }
+          next.set(msg.cwd, merged);
+          return next;
+        });
+        setPagedCount?.((prev) => {
+          const next = new Map(prev);
+          next.set(msg.cwd, (prev.get(msg.cwd) ?? 0) + msg.sessions.length);
+          return next;
+        });
+        break;
+
+      case "openspec_get_result": {
+        const entry = openspecGetInflightRef?.current.get(msg.cwd);
+        // Match by requestId: a delayed reply from a timed-out earlier request
+        // must not overwrite newer data or clear the newer in-flight entry.
+        if (entry && entry.requestId !== msg.requestId) break;
+        // D6/D7: applied exactly like `openspec_update`. The in-flight mark
+        // releases only on `final:true` — a `final:false` placeholder is not
+        // a settled entry and its final reply may still be lost.
+        // See change: fix-connect-snapshot-frame-loss.
+        setOpenspecMap((prev) => {
+          const next = new Map(prev);
+          next.set(msg.cwd, msg.data);
+          return next;
+        });
+        if (msg.final && entry) {
+          clearTimeout(entry.timer);
+          openspecGetInflightRef?.current.delete(msg.cwd);
+        }
+        break;
+      }
 
       case "sessions_snapshot":
         // Atomic REPLACE — not merge. Drops stale ids from previous server
@@ -1345,6 +1609,17 @@ export function useMessageHandler(
         // See change: fix-stale-sessions-on-reconnect.
         setSessions(new Map(msg.sessions.map((s) => [s.id, s])));
         setSessionOrderMap(new Map(Object.entries(msg.orders)));
+        // D4/D9: endedTotals replaced wholesale; pages are void after a
+        // snapshot (the window resets); the generation bump re-runs OpenSpec
+        // reconciliation. `?? {}` tolerates a pre-change server omitting it.
+        // See change: fix-connect-snapshot-frame-loss.
+        setEndedTotalsMap?.(new Map(Object.entries(msg.endedTotals ?? {})));
+        // archive-sessions-lazy-load: archived counts replace wholesale with
+        // the rest of the snapshot. `?? {}` tolerates a pre-change server
+        // omitting the field at runtime.
+        setArchivedCountMap?.(new Map(Object.entries(msg.archivedCountByCwd ?? {})));
+        setPagedCount?.(new Map());
+        setSnapshotGeneration?.((n) => n + 1);
         break;
 
       case "pinned_dirs_updated":
@@ -1603,5 +1878,5 @@ export function useMessageHandler(
         break;
       }
     }
-  }, [send, clearSpawningCwd, navigate, setSessions, setSessionStates, setSessionCommands, setFileResults, setChangedOnDisk, setOpenspecMap, setModelsMap, setModelRefreshErrorsMap, setRolesMap, setSpawnResult, setSessionOrderMap, setPinnedDirectories, setFavoriteModels, setWorkspaces, setTerminals, setDiscoveredServers, setLoadingHistory, setHistoryWindows, setReplayInFlight, setCanvasMap, setHistoryGaps, setHistorySpliceRev, spawningCwdsRef, subscribedRef, pendingTerminalCwdRef, lastCreatedTerminalIdRef, maxSeqMapRef, selectedSessionIdRef, pendingSpawnsRef, loadingHistoryTimersRef, replayInFlightTimersRef, replayPersister, showToast, flushLiveEvents, scheduleLiveFlush, flushReplayEvents, scheduleReplayFlush, publishGap, clearHistoryWindow]);
+  }, [send, clearSpawningCwd, navigate, setSessions, setSessionStates, setSessionCommands, setFileResults, setChangedOnDisk, setOpenspecMap, setModelsMap, setModelRefreshErrorsMap, setRolesMap, setSpawnResult, setSessionOrderMap, setPinnedDirectories, setFavoriteModels, setWorkspaces, setTerminals, setDiscoveredServers, setLoadingHistory, setHistoryWindows, setReplayInFlight, setCanvasMap, setHistoryGaps, setHistorySpliceRev, spawningCwdsRef, subscribedRef, pendingTerminalCwdRef, lastCreatedTerminalIdRef, maxSeqMapRef, selectedSessionIdRef, pendingSpawnsRef, loadingHistoryTimersRef, replayInFlightTimersRef, replayPersister, showToast, flushLiveEvents, scheduleLiveFlush, flushReplayEvents, scheduleReplayFlush, publishGap, clearHistoryWindow, setEndedTotalsMap, setPagedCount, setSnapshotGeneration, sessionsRef, openspecGetInflightRef]);
 }

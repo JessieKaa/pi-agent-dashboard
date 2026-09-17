@@ -62,21 +62,24 @@ import { useLaunchSource } from "./hooks/useLaunchSource.js";
 import { useMessageHandler } from "./hooks/useMessageHandler.js";
 import { useMobile } from "./hooks/useMobile.js";
 import { useOpenSpecReader } from "./hooks/useOpenSpecReader.js";
+import { type OpenSpecGetInflight, useOpenSpecReconcile } from "./hooks/useOpenSpecReconcile.js";
 import { usePiResourceFileFetch } from "./hooks/usePiResourceFileFetch.js";
 import { useSidebarState } from "./hooks/useSidebarState.js";
 import { useStaleToolReconcile } from "./hooks/useStaleToolReconcile.js";
 import { useWebSocket } from "./hooks/useWebSocket.js";
+import { fetchArchivedSessionById } from "./lib/api/archived-sessions-api.js";
 import { performServerSwitch } from "./lib/api/server-switch.js";
 import { openStagingSocket } from "./lib/api/staging-socket.js";
 import { EMPTY_CANVAS_STATE } from "./lib/canvas/canvas-gate.js";
 // SubagentPopoutPage no longer imported by the shell — it's registered via
 // the subagents-plugin's `shell-overlay-route` claim and mounted through
 // `<ShellOverlayRouteSlot>` below. See change: add-flow-agent-popout.
-import { applyPromptTimeout, createInitialState, deriveBannerState, reduceEvent, resolveInteractiveRequest, type SessionState } from "./lib/chat/event-reducer.js";
+import { applyPromptTimeout, carryInteractiveRequests, createInitialState, deriveBannerState, reduceEvent, resolveInteractiveRequest, type SessionState } from "./lib/chat/event-reducer.js";
 import { normalizeFollowUpEntries } from "./lib/chat/followup-entries.js";
 import { nextBackfillRange } from "./lib/chat/history-gap.js";
 import { refreshChat } from "./lib/chat/refresh-chat.js";
 import { maybeAutoInitWorktreeOnSpawn } from "./lib/git/auto-init-worktree.js";
+import { resolveWorktreeAvailability } from "./lib/git/folder-worktree-availability.js";
 import { fetchActiveInits } from "./lib/git/git-api.js";
 import { refreshGitStatus } from "./lib/git/git-status-cache.js";
 import { resendActiveCwdSubscriptions, setInitSender } from "./lib/git/worktree-init-bus.js";
@@ -125,7 +128,7 @@ import { scrollDebugLog } from "./lib/util/scroll-debug.js";
 const NAV_TRACKER = { predecessor, popNav };
 
 import { applyPluginConfigUpdate, initPluginConfigs, PluginContextProvider, type SubagentStateSnapshot } from "@blackbelt-technology/dashboard-plugin-runtime/context";
-import type { HistoryWindowMetadata, ServerToBrowserMessage } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
+import type { ArchivedSessionSummary, HistoryWindowMetadata, ServerToBrowserMessage } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
 import type { ProviderRefreshError } from "@blackbelt-technology/pi-dashboard-shared/protocol.js";
 import type { TerminalSession } from "@blackbelt-technology/pi-dashboard-shared/terminal-types.js";
 import type { CommandInfo, DashboardSession, FileEntry, ImageContent, ModelInfo, OpenSpecData, OpenSpecGroup, RoleInfo } from "@blackbelt-technology/pi-dashboard-shared/types.js";
@@ -324,6 +327,38 @@ function PiResourceFileRoute({
   );
 }
 
+/**
+ * Synthesize a header-only `DashboardSession` from an archived summary row
+ * (read-only `?archived=1` open). Feeds `SessionHeader` when the session is
+ * deliberately absent from the live `sessions` Map; it must NEVER be written
+ * back into that Map.
+ * See change: archive-sessions-lazy-load.
+ */
+function archivedSummaryToSession(item: ArchivedSessionSummary): DashboardSession {
+  return {
+    id: item.id,
+    cwd: item.cwd,
+    name: item.name,
+    firstMessage: item.firstMessage,
+    source: "tui",
+    status: "ended",
+    startedAt: item.endedAt,
+    endedAt: item.endedAt,
+    tokensIn: 0,
+    tokensOut: 0,
+    cost: 0,
+    sessionFile: item.sessionFile,
+    gitWorktree: item.gitWorktree,
+    // Origin + retained completeness carried through, so a read-only open of an
+    // ARCHIVED REMOTE session still distinguishes a truncated transfer from a
+    // whole one. Dropping them here would silently present a partial
+    // conversation as complete on exactly the sessions whose origin host is
+    // gone. See change: serve-retained-remote-transcripts (task 2.2).
+    originDeviceId: item.originDeviceId,
+    retainedTranscript: item.retainedTranscript,
+  };
+}
+
 // Referentially-stable empty steering array so the common (no-pending) case
 // does not hand ChatView a fresh [] literal every render, which would defeat
 // its React.memo. See change: reduce-chat-render-cpu-umbrella (Phase 4).
@@ -358,7 +393,15 @@ export default function App() {
   // See change: pause-decorative-fx-when-idle.
   useIdleFx();
   const [wsUrl, setWsUrl] = useState(getInitialWsUrl);
-  const { send, onMessage, status } = useWebSocket(wsUrl);
+  const { send, onMessage, status, ws, onOutboxExpiry } = useWebSocket(wsUrl);
+  // Stable identity: the plugin runtime's `usePluginSend` memoizes on this prop,
+  // and a fresh closure per render made every effect that depends on `send`
+  // re-run — the browser relay's LiveViewTile re-subscribed on every render.
+  // See change: add-browser-relay.
+  const pluginSend = useCallback(
+    (msg: unknown) => dispatchPluginMessage(msg, (m) => send(m as Parameters<typeof send>[0])),
+    [send],
+  );
   // Worktree-init bus needs a way to send subscribe/unsubscribe
   // messages over the same socket. See change: generalize-worktree-init-hook.
   useEffect(() => {
@@ -522,6 +565,15 @@ export default function App() {
     setRevealRequest((prev) => ({ sessionId, nonce: (prev?.nonce ?? 0) + 1 }));
   }, []);
 
+  // ── Read-only archived open (archive-sessions-lazy-load) ──
+  // `/session/:id?archived=1` renders the transcript through the normal
+  // subscribe-by-id path (the server hydrates archived ids from the index)
+  // while the session stays OUT of the live `sessions` Map. The summary row
+  // (fetched in the effect beside `archivedSummaryById`) only seeds the
+  // header; the composer is hidden (readOnly).
+  const archivedReadOnlyId =
+    match && fileViewSearch.get("archived") === "1" ? selectedId : undefined;
+
   // Drives the server-side viewed-session tracker for unread state.
   // See change: session-card-unread-stripes.
   useViewDispatcher({
@@ -601,6 +653,44 @@ export default function App() {
   // behavior cwd-keyed). See change: spawn-correlation-token.
   const pendingSpawnsRef = useRef<Map<string, { cwd: string; kind: "spawn" | "resume"; placeholderCwd?: string }>>(new Map());
   const [sessionOrderMap, setSessionOrderMap] = useState<Map<string, string[]>>(new Map());
+  // ── fix-connect-snapshot-frame-loss (D7/D9) ── Snapshot-window ended
+  // totals, per-group page offsets, and the snapshot generation counter that
+  // re-runs OpenSpec reconciliation after every applied snapshot.
+  const [endedTotalsMap, setEndedTotalsMap] = useState<Map<string, number>>(new Map());
+  const [pagedCount, setPagedCount] = useState<Map<string, number>>(new Map());
+  // archive-sessions-lazy-load: folder group key → archived count, replaced
+  // by `sessions_snapshot`, maintained by `session_archived` /
+  // `archived_count_updated`. Drives the per-folder `Archive (N)` fold.
+  const [archivedCountMap, setArchivedCountMap] = useState<Map<string, number>>(new Map());
+  // Read-only archived deep link (`/session/:id?archived=1`): summary row
+  // fetched from `/api/sessions/archived/:id` to seed the header when the
+  // session is not (and must not be) in the live `sessions` Map.
+  const [archivedSummaryById, setArchivedSummaryById] = useState<Map<string, ArchivedSessionSummary>>(new Map());
+  // Fetch the summary that seeds the read-only header (skip when the id is
+  // live-resident — a restored session renders from the `sessions` Map).
+  useEffect(() => {
+    const id = archivedReadOnlyId;
+    if (!id || sessions.has(id) || archivedSummaryById.has(id)) return;
+    let alive = true;
+    fetchArchivedSessionById(id)
+      .then((item) => {
+        if (alive) setArchivedSummaryById((prev) => new Map(prev).set(id, item));
+      })
+      .catch(() => {
+        /* header stays lean; the transcript still renders via the replay */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [archivedReadOnlyId, sessions, archivedSummaryById]);
+  const [snapshotGeneration, setSnapshotGeneration] = useState(0);
+  // Live `sessions` mirror for useMessageHandler (order filtering + live
+  // endedTotals transitions read it synchronously outside setState updaters).
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
+  // Shared by useOpenSpecReconcile (marks) and useMessageHandler (releases on
+  // `final:true` openspec_get_result).
+  const openspecGetInflightRef = useRef<Map<string, OpenSpecGetInflight>>(new Map());
   const [pinnedDirectories, setPinnedDirectories] = useState<string[]>([]);
   // Favorite model labels ("provider/id"), server-persisted. Synced via
   // `favorite_models_updated`; cold-loaded from GET /api/favorite-models.
@@ -710,6 +800,12 @@ export default function App() {
           setFolderGitMap(new Map());
           setOpenspecGroupsMap(new Map());
           setTerminals(new Map());
+          // Snapshot-window bookkeeping is scoped to one server's registry —
+          // stale endedTotals / page offsets from server A must not render
+          // against server B. See change: fix-connect-snapshot-frame-loss.
+          setEndedTotalsMap(new Map());
+          setArchivedCountMap(new Map());
+          setPagedCount(new Map());
           // Per-session refresh failures are scoped to one server's bridges;
           // a stale notice from server A must not render against server B.
           // See change: upgrade-model-selector-primitives.
@@ -858,6 +954,26 @@ export default function App() {
     );
   }, []);
 
+  // Single send point for the pending-prompt resync (`prompt_resync_request`,
+  // design D9 of fix-pending-prompt-lost-on-replay): the refresh coordinator
+  // AND the desync affordance both fire it, so exactly one request goes out per
+  // refresh / affordance activation. `requestId` correlates the reply so the
+  // server delivers it requester-scoped as a critical frame.
+  // Declared BEFORE `handleRefreshChat`, which lists it as a dependency.
+  const requestPromptResync = useCallback((id: string) => {
+    send({
+      type: "prompt_resync_request",
+      sessionId: id,
+      // Guarded like the sibling subagent-resync sender: `crypto.randomUUID`
+      // is secure-context-only, and the dashboard is legitimately served over
+      // plain HTTP on LAN IPs. A bare call would throw there — silently making
+      // the refresh resync inert and killing the desync pill's click.
+      requestId:
+        globalThis.crypto?.randomUUID?.() ??
+        `pr-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    });
+  }, [send]);
+
   // Chat refresh: invalidate the durable entry BEFORE resetting in-memory state,
   // so an interrupted refresh can't leave a reset view paired with a surviving
   // cache entry (which rehydrates as authoritative on the next load). One shared
@@ -866,10 +982,15 @@ export default function App() {
   const handleRefreshChat = useCallback((sid: string) => {
     void refreshChat(sid, {
       dropPersisted: (id) => replayPersisterRef.current.drop(id),
+      // The refresh reset carries unanswered interactive requests + their
+      // `ui-<requestId>` rows, exactly like the four reducer-side reset sites,
+      // so the dialog a resync restores cannot be erased by the reset the
+      // refresh itself performs (design D8/D9).
+      // See change: fix-pending-prompt-lost-on-replay.
       resetSessionState: (id) =>
         setSessionStates((prev) => {
           const next = new Map(prev);
-          next.set(id, createInitialState());
+          next.set(id, { ...createInitialState(), ...carryInteractiveRequests(prev.get(id)) });
           return next;
         }),
       resetCursor: (id) => {
@@ -882,8 +1003,9 @@ export default function App() {
       subscribe: (id) => send({ type: "subscribe", sessionId: id, lastSeq: 0 }),
       beginLoadingHistory: (id) => beginLoadingHistory(id),
       beginReplayInFlight: (id) => beginReplayInFlight(id),
+      requestPromptResync,
     }).catch(logRejection("App.handleRefreshChat"));
-  }, [send, beginLoadingHistory, beginReplayInFlight]);
+  }, [send, beginLoadingHistory, beginReplayInFlight, requestPromptResync]);
 
   const handleLoadFullHistory = useCallback(() => {
     if (!selectedId || status !== "connected") return;
@@ -918,9 +1040,40 @@ export default function App() {
   }, [send, historyGaps]);
 
   const handleMessage = useMessageHandler(
-    { setSessions, setSessionStates, setSessionCommands, setFileResults, setChangedOnDisk, setOpenspecMap, setFolderGitMap, setOpenspecGroupsMap, setModelsMap, setModelRefreshErrorsMap, setRolesMap, setSpawnResult, setSessionOrderMap, setPinnedDirectories, setFavoriteModels, setWorkspaces, setTerminals, setDiscoveredServers, setSpawnErrors, setResumeErrors, setDisplayPrefs, setLoadingHistory, setHistoryWindows, setReplayInFlight, setCanvasMap, setHistoryGaps, setHistorySpliceRev },
-    { send, navigate, clearSpawningCwd, spawningCwdsRef, subscribedRef, pendingTerminalCwdRef, lastCreatedTerminalIdRef, maxSeqMapRef, selectedSessionIdRef, pendingSpawnsRef, cwdVisibilityInputsRef, loadingHistoryTimersRef, replayInFlightTimersRef, replayPersister: replayPersisterRef.current, showToast },
+    { setSessions, setSessionStates, setSessionCommands, setFileResults, setChangedOnDisk, setOpenspecMap, setFolderGitMap, setOpenspecGroupsMap, setModelsMap, setModelRefreshErrorsMap, setRolesMap, setSpawnResult, setSessionOrderMap, setPinnedDirectories, setFavoriteModels, setWorkspaces, setTerminals, setDiscoveredServers, setSpawnErrors, setResumeErrors, setDisplayPrefs, setLoadingHistory, setHistoryWindows, setReplayInFlight, setCanvasMap, setHistoryGaps, setHistorySpliceRev, setEndedTotalsMap, setArchivedCountMap, setPagedCount, setSnapshotGeneration },
+    { send, navigate, clearSpawningCwd, spawningCwdsRef, subscribedRef, pendingTerminalCwdRef, lastCreatedTerminalIdRef, maxSeqMapRef, selectedSessionIdRef, pendingSpawnsRef, cwdVisibilityInputsRef, loadingHistoryTimersRef, replayInFlightTimersRef, replayPersister: replayPersisterRef.current, showToast, sessionsRef, openspecGetInflightRef },
   );
+
+  // D7: rendered cwds the OpenSpec reconciliation may pull for — non-ended
+  // session cards, pinned folder cards, and the selected session's pane (any
+  // status). Deliberately over-approximates the sidebar's filter state: the
+  // pull is bounded by the settled-map / in-flight gates, not filter
+  // exactness. Ended cards and stub groups never enter the set.
+  // See change: fix-connect-snapshot-frame-loss.
+  const renderedCwds = useMemo(() => {
+    const set = new Set<string>();
+    for (const s of sessions.values()) {
+      if (s.status !== "ended") set.add(s.cwd);
+    }
+    for (const p of pinnedDirectories) set.add(p);
+    const selected = selectedId ? sessions.get(selectedId) : undefined;
+    if (selected) set.add(selected.cwd);
+    // Active route surfaces: a direct load of an OpenSpec board/preview for an
+    // unpinned, ended-only folder renders no card, so without these the route
+    // directory would never pull and the view would stay loading.
+    if (openspecPreviewCwd) set.add(openspecPreviewCwd);
+    if (openspecBoardCwd) set.add(openspecBoardCwd);
+    return Array.from(set);
+  }, [sessions, pinnedDirectories, selectedId, openspecPreviewCwd, openspecBoardCwd]);
+
+  useOpenSpecReconcile({
+    renderedCwds,
+    openspecMap,
+    send,
+    status,
+    snapshotGeneration,
+    inflightRef: openspecGetInflightRef,
+  });
 
   useEffect(() => {
     return onMessage(handleMessage);
@@ -1032,13 +1185,16 @@ export default function App() {
     prevStatusRef.current = status;
   }, [status]);
 
-  // Redirect to / if session ID in URL is not found after sessions have loaded
+  // Redirect to / if session ID in URL is not found after sessions have loaded.
+  // An archived read-only deep link (`?archived=1`) is INTENTIONALLY absent from
+  // the live `sessions` Map, so it must not be bounced. See change:
+  // archive-sessions-lazy-load.
   const sessionsLoaded = sessions.size > 0;
   useEffect(() => {
-    if (selectedId && sessionsLoaded && !sessions.has(selectedId)) {
+    if (selectedId && sessionsLoaded && !sessions.has(selectedId) && !archivedReadOnlyId) {
       navigate("/", { replace: true });
     }
-  }, [selectedId, sessionsLoaded, sessions, navigate]);
+  }, [selectedId, sessionsLoaded, sessions, navigate, archivedReadOnlyId]);
 
   // Request global roles once on connect, using any available session id
   // as a routing target (the bridge handler doesn't actually scope by it).
@@ -1348,13 +1504,26 @@ export default function App() {
     handleAbort, handleForceKill, handleStopAfterTurn, handleCancelPending, handleRespondToUi, handleSend,
     handleSelect, handleRenameSession, handleShutdownSession, handleKillProcess,
     handleSendPromptToSession, handleRetrySession, handleResumeSession, handleResumeSessionKeepPosition, handleSpawnSession,
-    handleHideSession, handleUnhideSession, handleSetSessionTags, removeTagGlobally,
+    handleArchiveSession, handleUnarchiveSession, handleSetSessionTags, removeTagGlobally,
     handleCreateTerminal, handleKillTerminal, handleRenameTerminal, handleTerminalTitle,
     handleOpenInlineTerminal, handleCloseInlineTerminal,
     handleListFiles,
     // Bridge-owned follow-up buffer mutation senders. See change: rework-mid-turn-prompt-queue.
     removeFollowUpEntry, editFollowUpEntry, promoteFollowUpEntry, clearFollowUpEntries,
+    markPromptUndelivered,
   } = sessionActions;
+
+  // A prompt queued while the socket was not open is dropped if the reconnect
+  // never lands inside the outbox window. Correct that to an honest,
+  // connection-attributed failure rather than letting the 30 s session-blaming
+  // wording stand. See change: stop-discarding-known-session-state (test-plan Q1).
+  useEffect(() => {
+    return onOutboxExpiry((msg, entryId) => {
+      if (msg.type === "send_prompt") {
+        markPromptUndelivered(msg.sessionId, entryId);
+      }
+    });
+  }, [onOutboxExpiry, markPromptUndelivered]);
 
   // Stabilized ChatView callbacks: hoisted from inline arrows at the call site
   // so keystrokes into the command input (which re-render App) do not defeat
@@ -1372,6 +1541,22 @@ export default function App() {
     },
     [selectedId, handleCloseInlineTerminal],
   );
+  // Re-send the preserved text of a prompt the BROWSER refused to transmit
+  // (connection-attributed failed arm). The marked exit, not a silent drop.
+  // See change: stop-discarding-known-session-state.
+  const handleRetryPendingPrompt = useCallback(() => {
+    const pending = selectedState.pendingPrompt;
+    if (!pending) return;
+    handleSend(pending.text, pending.images as any, pending.delivery);
+  }, [selectedState.pendingPrompt, handleSend]);
+  // Ended session with no saved transcript: resume AND fork are both refused
+  // server-side (`resume.session_file_unknown` — the `sessionFile` guard runs
+  // before any mode branching), so the action that actually works is a fresh
+  // session in the same folder. See change: stop-discarding-known-session-state.
+  const handleForkPendingPrompt = useCallback(() => {
+    const target = selectedId ? sessions.get(selectedId) : undefined;
+    if (target) handleSpawnSession(target.cwd);
+  }, [selectedId, sessions, handleSpawnSession]);
   const handleCollapseStreamingThinking = useCallback(() => {
     if (!selectedId) return;
     setSessionStates((prev) => {
@@ -1571,6 +1756,10 @@ export default function App() {
       folderGitMap={folderGitMap}
       openspecGroupsMap={openspecGroupsMap}
       sessionOrderMap={sessionOrderMap}
+      endedTotalsMap={endedTotalsMap}
+      pagedCount={pagedCount}
+      connected={status === "connected"}
+      onSessionsPage={(cwd, offset) => send({ type: "sessions_page", cwd, offset })}
       onReorderSessions={(cwd, sessionIds) => {
         setSessionOrderMap((prev) => {
           const next = new Map(prev);
@@ -1594,8 +1783,9 @@ export default function App() {
       onShutdown={handleShutdownSession}
       onResume={handleResumeSession}
       onResumeKeepPosition={handleResumeSessionKeepPosition}
-      onHideSession={handleHideSession}
-      onUnhideSession={handleUnhideSession}
+      onArchiveSession={handleArchiveSession}
+      onUnarchiveSession={handleUnarchiveSession}
+      archivedCountMap={archivedCountMap}
       onSpawnSession={handleSpawnSession}
       spawningCwds={spawningCwds}
       addSpawningCwd={addSpawningCwd}
@@ -1684,15 +1874,23 @@ export default function App() {
       onSpawnSession={handleSpawnSession}
       onSpawnAttachedWorktree={(c, changeName) => setBoardWorktreeForChange({ cwd: c, changeName })}
       onResumeSession={handleResumeSession}
-      onHideSession={handleHideSession}
-      onUnhideSession={handleUnhideSession}
+      onArchiveSession={handleArchiveSession}
       onSendPrompt={handleSendPromptToSession}
       onAttachProposal={handleAttachProposal}
       onDetachProposal={handleDetachProposal}
       onReplaceProposal={handleReplaceProposal}
       onBulkArchive={() => handleBulkArchive(openspecBoardCwd)}
-      isGitRepo={Array.from(sessions.values()).some((s) => s.cwd === openspecBoardCwd && !!s.gitBranch)}
-      gitWorktreeEnabled={gitWorktreeEnabled}
+      // Folder-level availability, NOT `gitBranch` (populated only for the
+      // live poll work-set, so the board's button vanished when the last
+      // main-cwd session ended). Pure + O(sessions) on an already-rendered
+      // path; cannot be a `useMemo` here because the cwd is a render-fn arg.
+      // See change: fix-openspec-board-worktree-button-gating.
+      worktreeAvailability={resolveWorktreeAvailability({
+        cwd: openspecBoardCwd,
+        sessions: Array.from(sessions.values()),
+        folderGitMap,
+        gitWorktreeEnabled,
+      })}
       selectedId={selectedId}
     />
   );
@@ -1771,7 +1969,15 @@ export default function App() {
   // See change: add-route-backed-overlay-dialogs.
   const renderSessionDetail = (sessionIdArg: string, frozen = false) => {
     const selectedId = sessionIdArg;
-    const selectedSession = sessions.get(selectedId);
+    // Read-only archived open (archive-sessions-lazy-load): the session is
+    // not in the live `sessions` Map by design — synthesize a header row from
+    // the fetched summary. The synthesized session NEVER feeds the composer
+    // (`readOnly` gates it off below).
+    const readOnly = !frozen && selectedId === archivedReadOnlyId;
+    const archivedSummary = readOnly ? archivedSummaryById.get(selectedId) : undefined;
+    const selectedSession =
+      sessions.get(selectedId) ??
+      (archivedSummary ? archivedSummaryToSession(archivedSummary) : undefined);
     const selectedCwd = selectedSession?.cwd;
     const selectedState = sessionStates.get(selectedId) ?? createInitialState();
     const selectedImages = pendingImagesMap.get(selectedId) ?? (EMPTY_IMAGES as ImageContent[]);
@@ -1793,11 +1999,10 @@ export default function App() {
         onSeekToCard={selectedId ? () => seekToCard(selectedId) : undefined}
         showBack
         onBack={goBack}
-        onResume={selectedId ? (mode) => handleResumeSession(selectedId, mode) : undefined}
+        onResume={!readOnly && selectedId ? (mode) => handleResumeSession(selectedId, mode) : undefined}
         mobileActions={isMobile ? {
           openspecChanges: selectedCwd ? openspecMap.get(selectedCwd)?.changes : undefined,
-          onHide: () => handleHideSession(selectedId),
-          onUnhide: () => handleUnhideSession(selectedId),
+          onArchive: () => handleArchiveSession(selectedId),
           onResume: (mode) => handleResumeSession(selectedId, mode),
           onShutdown: () => handleShutdownSession(selectedId),
           onAttachProposal: (changeName) => handleAttachProposal(selectedId, changeName),
@@ -1952,7 +2157,7 @@ export default function App() {
             </div>
           }>
             <SessionAssetsProvider assets={selectedSession?.assets}>
-            <ChatView ref={chatViewRef} sessionId={selectedId} state={selectedState} toolContext={toolContext} onRespondToUi={handleRespondToUi} onAbort={handleAbort} onForceKill={handleForceKill} onForkFromMessage={selectedId ? handleForkFromMessage : undefined} onCloseInlineTerminal={selectedId ? handleCloseInlineTerminalForSelected : undefined} pendingSteering={selectedSession?.pendingQueues?.steering ?? EMPTY_STEERING} loadingHistory={selectedId ? loadingHistory.get(selectedId) ?? false : false} replayInFlight={selectedId ? replayInFlight.get(selectedId) ?? false : false} historyWindow={selectedId ? historyWindows.get(selectedId) : undefined} onLoadFullHistory={selectedId ? handleLoadFullHistory : undefined} historyGap={selectedId ? historyGaps.get(selectedId) : undefined} onLoadEarlier={selectedId ? handleLoadEarlier : undefined} historySpliceRev={historySpliceRev} onCollapseStreamingThinking={selectedId ? handleCollapseStreamingThinking : undefined} />
+            <ChatView ref={chatViewRef} sessionId={selectedId} state={selectedState} toolContext={toolContext} onRespondToUi={handleRespondToUi} onPromptResync={requestPromptResync} onAbort={handleAbort} onForceKill={handleForceKill} onForkFromMessage={selectedId ? handleForkFromMessage : undefined} onRetryPendingPrompt={selectedId ? handleRetryPendingPrompt : undefined} onForkPendingPrompt={selectedId ? handleForkPendingPrompt : undefined} onCloseInlineTerminal={selectedId ? handleCloseInlineTerminalForSelected : undefined} pendingSteering={selectedSession?.pendingQueues?.steering ?? EMPTY_STEERING} loadingHistory={selectedId ? loadingHistory.get(selectedId) ?? false : false} retainedTranscript={selectedSession?.retainedTranscript} replayInFlight={selectedId ? replayInFlight.get(selectedId) ?? false : false} historyWindow={selectedId ? historyWindows.get(selectedId) : undefined} onLoadFullHistory={selectedId ? handleLoadFullHistory : undefined} historyGap={selectedId ? historyGaps.get(selectedId) : undefined} onLoadEarlier={selectedId ? handleLoadEarlier : undefined} historySpliceRev={historySpliceRev} onCollapseStreamingThinking={selectedId ? handleCollapseStreamingThinking : undefined} />
             </SessionAssetsProvider>
           </ErrorBoundary>
           {/* Single-card error-lifecycle surface. Sticky above the command
@@ -1991,10 +2196,14 @@ export default function App() {
           />
           {/* Context strip above the composer card: OpenSpec refresh + View
               menu + session-action groups (relocated from the retired
-              StatusBar model row). See change: redesign-prompt-input. */}
-          {selectedSession && (
+              StatusBar model row). Read-only archived open hides it with the
+              rest of the composer (archive-sessions-lazy-load). */}
+          {selectedSession && !readOnly && (
             <div
-              className="flex items-center gap-2 flex-wrap px-3 pt-2 text-xs"
+              /* `shrink-0`: thin furniture row — cannot compress below its content,
+                 so absorbing a pane height deficit here would clip it rather than
+                 shrink it. See change: fix-quota-widget-clipping. */
+              className="flex items-center gap-2 flex-wrap px-3 pt-2 text-xs shrink-0"
               data-testid="composer-context-strip"
             >
               {selectedCwd && (
@@ -2024,6 +2233,8 @@ export default function App() {
               />
             </div>
           )}
+          {!readOnly && (
+            <>
           <StatusBar
             status={selectedState.status}
             currentTool={selectedState.currentTool}
@@ -2097,8 +2308,17 @@ export default function App() {
             modelRefreshErrors={modelRefreshErrorsMap.get(selectedId)}
             contextUsage={selectedContextUsage}
           />
-          {/* Plugin slot: content-inline-footer — contributions from flows-plugin (per-session inline footer) and other plugins. */}
-          {selectedSession && <ContentInlineFooterSlot session={selectedSession} />}
+            </>
+          )}
+          {/* Plugin slot: content-inline-footer — contributions from flows-plugin (per-session inline footer) and other plugins.
+              Host-owned `shrink-0` wrapper so EVERY contribution in this slot is
+              protected from the chat pane's bottom clip, without each plugin having
+              to know it renders into a flex column. See change: fix-quota-widget-clipping. */}
+          {selectedSession && (
+            <div className="shrink-0">
+              <ContentInlineFooterSlot session={selectedSession} />
+            </div>
+          )}
           {/* Extension UI System (Phase 1): module picker + generic modal. */}
           {/* See change: add-extension-ui-modal. */}
           {extensionModulePickerOpen && selectedId && (() => {
@@ -2336,11 +2556,16 @@ export default function App() {
         registry={_pluginRegistry}
         sessions={allSessionsList}
         selectedSessionId={selectedId}
+        // The live shell socket, so plugin `usePluginMessage` consumers actually
+        // receive server→browser frames (the browser relay's status + screencast
+        // frames). Omitting it silently no-ops EVERY plugin's message hook.
+        // See change: add-browser-relay.
+        ws={ws}
         // Plugin settings-section writes persist via the canonical REST route
         // (validated, broadcast) instead of the dead WS frame; all other
         // messages pass through to the WebSocket. See change:
         // fix-plugin-config-write-persistence.
-        send={(msg) => dispatchPluginMessage(msg, (m) => send(m as Parameters<typeof send>[0]))}
+        send={pluginSend}
         useSessionInteractiveRequests={(sid) =>
           sessionStates.get(sid)?.interactiveRequests ?? EMPTY_INTERACTIVE_REQUESTS
         }
@@ -2519,7 +2744,15 @@ export default function App() {
         {sessionList}
       </MobileOverlay>
 
-      <div className="flex-1 flex flex-col min-w-0 min-h-0">
+      {/* `relative` is load-bearing: a route-backed overlay's frozen underlay is
+          `absolute inset-0`, and without a positioned containing block here it
+          escapes to the viewport — painting the frozen session detail from x=0,
+          straight over the live sidebar. Two surfaces then share the same
+          pixels, which rendered as garbled, doubled session-header text in the
+          strip above the dialog card (issue #591). As the containing block, the
+          underlay covers exactly the content region the launching surface
+          occupied. See change: fix-settings-overlay-header-peek. */}
+      <div className="relative flex-1 flex flex-col min-w-0 min-h-0">
         {connectionBanner}
         <RecoveryOfferHost onReopen={(ids) => { for (const id of ids) handleResumeSession(id, "continue"); }} onDismiss={(ids) => send({ type: "recovery_dismiss", sessionIds: ids })} />
         {/* Folder-scoped editor pane (hosts terminal tabs via the keep-alive

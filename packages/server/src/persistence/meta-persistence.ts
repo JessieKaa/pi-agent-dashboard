@@ -3,8 +3,10 @@
  * Each session gets its own debounce timer — updating session A
  * does not trigger a write for session B.
  */
-import { type SessionMeta, metaPath, readSessionMeta, writeSessionMeta, mergeSessionMeta } from "@blackbelt-technology/pi-dashboard-shared/session-meta.js";
+
 import type { DisplayPrefs, PartialDisplayPrefs } from "@blackbelt-technology/pi-dashboard-shared/display-prefs.js";
+import { mergeSessionMeta, metaPath, readSessionMeta, type SessionMeta, writeSessionMeta } from "@blackbelt-technology/pi-dashboard-shared/session-meta.js";
+import type { ClosedReason } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 
 const DEBOUNCE_MS = 1000;
 
@@ -35,10 +37,17 @@ export interface MetaPersistence {
    */
   setLiveness(
     sessionFile: string,
-    liveness: { live: boolean; liveEpoch?: number; closedReason?: string },
+    liveness: { live: boolean; liveEpoch?: number; closedReason?: ClosedReason },
   ): void;
   /** Flush all pending writes immediately. */
   flushAll(): void;
+  /**
+   * Flush the pending debounced write for ONE session file immediately (no-op
+   * when none is pending). Used by the archive transition, which must not lose
+   * a queued rename/tag before it writes `archived: true`. See change:
+   * archive-sessions-lazy-load.
+   */
+  flush(sessionFile: string): void;
   /** Stop all debounce timers. */
   dispose(): void;
 }
@@ -69,6 +78,16 @@ export function createMetaPersistence(): MetaPersistence {
       if (onDisk?.live !== undefined) meta.live = onDisk.live;
       if (onDisk?.liveEpoch !== undefined) meta.liveEpoch = onDisk.liveEpoch;
       if (onDisk?.closedReason !== undefined) meta.closedReason = onDisk.closedReason;
+    }
+    // Carry the three archive fields forward the same way when the caller did
+    // not set them: a routine stats write for a still-archived (or just
+    // restored) session must not drop `archived`/`archivedAt`/`restoredAt`.
+    // See change: archive-sessions-lazy-load.
+    if (meta.archived === undefined && meta.archivedAt === undefined && meta.restoredAt === undefined) {
+      const onDisk = readSessionMeta(sessionFile);
+      if (onDisk?.archived !== undefined) meta.archived = onDisk.archived;
+      if (onDisk?.archivedAt !== undefined) meta.archivedAt = onDisk.archivedAt;
+      if (onDisk?.restoredAt !== undefined) meta.restoredAt = onDisk.restoredAt;
     }
     writeSessionMeta(sessionFile, meta);
   }
@@ -128,6 +147,10 @@ export function createMetaPersistence(): MetaPersistence {
       for (const sessionFile of [...pending.keys()]) {
         writeNow(sessionFile);
       }
+    },
+
+    flush(sessionFile: string): void {
+      writeNow(sessionFile);
     },
 
     dispose(): void {

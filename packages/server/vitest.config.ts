@@ -1,12 +1,13 @@
 import { defineConfig } from "vitest/config";
 import path from "node:path";
+import { PARALLEL_MAX_WORKERS } from "../../vitest.workers";
 
 export default defineConfig({
   test: {
     include: ["src/**/__tests__/**/*.test.ts"],
     environment: "node",
     pool: "forks",
-    maxWorkers: "50%",
+    maxWorkers: PARALLEL_MAX_WORKERS,
     // Many server tests boot a full server (via `vi.resetModules()` + a fresh
     // `import("../server.js")`), spawn git worktree operations, or probe
     // subprocess state — legitimately slow work. `pool: "forks"` gives each
@@ -19,6 +20,11 @@ export default defineConfig({
     // tests stop tripping; a genuine hang still fails, just at 30s. Fast tests
     // finish immediately, unaffected.
     testTimeout: 30_000,
+    // `hookTimeout` defaults to 10s INDEPENDENTLY of `testTimeout`, and four
+    // server specs boot a full server in `beforeEach` — under 8-fork
+    // contention those hooks blew 10s while the test budget was already 30s.
+    // Match the test budget. See change: contention-harden-real-process-tests.
+    hookTimeout: 30_000,
     globalSetup: ["@blackbelt-technology/pi-dashboard-shared/test-support/setup-home.ts"],
     // Config-relative path (not the package name) so the worktree-local source
     // wins over the hoisted-workspace node_modules symlink, mirroring the
@@ -31,6 +37,19 @@ export default defineConfig({
     // build does. Mirrors packages/client/vitest.config.ts resolve.alias.
     alias: {
       "@blackbelt-technology/pi-dashboard-shared": path.resolve(__dirname, "../shared/src"),
+      // Worktree-local runtime source wins for the same reason — server.ts
+      // calls `createIsPiExtensionInstalled`, an export that exists only in
+      // this worktree until it lands. Specific `/server` key MUST precede the
+      // bare key (alias matches by prefix). See change:
+      // add-blackhole-session-pipeline.
+      "@blackbelt-technology/dashboard-plugin-runtime/server": path.resolve(
+        __dirname,
+        "../dashboard-plugin-runtime/src/server/index.ts",
+      ),
+      "@blackbelt-technology/dashboard-plugin-runtime": path.resolve(
+        __dirname,
+        "../dashboard-plugin-runtime/src/index.ts",
+      ),
     },
   },
 });

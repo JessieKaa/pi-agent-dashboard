@@ -390,6 +390,17 @@ The dashboard resolves every external tool it calls (`pi`, `pi-coding-agent`, `o
 
 The file is deliberately separate from `config.json` so machine-specific paths don't follow a dotfiles sync. Invalid overrides (path doesn't exist) are recorded in the trail and the registry falls through to the next strategy automatically.
 
+### MCP servers
+
+Enable the **MCP Client** plugin (`mcp-client`) in Settings → Plugins to manage the MCP servers your pi sessions use. It requires the `pi-mcp-adapter` pi extension (minimum version `2.20.0`); the plugins index offers an inline Install for it.
+
+- **Global surface** — `/settings/plugins/mcp-client`: every server the adapter resolves, with its source layer (Pi global, Pi folder, shared, other), enable/disable, a per-server editor, and the global adapter settings form. Writes land only in `~/.pi/agent/mcp.json`.
+- **Per folder** — `/folder/<cwd>/mcp`, reachable from the folder pill: the effective merged view for that directory plus folder-layer overrides. Writes land only in `<cwd>/.pi/mcp.json`.
+
+Shared layers (`<cwd>/.mcp.json`, imports, `package.json#mcp`) are read-only and shown with provenance. Secret values inherited from a layer you cannot write are redacted server-side and never reach the browser. Comments in a `mcp.json` are not preserved on write.
+
+**`adapterLoadTimeoutMs`** (Dashboard plugin settings group, default `10000`, range `1000`–`120000`) bounds how long the dashboard waits for one `pi-mcp-adapter` config load. The load runs in a worker thread; on expiry the request fails with `adapter-timeout`. It bounds the **dashboard's** config read only — it does not affect pi sessions.
+
 ---
 
 ## Using the model proxy
@@ -410,8 +421,6 @@ export OPENAI_API_KEY=pi-proxy-<your-proxy-key>
 - `POST /v1/messages` — Anthropic messages, streaming + non-streaming
 
 **Auth:** proxy API keys only (`pi-proxy-*` prefix). Dashboard JWT is never accepted on `/v1/*`.
-
-For migration from `@blackbelt-technology/pi-model-proxy`, see [`docs/migration/from-pi-model-proxy.md`](docs/migration/from-pi-model-proxy.md).
 
 ## Usage
 
@@ -566,9 +575,9 @@ The dashboard integrates tightly with a small, curated set of pi extensions — 
 
 | Extension | Source | Status | Unlocks |
 |---|---|---|---|
-| `pi-anthropic-messages` | `git@github.com:BlackBeltTechnology/pi-anthropic-messages.git` | **required** | Tool calls on Claude-model Anthropic OAuth / 9Router `cc/*` / pi-model-proxy providers. Without it, tool calls fall back to Claude Code's built-in `bash_ide` sandbox and fail. |
-| `pi-dashboard-subagents` | `https://github.com/BlackBeltTechnology/pi-dashboard-subagents.git` | optional (bundled) | `Agent` tool card UI, subagent inspector (inline expand + popout), agent-md path display |
-| `pi-flows` | `git@github.com:BlackBeltTechnology/pi-flows.git` | strongly suggested | Flow dashboard, role aliases (`@planning`, `@coding`, …), subagent / flow_write / flow_results / agent_write / ask_user / skill_read / finish tools |
+| `pi-anthropic-messages` | `npm:@blackbelt-technology/pi-anthropic-messages` | **required** | Tool calls on Claude-model Anthropic OAuth / 9Router `cc/*` / dashboard model proxy providers. Without it, tool calls fall back to Claude Code's built-in `bash_ide` sandbox and fail. |
+| `pi-dashboard-subagents` | `npm:@blackbelt-technology/pi-dashboard-subagents` | optional | `Agent` tool card UI, subagent inspector (inline expand + popout), agent-md path display |
+| `pi-flows` | `npm:@blackbelt-technology/pi-flows` | strongly suggested | Flow dashboard, role aliases (`@planning`, `@coding`, …), subagent / flow_write / flow_results / agent_write / ask_user / skill_read / finish tools |
 | `pi-web-access` | `npm:pi-web-access` | strongly suggested | `web_search`, `code_search`, `fetch_content`, `get_search_content` |
 | `pi-agent-browser` | `npm:pi-agent-browser` | optional | `browser` tool (open, snapshot, click, screenshot) |
 
@@ -651,10 +660,6 @@ If you still see two entries for what should be one folder, the paths are likely
 ### Tool not found (pi / openspec / npm / …)
 
 Open **Settings → General → Tools**, click the chevron next to the failing tool to see the full `tried[]` trail, then either (a) install the missing tool on PATH / in the managed location shown in the trail, or (b) set an explicit override via the row's path input. Hit **Rescan** to pick up the change without a server restart.
-
-### Recommended extensions: "Permission denied (publickey)"
-
-`pi-flows` and `pi-anthropic-messages` install via SSH (`git@github.com:…`). If your system has no GitHub SSH key, set one up following [GitHub's SSH docs](https://docs.github.com/en/authentication/connecting-to-github-with-ssh), or substitute the equivalent HTTPS URL in the manifest if your fork is public.
 
 ---
 

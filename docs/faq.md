@@ -332,9 +332,11 @@ Common keys:
 - `reattachPlacement` (default `"always"`) — `"always"` / `"streaming-only"` / `"preserve"`
 - `devBuildOnReload` (default `false`)
 - `askUserPromptTimeoutSeconds` (default `300`; `≤0` = wait indefinitely)
+- `allowedHosts` (default `[]`) — bare hostnames the dashboard may answer on (e.g. reverse-proxy name). No scheme/port. Applies live.
+- `hostGate.mode` (default `"report"`) — `"report"` logs `[host-gate] would-refuse` + proceeds; `"enforce"` refuses unlisted hosts. Applies live.
 
 CLI flags: `--port`, `--pi-port`, `--dev`, `--no-tunnel`.
-Env vars: `PI_DASHBOARD_PORT`, `PI_DASHBOARD_PI_PORT`, `PI_DASHBOARD_URL` (bridge → remote server).
+Env vars: `PI_DASHBOARD_PORT`, `PI_DASHBOARD_PI_PORT`, `PI_DASHBOARD_URL` (bridge → remote server), `PI_DASHBOARD_HOST_GATE` (`report`|`enforce`; overrides `hostGate.mode`; unrecognised = ignored + logged once).
 
 Live-reconfigurable via `PUT /api/config` — partial merge, secrets preserved as `***`. Port/piPort changes set `restartRequired: true`.
 
@@ -387,6 +389,19 @@ Diagnose:
 Bind host wins over trust. `trustedNetworks` only ever admits peers the socket already accepts.
 
 See change: warn-unreachable-trusted-networks.
+
+## I got 'This address is not allowed'?
+
+Host-admission gate refused the request's `Host` header (issue #637; `hostGate.mode: "enforce"` or `PI_DASHBOARD_HOST_GATE=enforce`). Gate keys on `Host`, not `Origin` — a DNS-rebinding page is same-origin and sends no `Origin`.
+
+Three ways in (the 403 page lists all):
+- open `http://localhost:<port>` from the host machine
+- add the bare name to `allowedHosts` in `~/.pi/dashboard/config.json` (applies live)
+- add the full URL to `publicBaseUrls`
+
+Before flipping to `enforce`, check what would break: Settings ▸ Security ▸ Allowed hostnames ▸ Recent refusals, or `grep -F '[host-gate] would-refuse' server.log`. Report-only mode logs every name.
+
+See change: add-host-allowlist-admission.
 
 ## My Tailscale device is not trusted after Add Local Network?
 
@@ -1289,6 +1304,40 @@ Measured (#399-shaped window, 140 messages × ~150 snapshot updates):
 
 See change: `compact-warm-replay-stream`. See also `docs/architecture.md` § "Reconnection Flow".
 
+## Where did my old sessions go? (archived sessions)
+
+Symptom:
+- Old ended sessions vanish from the sidebar.
+- Folder shows an `Archive (N)` fold instead.
+
+Explanation (change: `archive-sessions-lazy-load`):
+- Ended sessions past `sessionList.archiveAfterDays` (default 30) auto-archive.
+- Legacy hidden-ended sessions migrate to archived at boot.
+- Archived != deleted. Sidecar + transcript stay on disk.
+- Archived sessions leave the live set: not in `GET /api/sessions`, not in the connect snapshot, no RAM cost.
+
+Restore one:
+- Expand the folder `Archive (N)` fold (`GET /api/sessions/archived` on first expand).
+- Click Restore on the row -> session returns as an ended card.
+- Or click the row -> read-only transcript at `/session/<id>?archived=1`.
+
+## How do I stop sessions being auto-archived?
+
+Settings -> Sessions -> `Archive after` -> `0`. Disables auto-archive. Or raise the day count.
+- Config key `sessionList.archiveAfterDays` (days, min 0).
+- Sweeper cadence `sessionList.archiveSweepIntervalMinutes` (min 1, default 60).
+- Sweep skips live, viewed, running sessions. Cap 200 oldest per tick.
+- Manual archive button still works with auto-archive off.
+
+## Why did a session disappear from the sidebar?
+
+Check in order:
+1. Archived? Folder `Archive (N)` fold holds it. See above.
+2. Hidden worker? Footer `N hidden workers` counts auto-hidden sessions. Toggle Show hidden.
+3. Ended + collapsed? Ended fold is collapsed by default.
+
+Manual hide is gone. `hide_session`/`unhide_session` removed. Use archive (`archive_session`).
+
 ## Session stuck after Stop or Shutdown — how to recover?
 
 Symptom: Stop / abort / Shutdown clicked. Card stays "running". `ps` shows pi PID alive. Server restart clears it.
@@ -1306,6 +1355,41 @@ Recovery order:
 Diagnostic: `ps -p <piPid>` after Shutdown. Alive after 3 s indicates regression.
 
 See change: `fix-keeper-kill-escalation`. See also `docs/architecture.md` § "RPC keeper sidecar".
+
+## Why does my session die whenever it spawns subagents?
+
+Symptom: session dies immediately after issuing wide `Agent` fan-out. Last transcript entry shows unanswered subagent calls. Host marks session unresponsive and reaps process.
+
+Contributing cause: parallel subagent initialization blocks Node event loop on loaded host (contributing cause, not confirmed root cause; loaded-host and large-context factors untested). 13/14 census crash sessions died at fan-out start (correlation observed, causality not proven).
+
+Mitigation (change: `bound-subagent-fanout-under-host-pressure`): bridge admission gate bounds concurrent in-flight subagents per session (partial mitigation, not definitive fix).
+
+Mechanism:
+- Gate intercepts `tool_call` before execution starts.
+- Bound tracks in-flight concurrency, not batch width. Counter increments on admission, decrements on `tool_execution_end`.
+- Normal default cap: `DEFAULT_MAX_CONCURRENT_SUBAGENTS = 2`.
+- Host saturation (high event loop delay, process CPU, machine load) drops cap to 1 so session still makes progress.
+- Refused calls return terminal errored tool result with reason directing re-issue after running children finish. Card stops spinning immediately.
+- Refusals append durable `subagent-admission-refused` session entry so evidence survives process death.
+
+Configuration:
+- `maxConcurrentSubagents` in `~/.pi/dashboard/config.json`.
+- Default: `2`.
+- `0`: disables admission gate (rollback).
+- Absent: resolves to default (2).
+- Malformed: fails open (uncapped).
+
+Scope caveat:
+- Subagents skip bridge initialization via re-entry guard.
+- Admission gate protects top-level session only.
+- Grandchildren and `flow_agents` bypass gate.
+
+Cross-refs:
+- docs/architecture.md
+- packages/extension/src/subagent-fanout-admission.ts
+- packages/extension/src/subagent-saturation.ts
+- packages/shared/src/config.ts
+- openspec/changes/archive/2026-09-16-bound-subagent-fanout-under-host-pressure/
 
 ## Gemini session starts, model never responds, no error — "Gemini doesn't work with subagents"?
 
@@ -2864,3 +2948,177 @@ See change: add-apple-tools-imcp-plugin.
 Cross-refs:
 - packages/apple-tools/README.md
 - packages/apple-tools/.pi/skills/apple-tools/SKILL.md
+
+## npm test red locally, green in CI — is the suite broken?
+
+Rotating failure set = different file each run. Green CI on same commit = timing race under fork contention. NOT pre-existing regression. Do not dismiss as noise. Do not "fix" by re-running.
+
+Confirm suspicion: `npm test -- --maxWorkers=2` or run failing file alone. Passes in isolation → contention flake.
+
+Root cause class: fixed-tick test barriers. Pattern: `await new Promise((r) => setTimeout(r, N))` before one-shot assertion. Now banned in client tests. Guard triple:
+- `scripts/check-fixed-tick-waits.mjs` — standalone checker.
+- CI step `Fixed-tick wait guard` in `.github/workflows/ci.yml`.
+- Vitest wrapper `scripts/__tests__/fixed-tick-waits.test.mjs`.
+
+Converted tests poll via `waitFor` (10s `asyncUtilTimeout`; 5s margin under the 15s client `testTimeout`).
+
+Deliberate timer yields opt out PER OCCURRENCE. Comment on line directly above awaited timer: `// fixed-tick-waits: opt-out — <reason>`. Never file-level waiver. Exemplar: `packages/client/src/components/__tests__/PairLanding.test.tsx` postJson mock yield.
+
+Worker target single source: `vitest.workers.ts` at repo root (`PARALLEL_MAX_WORKERS = "50%"`). Imported by all parallel vitest configs. 7 serial projects keep `maxWorkers: 1`: electron, image-fit-extension, kb-extension, mockup-loop, nano-banana, video-production, video-transcription.
+
+Second root-cause class: real-process, wall-clock-budgeted tests. Server signal forwarding, log rotation, subprocess probes, advisory perf budgets. Plus isolated client `waitFor`-budget starvation. ~1 fires per loaded run. Green CI on same commit confirms the class, not a regression.
+
+Poll-or-budget rule. A test asserting a wall-clock outcome must either poll a bounded observable condition (`waitFor`, or a bounded poll loop on a process-recorded file/state), or carry a justified budget with documented fork-contention headroom. A budget red under a loaded 8-fork run, green in isolation = budget defect, not machine defect.
+
+Hardened members:
+- `packages/server/src/__tests__/cli-signal-forwarding.test.ts` — one-shot `boot-state.json` `exitIntent` read after SIGTERM → bounded poll.
+- `packages/server/src/__tests__/auth-redirect-base.test.ts` P1 — 100k-build budget 100ms → 1000ms (measured ~10ms isolated, 101ms saturated).
+- client global `asyncUtilTimeout` 5s → 10s.
+- `testTimeout: 30000` added where the 5s default applied: `packages/shared`, `packages/bus-client`, `packages/extension`, root `scripts`.
+- `packages/client/src/lib/__tests__/linkify-tool-output.perf.test.ts` 250ms → 1000ms. `packages/mcp-server-plugin/src/server/__tests__/performance.test.ts` P1 p95 1ms → 10ms.
+
+Worktree trap: `.worktrees/<name>` checkout WITHOUT root `node_modules` resolves deps from parent checkout. Misleading failures (pi-version-skew, published-imports). Fix: `pnpm install` inside worktree before `npm test`.
+
+Cross-refs:
+- openspec/changes/make-test-suite-deterministic/
+- openspec/changes/contention-harden-real-process-tests/
+- scripts/check-fixed-tick-waits.mjs
+- vitest.workers.ts
+- packages/client/src/__tests__/fixed-tick-conversion-equivalence.test.ts
+
+## Doctrine not injected / first-contact nudge keeps firing?
+
+Check in order:
+
+- kb extension not loaded → no hook runs, nothing injected. Add `@blackbelt-technology/pi-dashboard-kb-extension` to `settings.json#packages[]`. Doctor flags "doctrine configured but kb extension not loaded".
+- project config has no `doctrine` key → first-contact nudge fires once per session until a choice is recorded. Record in `.pi/dashboard/knowledge_base.json`: `"doctrine": {"inject":"kb","write":true}`. `ask later` writes nothing → nudge re-fires next session.
+- root `AGENTS.md` carries legacy `dox:*:start` delimiters → injection skipped (no double-load) + migration nudge. Replace legacy block with pointer block.
+- malformed config → built-in defaults for that turn (READ on, WRITE off) + one `[kb]` `console.warn` per session. No first-contact nudge.
+- WRITE discipline missing → `"write": true` required. `inject: "off"` injects nothing and makes `write` inert.
+
+See change: inject-dox-doctrine-and-describe.
+
+## How do I connect Claude Code / Cursor to the dashboard MCP?
+
+Connect external MCP client via HTTP transport with bearer authentication.
+
+Mint token:
+1. Navigate Settings → Security → Paired Devices.
+2. Click "Create token for an MCP client".
+3. Enter label (e.g. `claude-code`). Click Create.
+4. Token shown once. Copy snippet:
+   `claude mcp add --transport http pi-dashboard <base>/mcp --header "Authorization: Bearer <token>"`
+
+Caveats + configuration:
+- Tunnel / reverse-proxy: snippet uses current browser origin. Substitute URL client actually reaches.
+- Revoke: open Settings → Security → Paired Devices, delete device row. Token invalidated immediately.
+- Shell history hazard: pasting snippet writes bearer token into terminal history. Revoke + re-mint if machine shared.
+- Legacy revisions: clients speaking `2025-03-26`, `2025-06-18`, `2025-11-25` get tool calls + discovery. NO event streaming (`subscriptions/listen` requires `2026-07-28`; legacy callers get 404 `MethodRemoved`).
+- Client shutdown: client sends `DELETE /mcp` on exit. Server returns `405 Method Not Allowed` (`Allow: POST`). Expected; ignore error.
+
+Details: `docs/architecture.md` §MCP Endpoint.
+
+See change: mcp-legacy-clients-and-token-issuance, expand-mcp-tiered-surface.
+
+Cross-refs:
+- docs/architecture.md
+- packages/mcp-server-plugin/README.md
+- packages/client/src/components/connectivity/PairedDevicesSection.tsx
+- packages/server/src/routes/pairing-routes.ts
+
+## Which tier do I give Claude Code / Cursor?
+
+Tier choice depends on desired authority:
+
+- `observe` (default): inspect sessions, read files, list tools, view git diffs and transcripts. No execution or mutation.
+- `control`: drive sessions, send prompts, spawn sessions, abort runs, trigger session actions.
+- `operate`: full control including server restart, package management, process control, system settings.
+
+Details: `docs/architecture.md` §MCP Endpoint.
+
+See change: expand-mcp-tiered-surface.
+
+Cross-refs:
+- docs/architecture.md
+- packages/shared/src/route-tiers.ts
+- packages/mcp-server-plugin/src/server/tools.manifest.ts
+
+## How do I connect an agent from another machine?
+
+Steps:
+1. Navigate Settings → Security → Paired Devices.
+2. Click "Create token for an MCP client".
+3. Select base URL from "Reachable at" dropdown (shows LAN IP or active tunnel URL).
+4. Pick tier (`observe`, `control`, `operate`).
+5. Copy generated snippet containing target base URL and bearer token.
+
+CLI alternative on dashboard host:
+```bash
+pi-dashboard token create --label ci --tier control --url http://<lan-ip>:8000
+```
+
+Caveat: bearer token sends in cleartext over plain HTTP; LAN `http://` snippet exposes token to network sniffers. Use `https://` tunnel/base URL for agents off trusted LAN. Revoke + re-mint token after any exposure.
+
+Details: `docs/architecture.md` §MCP Endpoint.
+
+See change: expand-mcp-tiered-surface.
+
+Cross-refs:
+- docs/architecture.md
+- packages/server/src/routes/pairing-routes.ts
+- packages/server/src/cli.ts
+
+## Does observe still expose repo contents?
+
+Yes. `observe` grants inspection reach matching browser dashboard:
+- File reads, workspace directory tree, grep search.
+- Session diffs, transcripts, activity logs.
+- No session mutation, prompt dispatch, or process execution.
+
+Details: `docs/architecture.md` §MCP Endpoint.
+
+See change: expand-mcp-tiered-surface.
+
+Cross-refs:
+- docs/architecture.md
+- packages/shared/src/route-tiers.ts
+
+## My existing tokens changed behaviour
+
+Existing token registry rows written before `tier` field existed default to `operate`:
+- Full access preserved; existing automations continue working.
+- Paired Devices list displays assigned tier for each device row.
+- Re-mint narrower tokens (`observe` or `control`) to apply least privilege.
+
+Details: `docs/architecture.md` §MCP Endpoint.
+
+See change: expand-mcp-tiered-surface.
+
+Cross-refs:
+- docs/architecture.md
+- packages/server/src/routes/pairing-routes.ts
+
+## Why is a subagent or tool card stuck `running` after the session ended?
+
+Cause: server tracked only `currentTool`. When session died (kill -9, watchdog force close, grace expiry), nothing wrote terminal event for in-flight `Agent` tool calls or subagents. Cards spun forever live and after reload.
+
+Fix: `sessionManager.onEnded` (`packages/server/src/event-wiring.ts`) derives open work from stored event stream via `packages/server/src/session/open-tool-calls.ts` (`findOpenToolCalls`, `findOpenSubagents`). Inserts + broadcasts synthesized `tool_execution_end{isError:true, result:"parent session ended", healedBy:"session_ended"}` per open call and `subagent_failed{error:"parent session ended", healedBy:"session_ended"}` per non-terminal subagent.
+
+Idempotent: synthesized ends re-enter same stream; second `onEnded` finds nothing open. Relocation (`session.movedTo` set) skipped — calls still run on destination.
+
+Cold hydration: `packages/shared/src/state-replay.ts` `replayEntriesAsEvents` closes orphaned transcript toolCall with same error shape (`{result:"parent session ended", isError:true, healedBy:"session_ended"}`). Replaces previous `{result:"", isError:false}` (killed call previously rendered as silent empty success; now explicit failure in already-archived sessions).
+
+Client: reducer heals only `running` row (`packages/client/src/lib/chat/event-reducer.ts`). Payload carrying `healedBy` on existing terminal state ignored.
+
+API: `GET /api/session/:id/tool-result/:toolCallId` returns synthesized end if present. `healedBy:"session_ended"` in payload distinguishes synthesized end from real tool result.
+
+See change: heal-orphaned-tool-cards-on-session-end.
+
+Cross-refs:
+- packages/server/src/event-wiring.ts
+- packages/server/src/session/open-tool-calls.ts
+- packages/shared/src/state-replay.ts
+- packages/client/src/lib/chat/event-reducer.ts
+- openspec/changes/heal-orphaned-tool-cards-on-session-end/
+
+
