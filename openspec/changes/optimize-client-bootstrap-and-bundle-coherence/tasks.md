@@ -139,8 +139,17 @@
   git-diff-view graph + FileDiffView/DiffPanel/RichDiff, xterm stays 0; editor layout alone
   loads neither; `新建终端` click loads xterm + TerminalPaneLayer and mounts `.xterm` DOM.
   Tab-switch keep-alive covered by `TerminalPaneLayer.keep-alive.test.tsx`.
-- [ ] 8.5 Deployment verification is deferred to a separately authorized run: execute the hardened
-  rebuild script, then `/api/health.clientBuild.status` is `matched` and the browser banner stays
-  absent after a fresh load. NOTE: the dev-server run regenerated
-  `packages/client/src/generated/plugin-registry.tsx` with the dev-only `demo` plugin entry —
-  reverted before the final test run; do not commit a dev-flavored registry.
+- [x] 8.5 Deployment executed (authorized "提交并部署"): hash-reconciliation fix first —
+  the build-side `PLUGIN_REGISTRY_HASH`/declaration were computed over `loadPluginEntries`
+  (client-entry-gated) while the server hashes `discoverPlugins()` minus fixtures; the
+  server-only `mcp-server` plugin (no `client` field) made the deployed bundle embed
+  `59d19bdd…` where the server reports `879d335e…` (the banner could never clear on reload).
+  Fixed in `e78d4dc6` (`registryHashForRoot` = the exact runtime expression, + regression test).
+  Rebuilt (declaration/embedded/generated all `879d335e…`), synced to the global flat install
+  (7 sources incl. NEW `server/src/lib/client-dist.ts` + 3 runtime files; backup in /tmp), then
+  `node scripts/sync-served-client.mjs` (replaced; verified) + `pi-dashboard restart`. Result:
+  `/api/health` `clientBuild.status: "matched"`, `pluginRegistryHash == bundleHash == 879d335e…`;
+  served entry `index-DgLZ5TnP.js`; fresh browser load: no `PluginStalenessBanner` in DOM
+  (search by test id + text). Reload step intentionally skipped: no `packages/extension/`
+  changes in this change, and `/reload` to 148 live sessions would interrupt user work for
+  no effect (the user was told).
