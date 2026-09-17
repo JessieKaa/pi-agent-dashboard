@@ -1,5 +1,5 @@
 import type { DashboardSession } from "@blackbelt-technology/pi-dashboard-shared/types.js";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Router, useLocation } from "wouter";
@@ -229,6 +229,30 @@ describe("SessionList compact workspace sidebar", () => {
       </TestRouter>,
     );
   }
+
+  it("hides the tier-0 folder action banner (init-status probe stays quiet)", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/git/worktree/init-status")) {
+        return new Response(
+          JSON.stringify({ success: true, data: { hasHook: true, trusted: false } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ success: false }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const { container } = renderCompact(true);
+      await waitFor(() =>
+        expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/api/git/worktree/init-status"))).toBe(true),
+      );
+      expect(container.querySelector('[data-testid^="folder-banner-"]')).toBeNull();
+      expect(screen.queryByText("Review & trust changes")).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 
   it("keeps the folder header, Git info, project actions, body, and session card", () => {
     const { container } = renderCompact(true);

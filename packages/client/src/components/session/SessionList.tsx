@@ -1479,7 +1479,11 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
             />
           </div>
           {/* Tier-0 call-to-action banner — renders only when the folder cannot
-              proceed (setup / init needed / re-trust / running / failure). */}
+              proceed (setup / init needed / re-trust / running / failure).
+              Compact sidebar hides it entirely (all rungs), matching the other
+              hidden compact surfaces; the init-status probe above still runs
+              because the folder actions menu's Project setup tally uses it. */}
+          {!compactSidebar && (
           <FolderActionBanner
             cwd={group.cwd}
             status={initStatus}
@@ -1493,6 +1497,7 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
             onStatusChange={refetchInit}
             sessions={group.sessions}
           />
+          )}
           {/* Slot-pill grid: the plugin slot sections (Automations / Goals /
               KB) + OpenSpec render as single-concern pills in a 2-col grid that
               collapses to 1-col at mobile width. A section that renders null
