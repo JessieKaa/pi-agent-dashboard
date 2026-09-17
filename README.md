@@ -480,6 +480,24 @@ Set `"devBuildOnReload": true` in `config.json` for a one-command full-stack ref
 
 > Blocks pi for ~2–5s during the build. The server shutdown affects all connected sessions — they auto-reconnect when one restarts the server.
 
+### Rebuilding the served client
+
+The server serves ONE static client directory, resolved installed-package-first: `node_modules/@blackbelt-technology/pi-dashboard-web/dist` (the global/local npm install), falling back to `packages/client/dist` only in workspace-only layouts. A plain `npm run build` writes the workspace copy and does **not** touch the served one — the two can silently drift.
+
+Two paths keep them coherent:
+
+- **Workspace-only build** — `npm run build`. Use when you're running the server straight from this checkout (workspace fallback active). The build also emits `packages/client/dist/pi-dashboard-build.json`, a declaration recording the plugin-registry hash baked into this bundle.
+- **Deploy the fresh build locally** — `scripts/rebuild-restart.sh` (build → sync → restart → reload bridges). The sync step copies the workspace build into the installed `pi-dashboard-web/dist` and FAILS before restarting when the served artifact has no declaration or its hash disagrees with the fresh build. Do not restart by hand expecting new client code unless you used this script.
+
+`GET /api/health` reports the coherence state additively:
+
+```bash
+curl -s http://localhost:8000/api/health | jq .clientBuild
+# { "pluginRegistryHash": "59d1…", "status": "matched" }
+```
+
+`status` is one of `matched` (served bundle agrees with the running plugin registry), `mismatched` (restart the server after syncing), `metadata-missing` (served dir predates the declaration — run the rebuild script), `not-served` (API-only server, no static client). The browser stale-bundle banner keeps using `bundleHash`; `clientBuild` is server-side evidence.
+
 ### Session spawning
 
 **Headless** (default) — runs pi as a background process with no terminal attached. Interaction through the web UI.

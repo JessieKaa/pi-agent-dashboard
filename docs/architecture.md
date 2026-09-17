@@ -697,6 +697,14 @@ Runtime: `/api/health` returns `bundleHash` field. Server computes via same `plu
 
 Client: `PluginStalenessBanner` fetches `/api/health` on mount. Compares `bundleHash` against imported `PLUGIN_REGISTRY_HASH`. Mismatch ⇒ render banner with Refresh + Dismiss buttons. Refresh calls `location.reload()`. Dismiss persists in `sessionStorage` key `pi-plugin-staleness-dismissed` (tab-scoped, clears on browser close). Dismissed banner stays hidden until next session.
 
+**Served-build declaration + `clientBuild` health.** Production Vite build emits `pi-dashboard-build.json` into client dist dir. Contents: `{schemaVersion: 1, pluginRegistryHash}`. Hash = same value as `PLUGIN_REGISTRY_HASH` in generated registry — production plugin set, fixture-filtered. No timestamps, no machine paths. Vite plugin writes it at `configResolved` (captures `outDir` when `command === "build"`) + `closeBundle`. Dev/HMR writes nothing.
+
+Server resolves static client dir once at startup — `packages/server/src/lib/client-dist.ts`. Installed package first: `createRequire` resolve of `@blackbelt-technology/pi-dashboard-web/package.json`, sibling `dist`, gated on `index.html`. Fallback: workspace `packages/client/dist`. Same resolved dir feeds Fastify static serving + health report.
+
+`/api/health.clientBuild` = `{pluginRegistryHash: string|null, status}`. Status values: `matched` (served declaration hash equals live `bundleHash`), `mismatched`, `metadata-missing`, `not-served`. `bundleHash` + browser `PluginStalenessBanner` contract unchanged. No filesystem path in any browser payload. Startup logs one-line diagnostic when declaration missing — filename only, no path.
+
+`scripts/sync-served-client.mjs` copies fresh workspace build into installed served dir, verifies declaration equality. `scripts/rebuild-restart.sh` runs it between build + restart; mismatch fails before restart. Fixes silent drift: plain `npm run build` writes workspace copy, server may serve npm-installed copy.
+
 #### Plugin Activation UI
 
 Settings ▸ Plugins tab lists every discovered plugin (enabled or not) with display name, description, enable/disable toggle, missing-requirement chips, inline Install affordances.

@@ -2,7 +2,7 @@ import type { OpenSpecArtifact } from "@blackbelt-technology/pi-dashboard-shared
 import { mdiRefresh } from "@mdi/js";
 import { Icon } from "@mdi/react";
 import type React from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Redirect, Route, Switch, useLocation, useRoute, useSearch, useSearchParams } from "wouter";
 import { CanvasDriver } from "./components/canvas/CanvasDriver.js";
 import { ChatView, type ChatViewHandle } from "./components/chat/ChatView.js";
@@ -11,7 +11,6 @@ import { SessionCommandInput } from "./components/chat/SessionCommandInput.js";
 import { ConnectionStatusBanner } from "./components/connectivity/ConnectionStatusBanner.js";
 import { ServerSelector } from "./components/connectivity/ServerSelector.js";
 import { DirectorySettings, type DirectorySettingsPage } from "./components/DirectorySettings/DirectorySettings.js";
-import { FileDiffView } from "./components/diff/FileDiffView.js";
 import { SessionDiffProvider } from "./components/diff/SessionDiffContext.js";
 import { DirectoryHomeView } from "./components/folder/DirectoryHomeView.js";
 import { FolderEditorView } from "./components/folder/FolderEditorView.js";
@@ -329,6 +328,24 @@ function PiResourceFileRoute({
 // does not hand ChatView a fresh [] literal every render, which would defeat
 // its React.memo. See change: reduce-chat-render-cpu-umbrella (Phase 4).
 const EMPTY_STEERING: string[] = [];
+
+// Lazy so the Diff module graph (FileDiffView → DiffPanel → its markdown/diff
+// deps) stays out of the landing bundle: the chunk is fetched when a
+// `/session/:id/diff` route actually renders. `renderDiff` below is called as
+// a plain function (not rendered as a component), so it wraps the element in a
+// route-local Suspense with a full-screen fallback. See change:
+// optimize-client-bootstrap-and-bundle-coherence (P1).
+const FileDiffView = lazy(() =>
+  import("./components/diff/FileDiffView.js").then((m) => ({ default: m.FileDiffView })),
+);
+
+function DiffRouteFallback() {
+  return (
+    <div className="flex h-full items-center justify-center text-sm text-[var(--text-tertiary)]">
+      Loading diff…
+    </div>
+  );
+}
 
 export default function App() {
   const { t, language } = useI18n();
@@ -1910,7 +1927,9 @@ export default function App() {
           onBack={goBack}
         />
       ) : !frozen && diffMatch && diffSessionId ? (
-        <FileDiffView sessionId={diffSessionId} onBack={goBack} />
+        <Suspense fallback={<DiffRouteFallback />}>
+          <FileDiffView sessionId={diffSessionId} onBack={goBack} />
+        </Suspense>
       ) : (
         <SessionSplitView
           chat={
@@ -2229,7 +2248,11 @@ export default function App() {
     renderOpenSpecBoard: (cwd) => renderOpenSpecBoardView(cwd),
     renderArchive: (cwd) => <ArchiveBrowserView cwd={cwd} onBack={goBack} />,
     renderSpecs: (cwd) => <SpecsBrowserView cwd={cwd} onBack={goBack} />,
-    renderDiff: (sessionId) => <FileDiffView sessionId={sessionId} onBack={goBack} />,
+    renderDiff: (sessionId) => (
+      <Suspense fallback={<DiffRouteFallback />}>
+        <FileDiffView sessionId={sessionId} onBack={goBack} />
+      </Suspense>
+    ),
     renderPiResourceFile: (filePath, title) => (
       <PiResourceFileRoute filePath={filePath} title={title} onBack={goBack} />
     ),

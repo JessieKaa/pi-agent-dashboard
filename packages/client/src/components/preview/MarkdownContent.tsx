@@ -231,7 +231,7 @@ const MarkdownRenderContext = React.createContext<MarkdownRenderContextValue | n
 
 function useMarkdownRenderContext(): MarkdownRenderContextValue {
   const value = React.useContext(MarkdownRenderContext);
-  if (!value) throw new Error("Markdown renderer requires its render context");
+  if (!value) throw new Error("useMarkdownRenderContext must be used within MarkdownContent");
   return value;
 }
 

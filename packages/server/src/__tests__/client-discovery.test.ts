@@ -1,39 +1,79 @@
-import { describe, it, expect } from "vitest";
-import path from "node:path";
-import { existsSync } from "node:fs";
-
 /**
- * Tests the client static file discovery order.
- * Replicates the search logic from server.ts.
+ * Tests for the ONE client static-dir resolver (`lib/client-dist.ts`) that
+ * backs both Fastify static serving and `/api/health.clientBuild`.
+ * See change: optimize-client-bootstrap-and-bundle-coherence (P0).
  */
-function findClientDir(serverDir: string): string {
-  const searchPaths = [
-    path.join(serverDir, "../../node_modules/@blackbelt-technology/pi-dashboard-web/dist"),
-    path.join(serverDir, "../../client/dist"),
-    path.join(serverDir, "../../dist/client"),
-  ];
-  return searchPaths.find(p => existsSync(path.join(p, "index.html"))) ?? "";
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { resolveClientDist } from "../lib/client-dist.js";
+
+let root: string;
+/** Anchor dir inside a fake install whose node_modules holds the web pkg. */
+let anchorDir: string;
+let installedDist: string;
+let workspaceDist: string;
+
+beforeEach(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), "client-dist-"));
+  anchorDir = path.join(root, "server", "src");
+  installedDist = path.join(root, "node_modules", "@blackbelt-technology", "pi-dashboard-web", "dist");
+  workspaceDist = path.join(root, "packages", "client", "dist");
+  fs.mkdirSync(anchorDir, { recursive: true });
+  fs.mkdirSync(workspaceDist, { recursive: true });
+  fs.writeFileSync(path.join(workspaceDist, "index.html"), "<html></html>");
+});
+
+afterEach(() => {
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+function installWebPackage(): void {
+  const pkgDir = path.dirname(installedDist);
+  fs.mkdirSync(installedDist, { recursive: true });
+  fs.writeFileSync(
+    path.join(pkgDir, "package.json"),
+    JSON.stringify({ name: "@blackbelt-technology/pi-dashboard-web", version: "0.0.0" }),
+  );
+  fs.writeFileSync(path.join(installedDist, "index.html"), "<html></html>");
 }
 
-describe("client static file discovery", () => {
-  it("returns empty string when no client build exists", () => {
-    // Use a path that definitely doesn't have client builds
-    expect(findClientDir("/tmp/nonexistent-server-dir")).toBe("");
+describe("resolveClientDist", () => {
+  it("prefers the installed package when it resolves and contains index.html", () => {
+    installWebPackage();
+    const resolved = resolveClientDist({ anchor: anchorDir, workspaceFallback: workspaceDist });
+    expect(resolved).toEqual({ dir: installedDist, fromInstalledPackage: true });
   });
 
-  it("searches npm package path first", () => {
-    // This is a structural test — verifies search order
-    const serverDir = "/fake/packages/server/src";
-    const searchPaths = [
-      path.join(serverDir, "../../node_modules/@blackbelt-technology/pi-dashboard-web/dist"),
-      path.join(serverDir, "../../client/dist"),
-      path.join(serverDir, "../../dist/client"),
-    ];
-    // npm package path should be first
-    expect(searchPaths[0]).toContain("pi-dashboard-web/dist");
-    // workspace sibling second
-    expect(searchPaths[1]).toContain("client/dist");
-    // legacy third
-    expect(searchPaths[2]).toContain("dist/client");
+  it("falls back to the workspace sibling when the package does not resolve", () => {
+    const resolved = resolveClientDist({ anchor: anchorDir, workspaceFallback: workspaceDist });
+    expect(resolved).toEqual({ dir: workspaceDist, fromInstalledPackage: false });
+  });
+
+  it("falls back to the workspace sibling when the installed package has no dist", () => {
+    const pkgDir = path.dirname(installedDist);
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pkgDir, "package.json"),
+      JSON.stringify({ name: "@blackbelt-technology/pi-dashboard-web", version: "0.0.0" }),
+    );
+    const resolved = resolveClientDist({ anchor: anchorDir, workspaceFallback: workspaceDist });
+    expect(resolved).toEqual({ dir: workspaceDist, fromInstalledPackage: false });
+  });
+
+  it("returns null (API-only) when neither location has a build", () => {
+    fs.rmSync(path.join(workspaceDist, "index.html"));
+    const resolved = resolveClientDist({ anchor: anchorDir, workspaceFallback: workspaceDist });
+    expect(resolved).toEqual({ dir: null, fromInstalledPackage: false });
+  });
+
+  it("never throws on an anchor with no runnable module graph", () => {
+    const resolved = resolveClientDist({
+      anchor: path.join(root, "does", "not", "exist"),
+      workspaceFallback: workspaceDist,
+    });
+    expect(resolved).toEqual({ dir: workspaceDist, fromInstalledPackage: false });
   });
 });

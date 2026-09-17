@@ -93,13 +93,21 @@ export default defineConfig({
             // both — a separate `syntax` chunk only re-created a
             // `syntax → markdown → syntax` circular-chunk warning.
             "markdown": ["react-markdown", "remark-gfm", "rehype-raw", "dompurify", "react-syntax-highlighter"],
-            "diff": [
+            // The heavy diff-rendering libraries. Only reachable from lazy
+            // subtrees (FileDiffView route, editor DiffViewer tab,
+            // EditToolRenderer's RichDiff) so the chunk stays out of the
+            // landing preload graph. See change:
+            // optimize-client-bootstrap-and-bundle-coherence (P1).
+            "git-diff-view": [
               "@git-diff-view/core",
               "@git-diff-view/file",
               "@git-diff-view/lowlight",
               "@git-diff-view/react",
-              "diff",
             ],
+            // The small `diff` npm util itself MUST stay split from the
+            // renderers above: `lineDelta.ts` (chat turn summaries) and
+            // EditToolRenderer's mobile HomegrownDiff import it eagerly.
+            "diff": ["diff"],
             "xterm": [
               "@xterm/xterm",
               "@xterm/addon-attach",

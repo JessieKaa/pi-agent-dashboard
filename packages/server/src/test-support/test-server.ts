@@ -39,7 +39,13 @@ export async function createTestServer(
   overrides: TestServerOverrides = {},
 ): Promise<TestServerHandle> {
   const config: ServerConfig = { ...DEFAULTS, ...overrides };
-  const server = await createServer(config);
+  // Boot with API-only static serving: no clientDistOverride is passed, and
+  // `DASHBOARD_CLIENT_DIST_DIR` is deleted so `/api/health.clientBuild` is
+  // deterministically `not-served` regardless of builds/installs on the
+  // runner. Static-serving integration tests instead pass
+  // `clientDistOverride` explicitly. See change:
+  // optimize-client-bootstrap-and-bundle-coherence (P0).
+  const server = await createServer(config, { clientDistOverride: null });
   await server.start();
 
   const httpPort = server.httpPort();

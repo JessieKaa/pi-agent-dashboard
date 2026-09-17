@@ -1,11 +1,12 @@
 /**
  * SPA fallback tests — validates that client-side routes return index.html.
  */
-import { describe, it, expect, afterAll, beforeAll } from "vitest";
-import { createServer, type DashboardServer } from "../server.js";
-import path from "node:path";
+
 import fs from "node:fs";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createServer, type DashboardServer } from "../server.js";
 
 let httpPort: number;
 let piPort: number;
@@ -15,17 +16,20 @@ let server: DashboardServer;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const clientDir = path.join(__dirname, "../../../dist/client");
 const indexPath = path.join(clientDir, "index.html");
-let createdDir = false;
 
 describe("SPA fallback", () => {
   beforeAll(async () => {
-    // Create minimal dist/client/index.html if it doesn't exist
-    if (!fs.existsSync(indexPath)) {
-      fs.mkdirSync(clientDir, { recursive: true });
-      fs.writeFileSync(indexPath, "<!doctype html><html><body>SPA</body></html>");
-      createdDir = true;
-    }
+    // Create the minimal index.html the SPA fallback serves. The boot below
+    // pins this dir explicitly, so a real build elsewhere never masks it.
+    // See change: optimize-client-bootstrap-and-bundle-coherence (P0).
+    fs.mkdirSync(clientDir, { recursive: true });
+    fs.writeFileSync(indexPath, "<!doctype html><html><body>SPA</body></html>");
 
+    // Boot with an ISOLATED static dir holding ONLY the minimal index.html
+    // created above, overriding both the installed-package resolution and the
+    // workspace `packages/client/dist` fallback (either may carry a real build
+    // on dev machines and carry away the SPA fallback assertions).
+    // See change: optimize-client-bootstrap-and-bundle-coherence (P0).
     server = await createServer({
       port: 0,
       piPort: 0,
@@ -34,7 +38,7 @@ describe("SPA fallback", () => {
       autoShutdown: false,
       shutdownIdleSeconds: 999,
       tunnel: false,
-    });
+    }, { clientDistOverride: clientDir });
     await server.start();
     httpPort = server.httpPort()!;
     piPort = server.piPort()!;
@@ -42,9 +46,7 @@ describe("SPA fallback", () => {
 
   afterAll(async () => {
     if (server) await server.stop();
-    if (createdDir) {
-      fs.rmSync(indexPath);
-    }
+    fs.rmSync(indexPath);
   });
 
   it("returns index.html for /session/:id route", async () => {

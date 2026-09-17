@@ -21,6 +21,10 @@ import type { PluginManifest } from "@blackbelt-technology/pi-dashboard-shared/d
 import type { Plugin, ViteDevServer } from "vite";
 import { validateManifest } from "../manifest-validator.js";
 import {
+  BUILD_METADATA_FILENAME,
+  serializeBuildMetadata,
+} from "../server/build-metadata.js";
+import {
   clearDiscoveryCache,
   discoverPlugins,
   pluginRegistryHash,
@@ -76,7 +80,6 @@ function resolvePackageImportSpecifier(
   if (!exportsField || typeof exportsField !== "object") return undefined;
   const rootExport = (exportsField as Record<string, unknown>)["."];
   if (!rootExport) return undefined;
-
   let target: string | undefined;
   if (typeof rootExport === "string") target = rootExport;
   else if (typeof rootExport === "object") {
@@ -94,7 +97,6 @@ function resolvePackageImportSpecifier(
 
   return name;
 }
-
 function loadPluginEntries(repoRoot: string, isProd: boolean): PluginEntry[] {
   clearDiscoveryCache();
   const discovered = discoverPlugins(repoRoot);
@@ -350,15 +352,53 @@ function regenerate(repoRoot: string, isProd: boolean): { changed: boolean; cont
 }
 
 /**
+ * The plugin registry hash generated for a production build, in the SAME form
+ * the generated file embeds (`pluginRegistryHash` over the post-fixture-filter
+ * entries — see `generateRegistryContent`). Note this deliberately differs from
+ * `hashContent(content)`: the staleness hash and the served-build declaration
+ * must both match the runtime server's `pluginRegistryHash` computation.
+ * See change: optimize-client-bootstrap-and-bundle-coherence (P0 D3).
+ */
+function productionRegistryHash(repoRoot: string): string {
+  return pluginRegistryHash(loadPluginEntries(repoRoot, true));
+}
+
+/**
+ * Write the served-artifact declaration (`pi-dashboard-build.json`) into the
+ * build output directory. Consumed by the dashboard server to report whether
+ * the static artifact it actually serves agrees with its runtime plugin set.
+ * See change: optimize-client-bootstrap-and-bundle-coherence (P0).
+ */
+function writeBuildDeclaration(outDir: string, pluginRegistryHashValue: string): void {
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(outDir, BUILD_METADATA_FILENAME),
+    serializeBuildMetadata(pluginRegistryHashValue),
+    "utf-8",
+  );
+}
+
+/**
  * Returns the Vite plugin for dashboard plugin registry generation.
  * @param repoRoot - Absolute path to the monorepo root. Defaults to process.cwd().
  */
 export function viteDashboardPluginsPlugin(repoRoot?: string): Plugin {
   const root = repoRoot ?? process.cwd();
+  let buildOutDir: string | null = null;
 
   return {
     name: "vite-dashboard-plugins",
     enforce: "pre", // run before React plugin
+
+    configResolved(config) {
+      // Absolute build output dir, resolved from Vite's final config so the
+      // declaration lands in the same directory the build writes (independent
+      // of Vite's cwd). Dev server: `config.command` is "serve"; never write a
+      // production declaration. See change: optimize-client-bootstrap-and-bundle-coherence.
+      buildOutDir = config.command === "build"
+        ? path.resolve(config.root, config.build.outDir)
+        : null;
+    },
 
     buildStart() {
       const isProd = process.env.NODE_ENV === "production";
@@ -366,6 +406,15 @@ export function viteDashboardPluginsPlugin(repoRoot?: string): Plugin {
       if (changed) {
         console.info("[vite-dashboard-plugins] Generated plugin-registry.tsx");
       }
+    },
+
+    closeBundle() {
+      if (!buildOutDir) return;
+      // Recompute against the finally generated registry: buildStart may
+      // regenerate the file, and a stale declaration would poison the
+      // server's served-build compatibility report. See change: optimize-... (D3).
+      writeBuildDeclaration(buildOutDir, productionRegistryHash(root));
+      console.info("[vite-dashboard-plugins] Wrote pi-dashboard-build.json");
     },
 
     configureServer(server: ViteDevServer) {

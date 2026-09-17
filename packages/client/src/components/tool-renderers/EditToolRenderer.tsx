@@ -1,9 +1,25 @@
-import React from "react";
+import { type ComponentProps, lazy, Suspense } from "react";
 import { createTwoFilesPatch } from "diff";
 import type { ToolRendererProps } from "./types.js";
 import { OpenFileButton } from "./OpenFileButton.js";
 import { useMobile } from "../../hooks/useMobile.js";
-import { RichDiff } from "../diff/RichDiff.js";
+
+// Lazy so the heavy @git-diff-view chunk stays out of the landing preload
+// graph (this renderer is statically reachable from the chat tool registry).
+// The chunk is fetched on the first edit card with diffable text. File name
+// pinned by the bundle guard's LAZY_READER_FILES list. See change:
+// optimize-client-bootstrap-and-bundle-coherence (P1).
+const RichDiff = lazy(() =>
+  import("../diff/RichDiff.js").then((m) => ({ default: m.RichDiff })),
+);
+
+function LazyRichDiff(props: ComponentProps<typeof RichDiff>) {
+  return (
+    <Suspense fallback={null}>
+      <RichDiff {...props} />
+    </Suspense>
+  );
+}
 
 // --- Mobile-only diff renderer ---
 
@@ -138,7 +154,7 @@ export function EditToolRenderer({ args, status, result, toolDetails, context }:
         <div className="rounded bg-[var(--bg-code)] overflow-hidden text-code" style={{ fontSize: "12px" }}>
           {isMobile
             ? <HomegrownDiff oldText={oldText} newText={newText} filePath={filePath ?? "file"} />
-            : <RichDiff oldText={oldText} newText={newText} filePath={filePath ?? "file"} maxHeight="20rem" />}
+            : <LazyRichDiff oldText={oldText} newText={newText} filePath={filePath ?? "file"} maxHeight="20rem" />}
         </div>
       );
     }
@@ -151,7 +167,7 @@ export function EditToolRenderer({ args, status, result, toolDetails, context }:
             <div key={i} className={i > 0 ? "border-t border-[var(--border-secondary)]" : ""}>
               {isMobile
                 ? <HomegrownDiff oldText={edit.oldText} newText={edit.newText} filePath={filePath ?? "file"} />
-                : <RichDiff oldText={edit.oldText} newText={edit.newText} filePath={filePath ?? "file"} maxHeight="20rem" />}
+                : <LazyRichDiff oldText={edit.oldText} newText={edit.newText} filePath={filePath ?? "file"} maxHeight="20rem" />}
             </div>
           ))}
         </div>

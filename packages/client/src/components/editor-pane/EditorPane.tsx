@@ -17,12 +17,12 @@
 import { fileKind } from "@blackbelt-technology/pi-dashboard-shared/file-kind.js";
 import { mdiClose, mdiConsoleLine, mdiFileTreeOutline, mdiMagnify, mdiRefresh, mdiWeb } from "@mdi/js";
 import { Icon } from "@mdi/react";
-import { Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { grepContents } from "../../lib/api/grep-api.js";
 import { useI18n } from "../../lib/i18n/i18n.js";
 import { useRailWidth } from "../../lib/layout/rail-width.js";
 import { useTreeVisible } from "../../lib/util/tree-visible.js";
-import { stripTermId } from "../../lib/layout/use-terminal-pane-tabs.js";
+import { openTerminalIds, stripTermId } from "../../lib/layout/use-terminal-pane-tabs.js";
 import { SplitDivider } from "../split/SplitDivider.js";
 import { useSplitWorkspace } from "../split/SplitWorkspaceContext.js";
 import { ChangedOnDiskBanner } from "./ChangedOnDiskBanner.js";
@@ -30,12 +30,20 @@ import { ChangesRailSection } from "./ChangesRailSection.js";
 import { EditorFileTree } from "./EditorFileTree.js";
 import { EditorSearchPanel } from "./EditorSearchPanel.js";
 import { EditorTabs } from "./EditorTabs.js";
-import { TerminalPaneLayer } from "./TerminalPaneLayer.js";
 import { useServerCapabilities } from "../../hooks/useServerCapabilities.js";
 import { CappedViewer } from "./CappedViewer.js";
 import { pseudoTabRegistry } from "./pseudo-tab-registry.js";
 import { isPseudoTabViewer, type OpenPathViewer } from "./viewer-kinds.js";
 import { TabActions, type TabActionTarget } from "./TabActions.js";
+
+// Lazy so xterm + its client code stay out of the landing bundle: the chunk
+// is fetched on the first `term:` tab, never on cold load. Component type is
+// pinned by the named reader (this file is in the bundle guard's
+// LAZY_READER_FILES list). See change:
+// optimize-client-bootstrap-and-bundle-coherence (P1).
+const TerminalPaneLayer = lazy(() =>
+  import("./TerminalPaneLayer.js").then((m) => ({ default: m.TerminalPaneLayer })),
+);
 
 const absOf = (cwd: string, rel: string): string => (rel ? `${cwd}/${rel}` : cwd);
 
@@ -117,6 +125,11 @@ export function EditorPane() {
 
   const activeTab = state.activeIndex >= 0 ? state.openFiles[state.activeIndex] : null;
   const activePath = activeTab?.path ?? null;
+  // Gate for the lazy terminal layer: load only once a `term:` tab exists.
+  // Flipping false (last terminal tab closed) unmounts a layer that renders
+  // null anyway — stateless, so nothing is lost. Switching between a term tab
+  // and a file tab keeps `openIds` non-empty, so mounted terminals survive.
+  const hasTerminalTab = openTerminalIds(state.openFiles).length > 0;
 
   // System-open tab actions (D9). Gated on the server capability; only a real
   // file or a url tab exposes an action (virtual live-server/diff/terminal do
@@ -330,10 +343,19 @@ export function EditorPane() {
           {/* File viewer + keep-alive terminal layer share the body region.
               When a file tab is active the terminals are display:none; when a
               term tab is active `body` is the null placeholder and the layer's
-              active terminal fills. See change: terminals-in-tabbed-panes. */}
+              active terminal fills. The layer is lazy AND gated on an open
+              `term:` tab — with no terminal tabs it never loads, which keeps
+              its xterm chunk out of the cold landing graph. Keep-alive is
+              unchanged once mounted (visibility toggle, not unmount).
+              See change: optimize-client-bootstrap-and-bundle-coherence (P1),
+              terminals-in-tabbed-panes. */}
           <div className="min-h-0 flex-1 flex flex-col">
             {body}
-            <TerminalPaneLayer />
+            {hasTerminalTab && (
+              <Suspense fallback={null}>
+                <TerminalPaneLayer />
+              </Suspense>
+            )}
           </div>
         </div>
       </div>

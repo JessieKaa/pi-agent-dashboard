@@ -2,17 +2,18 @@
  * Dashboard HTTP + WebSocket server.
  */
 
-import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { createServerPluginContext, discoverPlugins, getPluginStatusStore, loadServerEntries, pluginSpawnToSessionOptions, refreshRequirementProbesFor } from "@blackbelt-technology/dashboard-plugin-runtime/server";
+import type { ExitIntent } from "@blackbelt-technology/pi-dashboard-shared/boot-state.js";
 import { isRecoveryAllowed } from "@blackbelt-technology/pi-dashboard-shared/boot-state.js";
 import { findBundledExtension, registerBridgeExtension } from "@blackbelt-technology/pi-dashboard-shared/bridge-register.js";
 import type { AuthConfig, DashboardConfig } from "@blackbelt-technology/pi-dashboard-shared/config.js";
 import { CONFIG_FILE, getPluginConfig as getPluginConfigFromFile, loadConfig, resolvePublicBaseUrls } from "@blackbelt-technology/pi-dashboard-shared/config.js";
+import { CustomEventGroupsStore } from "@blackbelt-technology/pi-dashboard-shared/custom-event-groups-store.js";
 import { advertiseDashboard, createBrowser, type DashboardBrowser, type DiscoveredServer, stopAdvertising } from "@blackbelt-technology/pi-dashboard-shared/mdns-discovery.js";
 import { setWindowsGitSourceSetting } from "@blackbelt-technology/pi-dashboard-shared/platform/git-source.js";
 import {
@@ -65,7 +66,10 @@ import { createGoalStatusProjector } from "./goal/goal-status-projector.js";
 import { createGoalStore } from "./goal/goal-store.js";
 import { createGoalSupervisor, type GoalDriverSpawnRequest, type GoalSupervisor } from "./goal/goal-supervisor.js";
 import { createGoalVerdictAccumulator } from "./goal/goal-verdict-accumulator.js";
+import { type ResolvedClientDist, resolveClientDist } from "./lib/client-dist.js";
+import { bootParentPid, isBootParentProvablyDead } from "./lifecycle/boot-parent-liveness.js";
 import { runBoundedStartup } from "./lifecycle/bounded-startup.js";
+import { startEphemeralParentWatch } from "./lifecycle/ephemeral-parent-watch.js";
 import { ensureInstanceId } from "./lifecycle/instance-id.js";
 import { createLiveServerManager } from "./live-server/live-server-manager.js";
 import { handleLiveServerUpgrade, registerLiveServerProxy } from "./live-server/live-server-proxy.js";
@@ -90,21 +94,18 @@ import { createPendingPromptAcks } from "./pending/pending-prompt-acks.js";
 import { createPendingResumeIntentRegistry } from "./pending/pending-resume-intent-registry.js";
 import { createPendingWorktreeBaseRegistry } from "./pending/pending-worktree-base-registry.js";
 import { recordExitIntent, resolveExitIntent, stampBootStart } from "./persistence/boot-state.js";
-import type { ExitIntent } from "@blackbelt-technology/pi-dashboard-shared/boot-state.js";
 import { createMemoryEventStore, DEFAULT_MAX_EVENT_DATA_SIZE, type EventStore } from "./persistence/memory-event-store.js";
 import { createMetaPersistence, type MetaPersistence } from "./persistence/meta-persistence.js";
+import { migrateCustomEntryFallbackOverrides } from "./persistence/migrate-custom-entry-fallback.js";
 import { needsMigration, runMigration } from "./persistence/migrate-persistence.js";
 import { createPreferencesStore, type PreferencesStore } from "./persistence/preferences-store.js";
-import { migrateCustomEntryFallbackOverrides } from "./persistence/migrate-custom-entry-fallback.js";
-import { CustomEventGroupsStore } from "@blackbelt-technology/pi-dashboard-shared/custom-event-groups-store.js";
-import { CustomEventGroupMatcher } from "./session/custom-event-group-matcher.js";
-import { CustomEventGroupResolver } from "./session/custom-event-group-resolver.js";
 import { PiCoreChecker } from "./pi/pi-core-checker.js";
 import { PiCoreUpdater } from "./pi/pi-core-updater.js";
 import { createPiGateway, type PiGateway } from "./pi/pi-gateway.js";
 import { pluginIntentCache } from "./plugin-intent-cache.js";
 import { registerAttachmentRoutes } from "./routes/attachment-routes.js";
 import { registerCanvasTypesRoutes } from "./routes/canvas-types-routes.js";
+import { registerCustomEventGroupsRoutes } from "./routes/custom-event-groups-routes.js";
 import { registerDoctorRoutes } from "./routes/doctor-routes.js";
 import { registerFileRoutes } from "./routes/file-routes.js";
 import { registerGitRoutes } from "./routes/git-routes.js";
@@ -118,6 +119,7 @@ import { registerModelProxyDiagnosticsRoutes } from "./routes/model-proxy-diagno
 import { registerModelProxyRefreshRoutes } from "./routes/model-proxy-refresh-routes.js";
 import { registerModelProxyRoutes } from "./routes/model-proxy-routes.js";
 import { registerModelsIntrospectionRoute } from "./routes/models-introspection-routes.js";
+import { registerNodeRuntimeRoutes } from "./routes/node-runtime-routes.js";
 import { registerOpenSpecGroupRoutes } from "./routes/openspec-group-routes.js";
 import { registerOpenSpecRoutes } from "./routes/openspec-routes.js";
 import { registerPackageRoutes } from "./routes/package-routes.js";
@@ -126,12 +128,10 @@ import { registerPiChangelogRoutes } from "./routes/pi-changelog-routes.js";
 import { registerPiCoreRoutes } from "./routes/pi-core-routes.js";
 import { registerPiRetryRoutes } from "./routes/pi-retry-routes.js";
 import { registerPiRuntimeRoutes } from "./routes/pi-runtime-routes.js";
-import { registerNodeRuntimeRoutes } from "./routes/node-runtime-routes.js";
 import { registerPluginActivationRoutes } from "./routes/plugin-activation-routes.js";
 import { registerPluginConfigRoutes } from "./routes/plugin-config-routes.js";
 import { registerPreferencesAutoNameRoutes } from "./routes/preferences-auto-name-routes.js";
 import { registerPreferencesDisplayRoutes } from "./routes/preferences-display-routes.js";
-import { registerCustomEventGroupsRoutes } from "./routes/custom-event-groups-routes.js";
 import { registerPreferencesWorktreeInitRoutes } from "./routes/preferences-worktree-init-routes.js";
 import { registerProviderAuthRoutes } from "./routes/provider-auth-routes.js";
 import { registerProviderRoutes } from "./routes/provider-routes.js";
@@ -144,6 +144,8 @@ import {
   dispatchReload as dispatchReloadRaw,
   reloadTargetSessionIds,
 } from "./rpc-keeper/dispatch-reload.js";
+import { CustomEventGroupMatcher } from "./session/custom-event-group-matcher.js";
+import { CustomEventGroupResolver } from "./session/custom-event-group-resolver.js";
 import { deriveEndedAt } from "./session/derive-ended-at.js";
 import { createMemorySessionManager, type SessionManager } from "./session/memory-session-manager.js";
 import { applyReattachPolicy } from "./session/reattach-placement.js";
@@ -158,8 +160,6 @@ import { sessionToMeta } from "./session/session-to-meta.js";
 import { CwdPolicyRegistry } from "./spawn-process/cwd-policy.js";
 import { keeperOptsFromSpawnResult } from "./spawn-process/headless-pid-registry.js";
 import { createIdleTimer } from "./spawn-process/idle-timer.js";
-import { bootParentPid, isBootParentProvablyDead } from "./lifecycle/boot-parent-liveness.js";
-import { startEphemeralParentWatch } from "./lifecycle/ephemeral-parent-watch.js";
 import { getKeeperManager, setCwdPolicyRegistry, spawnPiSession } from "./spawn-process/process-manager.js";
 import { removePid, writePid } from "./spawn-process/server-pid.js";
 import { armSpawnWatchdog } from "./spawn-process/spawn-register-watchdog.js";
@@ -311,7 +311,21 @@ export interface DashboardServer {
 }
 
 
-export async function createServer(config: ServerConfig): Promise<DashboardServer> {
+/**
+ * Test-only server construction options. Not part of the public API.
+ * See change: optimize-client-bootstrap-and-bundle-coherence (P0).
+ */
+export interface CreateServerOptions {
+  /**
+   * Pin the static client dir instead of resolving it. A string pins that
+   * directory; explicit `null` forces API-only mode. Omitted → normal
+   * resolution (`DASHBOARD_CLIENT_DIST_DIR` env if set, else
+   * `resolveClientDist()`); the env var is cleared after resolution.
+   */
+  clientDistOverride?: string | null;
+}
+
+export async function createServer(config: ServerConfig, options?: CreateServerOptions): Promise<DashboardServer> {
   // Ensure bridge extension is registered in pi's global settings
   // (needed for bundled installs where pi can't discover it from package.json)
   //
@@ -1635,7 +1649,25 @@ export async function createServer(config: ServerConfig): Promise<DashboardServe
       piGateway.sendToSession(id, { type: "stop_after_turn", sessionId: id }),
   });
 
-  registerSystemRoutes(fastify, { sessionManager, preferencesStore, metaPersistence, config, networkGuard, version: pkgVersion, directoryService, piGateway, browserGateway, hydrationMetrics, readEventLoopDelay, eventLoopSpikes, eventStore, embedLifecycle, keeperLogStats: { get: () => getKeeperManager().getKeeperLogStats() } });
+  // Serve-side identity of the built web client, resolved ONCE: the directory
+  // Fastify serves below is the same one `/api/health.clientBuild` reports on,
+  // so the reported artifact cannot diverge from the served artifact.
+  // Tests pin the resolution through `options.clientDistOverride` (explicit
+  // `null` = API-only) or the `DASHBOARD_CLIENT_DIST_DIR` env for out-of-
+  // process boots, so integration tests see a deterministic clientBuild state
+  // regardless of builds/installs floating around the runner. The env is
+  // consumed and deleted here so spawned pi/terminal children never inherit it.
+  // See change: optimize-client-bootstrap-and-bundle-coherence (P0).
+  const envClientDist = process.env.DASHBOARD_CLIENT_DIST_DIR;
+  delete process.env.DASHBOARD_CLIENT_DIST_DIR;
+  const resolvedClientDist: ResolvedClientDist = options?.clientDistOverride !== undefined
+    ? (options.clientDistOverride === null
+        ? { dir: null, fromInstalledPackage: false }
+        : { dir: options.clientDistOverride, fromInstalledPackage: false })
+    : envClientDist
+      ? { dir: envClientDist, fromInstalledPackage: false }
+      : resolveClientDist();
+  registerSystemRoutes(fastify, { sessionManager, preferencesStore, metaPersistence, config, networkGuard, version: pkgVersion, directoryService, piGateway, browserGateway, hydrationMetrics, readEventLoopDelay, eventLoopSpikes, eventStore, embedLifecycle, clientDist: resolvedClientDist, keeperLogStats: { get: () => getKeeperManager().getKeeperLogStats() } });
   // GET /api/doctor — see change: doctor-rich-output (task 4.2). Auth-gated identically to /api/config.
   registerDoctorRoutes(fastify);
   registerToolRoutes(fastify, { registry: getDefaultRegistry(), networkGuard });
@@ -1925,41 +1957,13 @@ export async function createServer(config: ServerConfig): Promise<DashboardServe
 
   // Serve static files / SPA fallback.
   //
-  // Resolution strategies, in order:
-  //  1. Node module resolver — works in ANY install layout
-  //     (flat `node_modules/`, scoped, nested, pnpm, whatever).
-  //  2. Sibling-to-server in the installed @scope layout.
-  //  3. Monorepo workspace sibling.
-  //  4. Legacy dist/client.
-  //
-  // Same class of bug as commits 40a1319 (bridge auto-registration)
-  // and e11f5eb (server-launcher.ts resolve): sibling-path arithmetic
-  // that works in the dev repo silently returns wrong paths in the
-  // installed node_modules layout. require.resolve identifies packages
-  // by name, which is the only canonical identity across layouts.
-  // Client-dir resolution — single strategy under change:
-  // eliminate-electron-runtime-install. The legacy 5-strategy chain
-  // (sibling/hoisted/monorepo/legacy paths) defended against runtime
-  // re-extraction wiping the bundled tree. Under the immutable bundle
-  // architecture that scenario cannot occur; the npm-resolver-anchored
-  // path is the only durable identity across install layouts.
-  //
-  // Dev / monorepo fallbacks are still allowed when require.resolve
-  // misses (e.g. running from a checked-out workspace where the web
-  // package hasn't been linked yet).
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  let clientDir = "";
-  try {
-    const webPkgJson = createRequire(import.meta.url).resolve(
-      "@blackbelt-technology/pi-dashboard-web/package.json",
-    );
-    const candidate = path.join(path.dirname(webPkgJson), "dist");
-    if (existsSync(path.join(candidate, "index.html"))) clientDir = candidate;
-  } catch {
-    // Web package not resolvable — try dev-monorepo sibling.
-    const devCandidate = path.join(__dirname, "../../client/dist");
-    if (existsSync(path.join(devCandidate, "index.html"))) clientDir = devCandidate;
-  }
+  // Client-dir resolution lives in `lib/client-dist.ts` (installed-package-
+  // first, workspace fallback, API-only when neither exists) and runs ONCE,
+  // above, so Fastify serving and the health `clientBuild` report share one
+  // identity. See change: optimize-client-bootstrap-and-bundle-coherence (P0);
+  // prior rationale: eliminate-electron-runtime-install, commits 40a1319 /
+  // e11f5eb (sibling-path arithmetic breaks in installed layouts).
+  const clientDir = resolvedClientDist.dir ?? "";
   const hasProductionBuild = !!clientDir;
   if (!hasProductionBuild) {
     console.log("[dashboard] No client build found — running in API-only mode");

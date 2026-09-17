@@ -11,7 +11,7 @@
  * is defined once in `packages/client/src/index.css` (`@utility text-code`).
  */
 import { describe, it, expect, vi, beforeAll, afterEach } from "vitest";
-import { render, cleanup } from "@testing-library/react";
+import { render, cleanup, waitFor } from "@testing-library/react";
 import React from "react";
 
 beforeAll(() => {
@@ -98,7 +98,7 @@ describe("tool renderer code/diff payload — unified 12 px", () => {
     expect(styledNode).not.toBeNull();
   });
 
-  it("EditToolRenderer desktop (RichDiff path): wrapper has text-code + inline fontSize fallback", () => {
+  it("EditToolRenderer desktop (RichDiff path): wrapper has text-code + inline fontSize fallback", async () => {
     mockIsMobile = false;
     const { getByTestId } = render(
       <EditToolRenderer
@@ -108,6 +108,8 @@ describe("tool renderer code/diff payload — unified 12 px", () => {
         context={ctx}
       />,
     );
+    // RichDiff is lazy — wait for the dynamic import to mount it.
+    await waitFor(() => expect(getByTestId("rich-diff")).toBeTruthy());
     const wrapper = getByTestId("rich-diff").parentElement;
     expect(hasUnifiedFontSize(wrapper)).toBe(true);
   });

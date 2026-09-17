@@ -7,9 +7,12 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  BUILD_METADATA_FILENAME,
+  type BuildMetadata,
   discoverPlugins,
   getPluginStatusStore,
   pluginRegistryHash,
+  readBuildMetadata,
 } from "@blackbelt-technology/dashboard-plugin-runtime/server";
 import type { ServerToBrowserMessage } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
 import type { BridgeLoadSource, PluginStatus } from "@blackbelt-technology/pi-dashboard-shared/dashboard-plugin/plugin-status.js";
@@ -31,6 +34,7 @@ import {
 import { localhostGuard } from "../auth/localhost-guard.js";
 import { deleteAuthProvider, readConfigRedacted, writeConfigPartial } from "../config-api.js";
 import type { DirectoryService } from "../directory-service.js";
+import type { ResolvedClientDist } from "../lib/client-dist.js";
 import { bootParentPid, computeBootParentAlive, readLivePpid } from "../lifecycle/boot-parent-liveness.js";
 import { ensureInstanceId, instanceIdHealthFields } from "../lifecycle/instance-id.js";
 import { computeEffectiveLaunchSource } from "../lifecycle/launch-source-effective.js";
@@ -168,6 +172,11 @@ export function registerSystemRoutes(
     // (active/idle ephemeral counts, reaped-by-reason, capacity rejections,
     // acquire reuse hit/miss). See change: add-embed-session-lifecycle.
     embedLifecycle?: { snapshot: () => unknown };
+    // Serve-side identity of the built web client, resolved ONCE by the caller
+    // (the same value backing static serving). `/api/health.clientBuild` reads
+    // its declaration; absent/`null` dir → `not-served`. See change:
+    // optimize-client-bootstrap-and-bundle-coherence (P0).
+    clientDist?: ResolvedClientDist;
     // Keeper-log disk posture; `/api/health` reads the cached snapshot next
     // to storeTrim. Failure-isolated at the call site like embedLifecycle —
     // a throwing snapshot must never 500 the unguarded health hot path.
@@ -175,7 +184,7 @@ export function registerSystemRoutes(
     keeperLogStats?: { get: () => KeeperLogStats };
   },
 ) {
-  const { sessionManager, preferencesStore, metaPersistence, config, networkGuard, version, directoryService, piGateway, browserGateway, hydrationMetrics, readEventLoopDelay, eventLoopSpikes, eventStore, embedLifecycle, keeperLogStats } = deps;
+  const { sessionManager, preferencesStore, metaPersistence, config, networkGuard, version, directoryService, piGateway, browserGateway, hydrationMetrics, readEventLoopDelay, eventLoopSpikes, eventStore, embedLifecycle, clientDist, keeperLogStats } = deps;
 
   // Quiesce windows for the bridge `server_restarting` broadcast. See change
   // `fix-restart-bridge-auto-start-race`. Bridges that receive this message
@@ -198,6 +207,24 @@ export function registerSystemRoutes(
     } catch { /* best-effort */ }
   };
   const serverStartTime = Date.now();
+
+  // Served-build declaration, read ONCE at registration (the static dir is
+  // immutable for the process lifetime). Never throws — an absent/malformed
+  // declaration degrades to `metadata-missing` in health, and a throwing
+  // declaration read must never 500 the unguarded health hot path.
+  // See change: optimize-client-bootstrap-and-bundle-coherence (P0).
+  let servedDeclaration: BuildMetadata | null = null;
+  if (clientDist?.dir) {
+    try { servedDeclaration = readBuildMetadata(clientDist.dir); } catch { /* keep null */ }
+    // Startup diagnostic — the deploy-visibility half of coherent rebuilds.
+    // NEVER prints a filesystem path (this repo's health payloads carry
+    // versions only; the log follows suit for copy-paste-safe reports).
+    if (servedDeclaration === null) {
+      console.warn(
+        `[dashboard] served client build has no ${BUILD_METADATA_FILENAME} declaration — rebuild the served client`,
+      );
+    }
+  }
 
   // pi-version-skew compatibility surface for `/api/health`. Computed lazily
   // and cached 30s: the probe does a ToolRegistry resolve + file read, which
@@ -760,6 +787,32 @@ export function registerSystemRoutes(
   // Health endpoint — includes server + agent process metrics
   fastify.get("/api/health", async () => {
     const mem = process.memoryUsage();
+    // Build-time-vs-runtime plugin-bundle hash. Clients compare it to
+    // the embedded `PLUGIN_REGISTRY_HASH` to detect stale bundles.
+    // See change: fix-pi-flows-end-to-end (Group 6).
+    // Must hash over the SAME plugin set the vite-plugin used at build
+    // time — production builds exclude `fixture: true` plugins (e.g. demo).
+    // Without this filter, the runtime hash would differ from the embedded
+    // PLUGIN_REGISTRY_HASH and the staleness banner would always show.
+    // Computed ONCE per request; `clientBuild` below compares against the
+    // same value. See change: optimize-client-bootstrap-and-bundle-coherence.
+    const bundleHash = pluginRegistryHash(
+      discoverPlugins().filter((p) =>
+        config.dev ? true : p.manifest.fixture !== true,
+      ),
+    );
+    // Served-artifact coherence: does the static build this server serves
+    // carry the same registry hash the running process computes? Snapshot + a
+    // path-free 4-state status. `not-served` = API-only mode.
+    // See change: optimize-client-bootstrap-and-bundle-coherence (P0).
+    const clientBuild: { pluginRegistryHash: string | null; status: "matched" | "mismatched" | "metadata-missing" | "not-served" } = !clientDist?.dir
+      ? { pluginRegistryHash: null, status: "not-served" }
+      : servedDeclaration === null
+        ? { pluginRegistryHash: null, status: "metadata-missing" }
+        : {
+            pluginRegistryHash: servedDeclaration.pluginRegistryHash,
+            status: servedDeclaration.pluginRegistryHash === bundleHash ? "matched" : "mismatched",
+          };
     // Telemetry reads are failure-isolated so a throwing provider can never
     // turn /api/health into a 500. See change: instrument-session-hydration-timing.
     let eventLoopDelay = { meanMs: 0, p99Ms: 0, maxMs: 0 };
@@ -858,15 +911,12 @@ export function registerSystemRoutes(
       // Build-time-vs-runtime plugin-bundle hash. Clients compare it to
       // the embedded `PLUGIN_REGISTRY_HASH` to detect stale bundles.
       // See change: fix-pi-flows-end-to-end (Group 6).
-      // Must hash over the SAME plugin set the vite-plugin used at build
-      // time — production builds exclude `fixture: true` plugins (e.g. demo).
-      // Without this filter, the runtime hash would differ from the embedded
-      // PLUGIN_REGISTRY_HASH and the staleness banner would always show.
-      bundleHash: pluginRegistryHash(
-        discoverPlugins().filter((p) =>
-          config.dev ? true : p.manifest.fixture !== true,
-        ),
-      ),
+      bundleHash,
+      // Served static artifact vs running process, snapshot at registration.
+      // Additive — `bundleHash` and the browser `PluginStalenessBanner`
+      // comparison contract are unchanged.
+      // See change: optimize-client-bootstrap-and-bundle-coherence (P0).
+      clientBuild,
       proxy: getModelProxyStatus(),
       // Windows-only: active git/sh source readout for Settings + Diagnostics.
       // null on macOS/Linux. See change: embed-git-bash-on-windows.

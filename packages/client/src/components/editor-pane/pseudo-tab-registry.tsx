@@ -15,8 +15,7 @@
  * See change: cleanup-import-cycles (D3).
  */
 
-import type { ComponentType } from "react";
-import DiffViewer from "./DiffViewer.js";
+import { type ComponentType, lazy } from "react";
 import LiveServerViewer from "./LiveServerViewer.js";
 import type { ViewerProps } from "./types.js";
 import UrlViewer from "./UrlViewer.js";
@@ -28,6 +27,17 @@ import type { PseudoTabViewer } from "./viewer-kinds.js";
  * terminals-in-tabbed-panes), so the registry entry renders nothing.
  */
 const TerminalPlaceholder = (_p: ViewerProps) => null;
+
+/**
+ * Lazy so the Diff module graph stays out of the landing bundle (the pane's
+ * Suspense boundary in EditorPane supplies the loading fallback). Component
+ * type is pinned by the named reader (this file is in the bundle guard's
+ * LAZY_READER_FILES list). See change:
+ * optimize-client-bootstrap-and-bundle-coherence (P1).
+ */
+const DiffViewer = lazy(() =>
+  import("./DiffViewer.js").then((m) => ({ default: m.default })),
+);
 
 export const pseudoTabRegistry: Record<PseudoTabViewer, ComponentType<ViewerProps>> = {
   "live-server": LiveServerViewer,
