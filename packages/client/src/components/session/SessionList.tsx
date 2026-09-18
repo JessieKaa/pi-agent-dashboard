@@ -321,6 +321,27 @@ export function folderIsGitRepo(
   return resolveWorktreeAvailability({ cwd: group.cwd ?? "", sessions: group.sessions, folderGitMap }).available;
 }
 
+/**
+ * Compact-sidebar visibility for an unpinned group: folders with no alive
+ * session (ended-only held folders AND zero-held stub folders) drop, so the
+ * sidebar keeps only live workspaces. Session-search hits (the include-archive
+ * query rides the same search) and archive-search matches keep the folder
+ * reachable. Tag/phase and workspace-path filtering short-circuit elsewhere.
+ * See change: compact-workspace-sidebar-hide-ended-folders.
+ */
+export function compactShowsGroup(
+  group: DirectoryGroup,
+  opts: {
+    sessionSearch: string;
+    archivedMatchesFor: (cwd: string) => number;
+  },
+): boolean {
+  if (group.sessions.some((s) => s.status !== "ended")) return true;
+  const q = opts.sessionSearch.trim().toLowerCase();
+  if (q.length > 0 && filterByQuery(group.sessions, q).length > 0) return true;
+  return opts.archivedMatchesFor(group.cwd) > 0;
+}
+
 function ToggleButton({
   active,
   onClick,
@@ -1088,6 +1109,17 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
   const pendingRevealRef = useRef<{ sessionId: string; nonce: number } | null>(null);
   const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const revealRafRef = useRef<number | null>(null);
+  // Set while a seek is in flight; exempts the target's unpinned group from
+  // the compact no-alive hide, mirroring the seek's guarded fold-expansion.
+  // Derived at render (not effect state) so the exemption commits in the same
+  // render as the seek's other ancestor changes. Spent — and thus dropped —
+  // once the reveal lands or the backstop gives up; a superseding seek has a
+  // different nonce, so the stale exemption can't leak in.
+  const [revealedNonce, setRevealedNonce] = useState<number | null>(null);
+  const revealCwd = useMemo(() => {
+    if (!revealRequest || revealedNonce === revealRequest.nonce) return null;
+    return sessions.find((s) => s.id === revealRequest.sessionId)?.cwd ?? null;
+  }, [revealRequest, sessions, revealedNonce]);
 
   const clearPendingReveal = useCallback(() => {
     pendingRevealRef.current = null;
@@ -1111,6 +1143,7 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
     el.scrollIntoView({ behavior: "smooth", block: "center" });
     el.classList.add("card-seek-flash");
     window.setTimeout(() => el.classList.remove("card-seek-flash"), 1200);
+    setRevealedNonce(pending.nonce);
     clearPendingReveal();
   }, [findLaidOutCard, clearPendingReveal]);
 
@@ -1199,6 +1232,7 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
         return;
       }
       clearPendingReveal();
+      setRevealedNonce(pending.nonce);
       showToast(
         t("sessionList.seekTimeoutToast", undefined, "Couldn’t reveal the card."),
         "info",
@@ -1211,7 +1245,9 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
         },
       );
     }, 5000);
-    // Immediate attempt after the sync-ancestor re-render paints.
+    // Immediate attempt after the sync-ancestor re-render paints. The rAF
+    // also lets the reveal exemption (compact mode) commit before the
+    // presence probe.
     revealRafRef.current = requestAnimationFrame(() => {
       revealRafRef.current = null;
       attemptReveal();
@@ -2515,13 +2551,22 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
               // ended-only tag match still reveals the folder, and zero-match
               // folders are hidden (no empty shell). See change: add-session-tags.
               if (anyTagFilterActive) return folderMatchesFilters(g);
-              return workspaceFilter.length > 0
-                ? folderMatchesFilters(g)
-                : g.sessions.some((s) => s.status !== "ended") ||
-                  (endedTotalsMap?.get(foldKey(g.cwd)) ?? 0) > 0 ||
-                  // Archive-search matches keep an otherwise-ended folder
-                  // visible so their `Archive matches` section is reachable.
-                  (archivedMatchesByGroup?.get(foldKey(g.cwd))?.length ?? 0) > 0;
+              if (workspaceFilter.length > 0) return folderMatchesFilters(g);
+              if (compactSidebar) {
+                // A pending seek owns an explicit reveal contract (same as
+                // its fold-expansion): the target's group stays until the
+                // reveal completes or the backstop clears it.
+                if (revealCwd !== null && foldKey(g.cwd) === foldKey(revealCwd)) return true;
+                return compactShowsGroup(g, {
+                  sessionSearch,
+                  archivedMatchesFor: (cwd) => archivedMatchesByGroup?.get(foldKey(cwd))?.length ?? 0,
+                });
+              }
+              return g.sessions.some((s) => s.status !== "ended") ||
+                (endedTotalsMap?.get(foldKey(g.cwd)) ?? 0) > 0 ||
+                // Archive-search matches keep an otherwise-ended folder
+                // visible so their `Archive matches` section is reachable.
+                (archivedMatchesByGroup?.get(foldKey(g.cwd))?.length ?? 0) > 0;
             })
             .map((group, idx, visible) => {
               // C2 budget: zero-session stubs beyond the budget collapse into

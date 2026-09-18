@@ -330,3 +330,52 @@ describe("SessionList — include-archive search chip (archive-sessions-lazy-loa
     }
   });
 });
+
+/**
+ * compact-workspace-sidebar-hide-ended-folders: an archive-search match keeps
+ * an ended-only folder reachable in compact mode — same escape hatch the
+ * default view applies for the `Archive matches` section.
+ */
+describe("compact sidebar — archive-search exemption (compact-workspace-sidebar-hide-ended-folders)", () => {
+  function archivedItem(id: string, groupPath: string) {
+    return {
+      id,
+      name: `Archived ${id}`,
+      cwd: groupPath,
+      groupPath,
+      endedAt: 1000,
+      archivedAt: 2000,
+      sessionFile: `/tmp/sessions/${id}.jsonl`,
+    };
+  }
+
+  it("a compact-hidden ended-only folder returns when it has archive-search matches", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+        ok: true,
+        headers: new Headers({ "content-type": "application/json" }),
+        json: () => Promise.resolve({
+          success: true,
+          data: { items: [archivedItem("a1", "/old/proj")] },
+        }),
+      }));
+      const ended = makeSession({ id: "e1", cwd: "/old/proj", status: "ended", name: "Old run" });
+      renderList([makeSession({ name: "Live session" }), ended], {
+        endedTotalsMap: new Map([["/old/proj", 1]]),
+        compactSidebar: true,
+      });
+      expect(screen.queryByTestId("folder-header-name-/old/proj")).toBeNull();
+
+      fireEvent.click(screen.getByTestId("search-include-archive"));
+      fireEvent.change(screen.getByTestId("session-search-input"), { target: { value: "archived" } });
+      await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+
+      expect(screen.getByTestId("folder-header-name-/old/proj")).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+});

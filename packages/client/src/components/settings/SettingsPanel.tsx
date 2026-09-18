@@ -1379,7 +1379,7 @@ export function SettingsPanel({ availableModels, onMessage, onBack, selectedCwd,
                       hint={t(
                         "settings.compactWorkspaceSidebarDescription",
                         undefined,
-                        "Hide folder creation and plugin sections while keeping project, Git, project actions, and session information.",
+                        "Hide folder creation, plugin sections, and folders whose sessions have all ended, while keeping project, Git, project actions, and session information.",
                       )}
                     />
                   </div>

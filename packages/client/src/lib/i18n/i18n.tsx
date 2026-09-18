@@ -990,7 +990,7 @@ const zhCN: Record<string, string> = {
   "settings.interfaceDescription": "切换仪表盘界面语言。选择会保存在当前浏览器中。",
   "settings.language": "界面语言",
   "settings.compactWorkspaceSidebar": "精简工作区侧栏",
-  "settings.compactWorkspaceSidebarDescription": "隐藏文件夹创建入口和插件区块，保留项目、Git、项目操作和会话信息。",
+  "settings.compactWorkspaceSidebarDescription": "隐藏文件夹创建入口、插件区块，以及所有 pi 会话均已结束的文件夹；保留项目、Git、项目操作和会话信息。",
   "settings.loading": "正在加载设置...",
   "settings.llmProviders": "LLM 提供商",
   "settings.llmProvidersDescription": "注册兼容 OpenAI 的自定义 API 端点来访问模型。",

@@ -328,3 +328,89 @@ describe("stub-group budget (fix-archive-feedback-and-sidebar-perf C2)", () => {
     expect(screen.getByTestId("folder-body-/held0")).toBeTruthy();
   });
 });
+
+/**
+ * compact-workspace-sidebar-hide-ended-folders: with the compact workspace
+ * sidebar on, the unpinned (Other) tier renders only folders holding at least
+ * one alive session. Ended-only folders and zero-held stubs vanish from the
+ * default view; a narrowing filter or an archive-search match restores them.
+ * The pinned tier (explicit keep-visible opt-in) is never touched.
+ */
+describe("compact sidebar hides unpinned ended-only folders (compact-workspace-sidebar-hide-ended-folders)", () => {
+  const endedSession = (id: string, cwd: string): DashboardSession => ({
+    ...session,
+    id,
+    cwd,
+    status: "ended",
+  });
+
+  it("hides a held-ended-only folder in compact mode; restores it when compact is off", () => {
+    const ended = endedSession("e1", "/old/proj");
+    const sessions = [session, ended];
+    const totals = new Map([["/old/proj", 1]]);
+    renderList({ sessions, endedTotalsMap: totals, compactSidebar: true });
+    expect(screen.getByTestId(`folder-header-name-${CWD}`)).toBeTruthy();
+    expect(screen.queryByTestId("folder-header-name-/old/proj")).toBeNull();
+    cleanup();
+
+    renderList({ sessions, endedTotalsMap: totals, compactSidebar: false });
+    expect(screen.getByTestId("folder-header-name-/old/proj")).toBeTruthy();
+  });
+
+  it("hides a zero-held stub folder in compact mode; restores it when compact is off", () => {
+    const totals = new Map([["/stub-old", 3]]);
+    renderList({ sessions: [session], endedTotalsMap: totals, compactSidebar: true });
+    expect(screen.queryByTestId("folder-header-name-/stub-old")).toBeNull();
+    cleanup();
+
+    renderList({ sessions: [session], endedTotalsMap: totals, compactSidebar: false });
+    expect(screen.getByTestId("folder-header-name-/stub-old")).toBeTruthy();
+  });
+
+  it("keeps the stub budget counting only rendered stubs (hidden stubs consume none)", () => {
+    const totals = new Map([["/shown-stub", 2]]);
+    for (let i = 0; i < 5; i += 1) totals.set(`/hidden-stub${i}`, 2);
+    renderList({ sessions: [], endedTotalsMap: totals, compactSidebar: true });
+    // One alive-less stub is budget-relevant — nothing overflows, and its row
+    // is gone in compact mode.
+    expect(screen.queryByTestId("stub-budget-overflow")).toBeNull();
+    expect(document.querySelectorAll('[data-testid^="folder-stub-body-"]').length).toBe(0);
+  });
+
+  it("a session search matching an ended session restores the folder", () => {
+    const ended = endedSession("e1", "/old/proj");
+    renderList({
+      sessions: [session, { ...ended, name: "Historical cleanup run" }],
+      endedTotalsMap: new Map([["/old/proj", 1]]),
+      compactSidebar: true,
+    });
+    expect(screen.queryByTestId("folder-header-name-/old/proj")).toBeNull();
+
+    fireEvent.change(screen.getByTestId("session-search-input"), { target: { value: "historical" } });
+    expect(screen.getByTestId("folder-header-name-/old/proj")).toBeTruthy();
+  });
+
+  it("a workspace path filter matching an ended-only folder restores it", () => {
+    const ended = endedSession("e1", "/old/proj");
+    renderList({
+      sessions: [session, ended],
+      endedTotalsMap: new Map([["/old/proj", 1]]),
+      compactSidebar: true,
+    });
+    expect(screen.queryByTestId("folder-header-name-/old/proj")).toBeNull();
+
+    fireEvent.change(screen.getByTestId("workspace-filter-input"), { target: { value: "/old" } });
+    expect(screen.getByTestId("folder-header-name-/old/proj")).toBeTruthy();
+  });
+
+  it("a pinned ended-only folder still renders in compact mode", () => {
+    const ended = endedSession("e1", "/pinned/proj");
+    renderList({
+      sessions: [session, ended],
+      endedTotalsMap: new Map([["/pinned/proj", 1]]),
+      pinnedDirectories: ["/pinned/proj"],
+      compactSidebar: true,
+    });
+    expect(screen.getByTestId("folder-header-name-/pinned/proj")).toBeTruthy();
+  });
+});

@@ -105,6 +105,7 @@ const Harness = React.forwardRef<Ctl, {
   sessions: DashboardSession[];
   workspaces?: Workspace[];
   initialSelectedId?: string;
+  compactSidebar?: boolean;
   onSelect?: (id: string) => void;
   onSetWorkspaceCollapsed?: (id: string, collapsed: boolean) => void;
 }>((props, ref) => {
@@ -127,6 +128,7 @@ const Harness = React.forwardRef<Ctl, {
           onSeekToCard={seek}
           workspaces={workspaces}
           onSetWorkspaceCollapsed={props.onSetWorkspaceCollapsed}
+          compactSidebar={props.compactSidebar}
         />
       </ThemeProvider>
     </TestRouter>
@@ -350,5 +352,24 @@ describe("SessionList seek-to-card", () => {
     act(() => { ctl.setWorkspaces([{ ...ws, collapsed: false }]); });
     tick();
     expect(scrollSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("compact mode: a seek to an ended-only hidden folder reveals its card (reveal-first)", () => {
+    // compact-workspace-sidebar-hide-ended-folders: the ended-only folder is
+    // hidden in compact mode by default — a seek must exempt it for the
+    // duration of the reveal, expand the ended list, scroll, and flash. The
+    // exemption is spent once the reveal lands (the hides-again assertion
+    // rides the same tick: attemptReveal -> setRevealedNonce -> re-render).
+    const sessions = [
+      s({ id: "s1", cwd: "/proj", status: "ended", sessionFile: "/x.jsonl" }),
+      s({ id: "s2", cwd: "/other" }),
+    ];
+    const { container, ctl } = mount({ sessions, compactSidebar: true });
+    expect(container.querySelector('[data-testid="folder-header-name-/proj"]')).toBeNull();
+
+    act(() => { ctl.seek("s1"); });
+    tick();
+    expect(scrollSpy).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('[data-testid="folder-header-name-/proj"]')).toBeNull();
   });
 });
