@@ -7,6 +7,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type {
+  ArchiveResultBrowserMessage,
   BatchAnswer,
   BatchQuestion,
   BrowserAssetRegisterMessage,
@@ -352,6 +353,12 @@ function extractSessionsSnapshotEndedTotals(msg: ServerToBrowserMessage): Record
     default: return null;
   }
 }
+function extractArchiveResultCode(msg: ServerToBrowserMessage): string | null {
+  switch (msg.type) {
+    case "archive_result": return msg.code ?? null;
+    default: return null;
+  }
+}
 
 describe("fix-connect-snapshot-frame-loss protocol types (E28)", () => {
   it("openspec_get narrows with requestId + cwd", () => {
@@ -393,6 +400,31 @@ describe("fix-connect-snapshot-frame-loss protocol types (E28)", () => {
     const noOffset: SessionsPageMessage = { type: "sessions_page", cwd: "/a" };
     expect(noRequestId.cwd).toBe("/a");
     expect(noOffset.cwd).toBe("/a");
+  });
+});
+
+describe("fix-archive-feedback-and-sidebar-perf protocol types (B1)", () => {
+  it("archive_result narrows with sessionId + ok and the discriminating fields", () => {
+    const okMsg: ArchiveResultBrowserMessage = { type: "archive_result", sessionId: "s1", ok: true, pending: true };
+    const failMsg: ArchiveResultBrowserMessage = {
+      type: "archive_result",
+      sessionId: "s1",
+      ok: false,
+      error: "session is running",
+      code: "archive.reject_running",
+    };
+    // Discriminable through the union.
+    expect(extractArchiveResultCode(okMsg)).toBe(null);
+    expect(extractArchiveResultCode(failMsg)).toBe("archive.reject_running");
+  });
+
+  it("rejects a missing sessionId / ok at compile time", () => {
+    // @ts-expect-error sessionId is required on archive_result
+    const noId: ArchiveResultBrowserMessage = { type: "archive_result", ok: true };
+    // @ts-expect-error ok is required on archive_result
+    const noOk: ArchiveResultBrowserMessage = { type: "archive_result", sessionId: "s1" };
+    expect(noId.type).toBe("archive_result");
+    expect(noOk.type).toBe("archive_result");
   });
 });
 

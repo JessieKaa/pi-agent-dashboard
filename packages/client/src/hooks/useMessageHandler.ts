@@ -16,6 +16,7 @@ import type { CommandInfo, DashboardSession, FileEntry, ModelInfo, OpenSpecData,
 import { useCallback, useEffect, useRef } from "react";
 import type { DiscoveredServerInfo } from "../components/connectivity/ServerSelector.js";
 import type { ToastVariant } from "../components/primitives/Toast.js";
+import { resolveServerMessage } from "../lib/api/server-error.js";
 import { EMPTY_CANVAS_STATE, reduceCanvasChip, reduceCanvasIntent } from "../lib/canvas/canvas-gate.js";
 import { foldLiveEvents, type QueuedLiveEvent } from "../lib/chat/coalesce-live-events.js";
 import { addInteractiveRequest, addNotify, applyPromptReceived, carryInteractiveRequests, carryPendingPrompt, createInitialState, dismissInteractiveRequest, finalizeBackfillSegment, reduceEvent, retailPendingInteractiveRows, type SessionState } from "../lib/chat/event-reducer.js";
@@ -31,10 +32,10 @@ import { t } from "../lib/i18n/i18n.js";
 import { clearLoadingHistory, HYDRATE_CEILING_MS, rearmLoadingHistory } from "../lib/replay/loading-history.js";
 import type { ReplayPersister } from "../lib/replay/replay-persist.js";
 import { inferPlatform, pathKey, resolveSessionGroupPath } from "../lib/session/session-grouping.js";
-import type { OpenSpecGetInflight } from "./useOpenSpecReconcile.js";
 import { clearRecoveryOffer, setRecoveryOffer } from "../lib/state/recovery-offer-bus.js";
 import { pushSpawnErrorToast } from "../lib/state/spawn-error-toast-bus.js";
 import { isVisibleCwd } from "../lib/util/cwd-visibility.js";
+import type { OpenSpecGetInflight } from "./useOpenSpecReconcile.js";
 
 type ReplayEvent = Extract<ServerToBrowserMessage, { type: "event_replay" }>["events"][number];
 
@@ -92,11 +93,14 @@ import { applyPluginConfigUpdate, getPluginConfig } from "@blackbelt-technology/
 import { scrollDebugLog } from "../lib/util/scroll-debug.js";
 
 /**
- * Group key a session's ended count belongs under (D4/D9): the same
- * pin > worktree-mainPath > cwd precedence the sidebar groups by and the
- * snapshot `endedTotals` keys carry. Reads the pinned set from the live
- * visibility ref when present (optional dependency).
- * See change: fix-connect-snapshot-frame-loss.
+ * Group key a session's ended count belongs under (D4/D9): the FOLDED
+ * (`pathKey`) form of the pin > worktree-mainPath > cwd precedence — the
+ * exact key space the snapshot `endedTotals`, `sessionOrder` and
+ * `sessions_page` carry, so a cosmetic cwd variant can never target a key
+ * the reducer does not hold. Reads the pinned set from the live visibility
+ * ref when present (optional dependency).
+ * See changes: fix-connect-snapshot-frame-loss,
+ *              fix-archive-feedback-and-sidebar-perf (B2).
  */
 function endedTotalsGroupKey(
   session: Pick<DashboardSession, "cwd" | "gitWorktree">,
@@ -104,7 +108,7 @@ function endedTotalsGroupKey(
 ): string {
   const platform = inferPlatform([session.cwd, ...(pinnedDirectories ?? [])]);
   const pinnedKeys = new Set((pinnedDirectories ?? []).map((d) => pathKey(d, platform)));
-  return resolveSessionGroupPath(session, pinnedKeys, platform);
+  return pathKey(resolveSessionGroupPath(session, pinnedKeys, platform), platform);
 }
 
 export interface MessageHandlerSetters {
@@ -747,6 +751,18 @@ export function useMessageHandler(
           next.set(msg.cwd, msg.count);
           return next;
         });
+        break;
+
+      case "archive_result":
+        // The ACK for THIS tab's `archive_session` request (B1) — the WS path
+        // has no other failure signal, so a rejection MUST surface. Success is
+        // silent: the `session_archived` broadcast (or the `ended`-transition
+        // archive for `pending`) owns the state change. Never touch `sessions`
+        // here — a failed archive leaves the session listed.
+        // See change: fix-archive-feedback-and-sidebar-perf (B1).
+        if (!msg.ok) {
+          showToast?.(resolveServerMessage({ code: msg.code, message: msg.error }), "error");
+        }
         break;
 
       case "session_state_reset":

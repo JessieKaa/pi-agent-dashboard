@@ -153,6 +153,7 @@ export function StatusShapeBadge({ shape, colorClass }: { shape: StatusShape; co
 // server transitions, so it must use the very numbers the server fires on.
 // Re-exported so existing `SessionCard` import sites keep working.
 export { HOST_PRESSURE_DEGRADED_MS, HOST_PRESSURE_UNRESPONSIVE_MS };
+
 /** Local re-render cadence; the sidebar has no ticker of its own. */
 const HOST_PRESSURE_TICK_MS = 5_000;
 
@@ -646,47 +647,7 @@ export function GroupGitInfo({ sessions, cwd, folderBranch, onBranchClick, folde
 }
 
 
-export function SessionCard({
-  session,
-  selectedId,
-  onSelect,
-  now,
-  showGitInfo,
-  isHidden,
-  allSessions,
-  onArchive,
-  contextUsage,
-  openspecChanges,
-  openspecInitialized,
-  openspecPending,
-  openspecHasDir,
-  openspecGroups,
-  openspecAssignments,
-  openspecReadiness,
-  onSeekToFolderOpenSpec,
-  onOpenOpenSpecSettings,
-  onSendPrompt,
-  onAttachProposal,
-  onDetachProposal,
-  onReplaceProposal,
-  onReadArtifact,
-  onBulkArchive,
-  onRename,
-  onShutdown,
-  onResume,
-  onSpawnSibling,
-  onSpawnWorktree,
-  commands,
-  processes,
-  onKillProcess,
-  onSetProcessDrawerCollapsed,
-  inflightBashTools,
-  onAbortTool,
-  hasError,
-  isRetrying,
-  retryAttempt,
-  hasNotice,
-}: {
+interface SessionCardProps {
   session: DashboardSession;
   selectedId?: string;
   onSelect: (id: string) => void;
@@ -816,7 +777,160 @@ export function SessionCard({
   retryAttempt?: number;
   /** True iff the model returned only reasoning, no answer (non-error notice). */
   hasNotice?: boolean;
-}) {
+}
+
+/**
+ * Memo comparator for the sidebar card (C1, fix-archive-feedback-and-sidebar-perf).
+ *
+ * SessionList re-renders on every message; the PER-CARD closures it passes
+ * (`onSendPrompt`, `onAttachProposal`, …, fresh arrow identities each pass by
+ * design, meaning fixed by `session` + the list-level callbacks) are SKIPPED by
+ * identity and guarded by the `session` / callback-identity checks: every input
+ * those closures read is either compared here or captured from a ref-stable
+ * App handler (`useCallback`), so an identity change without a session change
+ * cannot change what the card renders. EVERY other prop is an exact
+ * identity-check.
+ *
+ * `now` is compared by its 30s relative-label bucket: the badge renders
+ * `formatRelativeTime(now - anchor)`, so a same-bucket delta cannot change any
+ * pixel. Worst case is one batch of latency after the label flips — coarsening
+ * can never freeze the label (equal bucket ⇒ equal formatRelativeTime bucket).
+ * `hostPressure` bypasses `now` entirely (its indicator ticks on its own).
+ *
+ * NEVER add a prop whose rendered VALUE can change while its identity does not
+ * (the `updatedAt`-style bug): with the memo in place that change would ship no
+ * re-render. Value-bearing props (session, contextUsage, …, processes) compare
+ * by identity — the reducers behind them replace objects on change.
+ */
+const sessionCardPropsEqual = (prev: SessionCardProps, next: SessionCardProps): boolean => {
+  const p = prev.session;
+  const n = next.session;
+  return (
+    (p === n ||
+      // Per-field: every field the card reads must be listed, or an update
+      // arriving as a fresh object with one changed field over-skips.
+      (p.id === n.id &&
+        p.status === n.status &&
+        p.source === n.source &&
+        p.name === n.name &&
+        p.firstMessage === n.firstMessage &&
+        p.cwd === n.cwd &&
+        p.startedAt === n.startedAt &&
+        p.lastActivityAt === n.lastActivityAt &&
+        p.endedAt === n.endedAt &&
+        p.closedReason === n.closedReason &&
+        p.model === n.model &&
+        p.thinkingLevel === n.thinkingLevel &&
+        p.currentTool === n.currentTool &&
+        p.resuming === n.resuming &&
+        p.closing === n.closing &&
+        p.hidden === n.hidden &&
+        p.attachedProposal === n.attachedProposal &&
+        p.openspecPhase === n.openspecPhase &&
+        p.openspecChange === n.openspecChange &&
+        p.tags === n.tags &&
+        p.tokensIn === n.tokensIn &&
+        p.tokensOut === n.tokensOut &&
+        p.cacheRead === n.cacheRead &&
+        p.cacheWrite === n.cacheWrite &&
+        p.cost === n.cost &&
+        p.contextTokens === n.contextTokens &&
+        p.contextWindow === n.contextWindow &&
+        p.gitBranch === n.gitBranch &&
+        p.gitBranchUrl === n.gitBranchUrl &&
+        p.gitPrNumber === n.gitPrNumber &&
+        p.gitPrUrl === n.gitPrUrl &&
+        p.gitWorktree === n.gitWorktree &&
+        p.gitStatus === n.gitStatus &&
+        p.isGitRepo === n.isGitRepo &&
+        p.originDeviceId === n.originDeviceId &&
+        p.movedTo === n.movedTo &&
+        p.cwdMissing === n.cwdMissing &&
+        p.pendingQueues === n.pendingQueues &&
+        p.processes === n.processes &&
+        p.hostPressure === n.hostPressure &&
+        p.processMetrics === n.processMetrics &&
+        p.processDrawerCollapsed === n.processDrawerCollapsed)) &&
+    next.selectedId === prev.selectedId &&
+    next.now - (next.now % 30_000) === prev.now - (prev.now % 30_000) &&
+    next.showGitInfo === prev.showGitInfo &&
+    next.isHidden === prev.isHidden &&
+    next.allSessions === prev.allSessions &&
+    next.contextUsage === prev.contextUsage &&
+    next.openspecChanges === prev.openspecChanges &&
+    next.openspecInitialized === prev.openspecInitialized &&
+    next.openspecPending === prev.openspecPending &&
+    next.openspecHasDir === prev.openspecHasDir &&
+    next.openspecGroups === prev.openspecGroups &&
+    next.openspecAssignments === prev.openspecAssignments &&
+    next.openspecReadiness === prev.openspecReadiness &&
+    next.commands === prev.commands &&
+    next.processes === prev.processes &&
+    next.inflightBashTools === prev.inflightBashTools &&
+    next.hasError === prev.hasError &&
+    next.isRetrying === prev.isRetrying &&
+    next.retryAttempt === prev.retryAttempt &&
+    next.hasNotice === prev.hasNotice &&
+    // Direct pass-throughs (ref-stable App handlers — identity IS meaning).
+    // The per-card ARROWS built in SessionList.tsx's SessionCard block
+    // (onSendPrompt/onAttachProposal/onDetachProposal/onReplaceProposal/
+    // onReadArtifact/onBulkArchive/onRename/onResume/onSpawnSibling/
+    // onSpawnWorktree/onKillProcess/onSetProcessDrawerCollapsed/onAbortTool)
+    // and `onSelect` are deliberately NOT identity-checked: they are fresh
+    // each render, and every value they close over is guarded by the session /
+    // callback-identity checks above (see the comparator doc).
+    next.onArchive === prev.onArchive &&
+    next.onShutdown === prev.onShutdown &&
+    next.onSeekToFolderOpenSpec === prev.onSeekToFolderOpenSpec &&
+    next.onOpenOpenSpecSettings === prev.onOpenOpenSpecSettings
+  );
+};
+
+/**
+ * Memoized card boundary. The export name stays `SessionCard` so every import
+ * site is unchanged; `displayName` keeps React DevTools readable.
+ */
+export const SessionCard = React.memo(function SessionCardImpl({
+  session,
+  selectedId,
+  onSelect,
+  now,
+  showGitInfo,
+  isHidden,
+  allSessions,
+  onArchive,
+  contextUsage,
+  openspecChanges,
+  openspecInitialized,
+  openspecPending,
+  openspecHasDir,
+  openspecGroups,
+  openspecAssignments,
+  openspecReadiness,
+  onSeekToFolderOpenSpec,
+  onOpenOpenSpecSettings,
+  onSendPrompt,
+  onAttachProposal,
+  onDetachProposal,
+  onReplaceProposal,
+  onReadArtifact,
+  onBulkArchive,
+  onRename,
+  onShutdown,
+  onResume,
+  onSpawnSibling,
+  onSpawnWorktree,
+  commands,
+  processes,
+  onKillProcess,
+  onSetProcessDrawerCollapsed,
+  inflightBashTools,
+  onAbortTool,
+  hasError,
+  isRetrying,
+  retryAttempt,
+  hasNotice,
+}: SessionCardProps) {
   // dnd-kit drag handle props (attributes + listeners) supplied by
   // SortableSessionCard via context. When non-null, the desktop card's left
   // gutter (status dot + source icon column) becomes the drag zone.
@@ -1390,7 +1504,9 @@ export function SessionCard({
       )}
     </li>
   );
-}
+}, sessionCardPropsEqual);
+
+SessionCard.displayName = "SessionCard";
 
 // Module-level stable empty references for default-prop normalization — avoid
 // allocating new arrays on every render so React.memo / useMemo equality

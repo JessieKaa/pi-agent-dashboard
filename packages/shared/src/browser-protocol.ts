@@ -637,11 +637,20 @@ export interface SessionsSnapshotMessage {
   orders: Record<string, string[]>;
   /**
    * Session group key → count of ended sessions for that group regardless of
-   * the snapshot window, for every group with ≥1 ended session. A group whose
+   * the snapshot window, for groups with ≥1 ended session, capped to the
+   * `SNAPSHOT_ENDED_TOTALS_GROUPS` most recently active groups. A group whose
    * ended sessions all fall outside the window still renders a stub folder
-   * group from this count. See change: fix-connect-snapshot-frame-loss (D4).
+   * group from this count. Capped-out groups stay fully pageable via
+   * `sessions_page`. See change: fix-connect-snapshot-frame-loss (D4);
+   * fix-archive-feedback-and-sidebar-perf (C2).
    */
   endedTotals: Record<string, number>;
+  /**
+   * Total ended-session count across groups dropped by the `endedTotals`
+   * top-N cap. Omitted when no group was dropped. See change:
+   * fix-archive-feedback-and-sidebar-perf (C2).
+   */
+  endedTotalsOverflow?: number;
   /**
    * Folder group key → archived-session count, from the in-memory archive
    * index. Folders with count 0 are omitted. See change:
@@ -1130,6 +1139,7 @@ export type ServerToBrowserMessage =
   | SessionRemovedMessage
   | SessionArchivedMessage
   | ArchivedCountUpdatedMessage
+  | ArchiveResultBrowserMessage
   | SessionOrphanedMessage
   | EventMessage
   | EventReplayMessage
@@ -1575,6 +1585,49 @@ export interface ArchiveSessionBrowserMessage {
   type: "archive_session";
   sessionId: string;
 }
+
+/**
+ * The acknowledgment for an `archive_session` request, unicast back to the
+ * requesting socket (REST has its own response body). Mirrors
+ * `requestArchive`'s outcome so a rejection (not-found / live / running /
+ * end-failure) is NEVER a silent drop — the client toasts `error`.
+ * `pending:true` means the session is idle-alive: it was terminated and the
+ * archive lands on its `ended` transition. Success needs no frame content
+ * beyond `ok` — the `session_archived` broadcast owns the state change.
+ * Delivery class: `state`, key `archive_result:<sessionId>` (latest-wins per
+ * socket) — a shed acknowledgment would reintroduce the silent failure this
+ * frame exists to remove.
+ * See change: fix-archive-feedback-and-sidebar-perf (B1).
+ */
+export interface ArchiveResultBrowserMessage {
+  type: "archive_result";
+  sessionId: string;
+  ok: boolean;
+  pending?: boolean;
+  /**
+   * Human-readable English failure. Emitted ALONGSIDE `code` (which the UI
+   * prefers); the pair lets a client that does not know `code` still show
+   * something actionable. Never send `error` alone.
+   */
+  error?: string;
+  /** Stable failure classifier for client translation (mirrors
+   *  `SpawnFailureCode`). Known values are listed on `ArchiveResultCode`.
+   *  Additive — clients without a mapping fall back to `error`. */
+  code?: ArchiveResultCode;
+}
+
+/**
+ * Failure classification codes for WS archive acks.
+ * `requestArchive` sets one on every `{ok:false}` path — an uncoded rejection
+ * is untranslatable client-side, so if you add a branch, add its code.
+ * See change: fix-archive-feedback-and-sidebar-perf.
+ */
+export type ArchiveResultCode =
+  | "archive.unavailable"
+  | "archive.not_found"
+  | "archive.reject_live"
+  | "archive.reject_running"
+  | "archive.failed";
 
 /**
  * Restore an archived session into the live set as ended (`restoredAt = now`,

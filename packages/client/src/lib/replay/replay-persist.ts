@@ -19,6 +19,8 @@
  *
  * See change: reduce-session-replay-traffic, fix-replay-cache-partial-payload-cursor.
  */
+
+import { DEFAULT_MEMORY_LIMITS, MIN_REPLAY_WINDOW } from "@blackbelt-technology/pi-dashboard-shared/memory-limits.js";
 import { type CachedEvent, type ReplayCache, replayCache } from "./replay-cache.js";
 
 /** Where a batch came from. `replay` answers this tab's own subscribe and is
@@ -48,6 +50,8 @@ export function createReplayPersister(
   /** Current server identity, read at FLUSH time (not construction time) so a
    *  buffer flushed after a switch is attributed to the server now connected. */
   getServerKey: () => string = () => "",
+  /** Tail bound override (tests); production uses `retainLimit` below. */
+  retainLimitOverride?: number,
 ): ReplayPersister {
   const buffers = new Map<string, CachedEvent[]>();
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -60,6 +64,12 @@ export function createReplayPersister(
    *  while gaining provenance. Only `seed()`, which replaces the buffer
    *  wholesale, can restore it. */
   const contaminated = new Set<string>();
+  /** Tail bound for the persisted payload: the retained suffix equals the
+   *  server's FULL-STREAM replay window (the floor guards a
+   *  deliberately-tiny `maxReplayEvents`), so the retained tail is the same
+   *  amount a cache-miss fresh load would replay. A cache hit therefore never
+   *  rehydrates materially less state than a fresh load. */
+  const retainLimit = retainLimitOverride ?? Math.max(DEFAULT_MEMORY_LIMITS.maxReplayEvents, MIN_REPLAY_WINDOW);
 
   function maxSeqOf(buf: CachedEvent[]): number {
     let m = 0;
@@ -78,10 +88,33 @@ export function createReplayPersister(
     // No provenance → skip silently. Never delete: a sibling tab may hold a
     // valid entry for this session (design D2/D3).
     if (!descended.has(sessionId)) return;
-    await cache.put(sessionId, { maxSeq: maxSeqOf(buf), payload: buf }, getServerKey());
+    // Persist — and retain — only the tail. Without this the raw-event buffer
+    // grows with tab lifetime for every session ever viewed, and every flush
+    // re-serializes the whole history into IndexedDB.
+    // See change: fix-archive-feedback-and-sidebar-perf (C3).
+    const payload = buf.length > retainLimit ? buf.slice(-retainLimit) : buf;
+    await cache.put(sessionId, { maxSeq: maxSeqOf(buf), payload }, getServerKey());
+    // Post-await re-check: a drop()/resetBuffers() may have raced the put.
+    // Re-slice the SAME array instance rather than reusing the captured
+    // payload: a record() during the await appended events that the captured
+    // payload predates, and dropping them would make the next live frame read
+    // as a dropped-frame gap (voiding provenance until a reseed). Never
+    // resurrect a buffer that was replaced (seed) or removed while the write
+    // was in flight. No re-schedule after a trim: the tail window is
+    // persisted, and events appended during the await ride the next record()'s
+    // schedule (or an explicit flush).
+    if (buffers.get(sessionId) === buf && buf.length > retainLimit) {
+      buffers.set(sessionId, buf.slice(-retainLimit));
+    }
   }
 
   function schedule(sessionId: string): void {
+    // A buffer that can never be persisted (no provenance) has nothing to
+    // flush — scheduling its debounce is pure waste for sessions this tab
+    // only ever saw broadcast traffic for. Provenance only moves forward or
+    // is dropped, and every such edge calls schedule() itself.
+    // See change: fix-archive-feedback-and-sidebar-perf (C3).
+    if (!descended.has(sessionId)) return;
     const existing = timers.get(sessionId);
     if (existing) clearTimeout(existing);
     timers.set(

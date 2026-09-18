@@ -153,6 +153,7 @@ import { deriveRetryProjection } from "./lib/session/retry-projection.js";
 import { SessionAssetsProvider } from "./lib/session/SessionAssetsContext.js";
 import { deriveSelectedSessionId } from "./lib/session/selectedSessionId.js";
 import { selectViewedSessionId } from "./lib/session/selectViewedSessionId.js";
+import { resolveSubscriptionTransition } from "./lib/session/subscription-transition.js";
 import { DisplayPrefsProvider, resolveSessionOverride } from "./lib/state/DisplayPrefsContext.js";
 import { openArtifactForViewport } from "./lib/util/artifact-view-gate.js";
 
@@ -1233,9 +1234,19 @@ export default function App() {
   // for the subscription side-effect below.
   const prevSelectedRef = useRef(selectedId);
   useEffect(() => {
-    if (selectedId !== prevSelectedRef.current) {
-      prevSelectedRef.current = selectedId;
+    // Release the previous selection's subscription on a genuine change; both
+    // the release and the ref advance hold while a plugin overlay is open.
+    // Decision + overlay carve-out rationale: resolveSubscriptionTransition.
+    // See change: fix-archive-feedback-and-sidebar-perf (C3).
+    const transition = resolveSubscriptionTransition(prevSelectedRef.current, selectedId, pluginOverlayMatched);
+    if (transition.release !== undefined) {
+      send({ type: "unsubscribe", sessionId: transition.release });
+      // The guard below treats subscribedRef membership as "this tab's socket
+      // has an open subscription". After a release that is no longer true, and
+      // a stale entry would skip the re-subscribe on a later re-selection.
+      subscribedRef.current.delete(transition.release);
     }
+    prevSelectedRef.current = transition.nextPrev;
     // Lazy subscribe: load events for ended sessions when first selected.
     // Also re-subscribes the selected session after reconnect (status change
     // clears subscribedRef, and adding `status` here re-triggers the effect).
@@ -1327,7 +1338,7 @@ export default function App() {
         doSubscribe(maxSeqMapRef.current.get(sid) ?? 0);
       }
     }
-  }, [selectedId, send, status]);
+  }, [selectedId, send, status, pluginOverlayMatched]);
 
   // Cold-open subscription for plugin overlay routes is now the claim's
   // responsibility — each claim (e.g. SubagentPopoutClaim)
@@ -1717,6 +1728,17 @@ export default function App() {
     return ids;
   }, [sessionStates]);
 
+  // ONE stable array from the sessions Map, consumed by SessionList, the
+  // plugin provider, the folder views and the tag filter alike — every inline
+  // `Array.from(sessions.values())` at a call site is a fresh identity per
+  // render. See change: fix-archive-feedback-and-sidebar-perf (C1, 8.3).
+  const allSessionsList = useMemo(() => Array.from(sessions.values()), [sessions]);
+
+  // Union of all tags in use across sessions — feeds TagEditor autocomplete
+  // (card + detail) and the sidebar tag filter group. Recomputes only when the
+  // session list changes. See change: add-session-tags.
+  const allTags = useMemo(() => allTagsInUse(allSessionsList), [allSessionsList]);
+
   // Per-session map of unresolved `bash` toolCalls, consumed by the
   // SessionActivityBar inside each session card's PROCESS subcard.
   // See change: redesign-process-list-activity-bar.
@@ -1737,14 +1759,9 @@ export default function App() {
     send({ type: "abort", sessionId });
   }, [send]);
 
-  // Union of all tags in use across sessions — feeds TagEditor autocomplete
-  // (card + detail) and the sidebar tag filter group. Recomputes only when the
-  // session list changes. See change: add-session-tags.
-  const allTags = useMemo(() => allTagsInUse(Array.from(sessions.values())), [sessions]);
-
   const sessionList = (
     <SessionList
-      sessions={Array.from(sessions.values())}
+      sessions={allSessionsList}
       selectedId={selectedId}
       onSelect={handleSelect}
       revealRequest={revealRequest}
@@ -2405,8 +2422,6 @@ export default function App() {
     }
     return null;
   }, [folderEditorCwd, getTerminalsForCwd, handleCreateTerminal, handleKillTerminal, handleRenameTerminal, handleTerminalTitle, handleEditorClose]);
-
-  const allSessionsList = useMemo(() => Array.from(sessions.values()), [sessions]);
 
   // Bare `/folder/:encodedCwd` directory home page (design D2).
   // Rendered in BOTH the desktop and mobile chains. No eligibility guard: any

@@ -16,8 +16,8 @@
 import { existsSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ArchivedSessionSummary } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
-import { mergeSessionMeta, metaPath, readSessionMeta } from "@blackbelt-technology/pi-dashboard-shared/session-meta.js";
 import { pathKey, resolveSessionGroupPath } from "@blackbelt-technology/pi-dashboard-shared/session-group-path.js";
+import { mergeSessionMeta, metaPath, readSessionMeta } from "@blackbelt-technology/pi-dashboard-shared/session-meta.js";
 import type { DashboardSession } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import type { MetaPersistence } from "../persistence/meta-persistence.js";
 import type { SessionManager } from "./memory-session-manager.js";
@@ -130,12 +130,16 @@ export function createSessionArchive(deps: SessionArchiveDeps): SessionArchive {
   };
 
   function groupKeyFor(row: ArchivedSessionSummary, pinned: Set<string>): string {
-    const groupPath = resolveSessionGroupPath(
+    return pathKey(resolveGroupPathFor(row, pinned), platform);
+  }
+
+  /** Raw display group path (pin > worktree main > cwd). */
+  function resolveGroupPathFor(row: ArchivedSessionSummary, pinned: Set<string>): string {
+    return resolveSessionGroupPath(
       { cwd: row.cwd, gitWorktree: row.gitWorktree },
       pinned,
       platform,
     );
-    return pathKey(groupPath, platform);
   }
 
   function rebuild(rows: ArchivedSessionSummary[]): void {
@@ -143,11 +147,10 @@ export function createSessionArchive(deps: SessionArchiveDeps): SessionArchive {
     const next = new Map<string, ArchivedSessionSummary[]>();
     for (const row of rows) {
       const key = groupKeyFor(row, pinned);
-      row.groupPath = resolveSessionGroupPath(
-        { cwd: row.cwd, gitWorktree: row.gitWorktree },
-        pinned,
-        platform,
-      );
+      // Folded — the SAME key the index map and `archivedCountByCwd` carry,
+      // so the client's fold/search file rows under the group they render.
+      // See change: fix-archive-feedback-and-sidebar-perf (B2).
+      row.groupPath = key;
       const list = next.get(key);
       if (list) list.push(row);
       else next.set(key, [row]);
@@ -186,12 +189,9 @@ export function createSessionArchive(deps: SessionArchiveDeps): SessionArchive {
   }
 
   function insertRow(row: ArchivedSessionSummary): void {
-    const key = groupKeyFor(row, pinnedKeys());
-    row.groupPath = resolveSessionGroupPath(
-      { cwd: row.cwd, gitWorktree: row.gitWorktree },
-      pinnedKeys(),
-      platform,
-    );
+    const pinned = pinnedKeys();
+    const key = groupKeyFor(row, pinned);
+    row.groupPath = key;
     const list = index.get(key);
     if (list) list.push(row);
     else index.set(key, [row]);

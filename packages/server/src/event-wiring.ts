@@ -284,6 +284,19 @@ export function wireEvents(deps: EventWiringDeps): void {
     customEventGroupResolver,
   } = deps;
 
+  // Idle-alive archive: the process was just ended, so complete the archive
+  // the user asked for. Consumed at the `ended` TRANSITION (`onEnded` fires
+  // for BOTH seams — `update({status:"ended"})` and `unregister`) so the
+  // force-kill / session-moved paths complete too; the one-shot registry makes
+  // a later `onUnregister` consume a silent no-op. "Archived as a consequence
+  // of MY request" stays distinct from every other death path.
+  // See changes: archive-sessions-lazy-load, fix-archive-feedback-and-sidebar-perf (A4).
+  const consumePendingArchiveIntent = (sessionId: string): void => {
+    if (pendingArchiveIntents?.consume(sessionId)) {
+      sessionArchive?.archiveSession(sessionId, "manual");
+    }
+  };
+
   // Once-per-activation guard for the eager liveness marker: maps sessionId
   // → epoch already stamped. Prevents a fresh atomic write on every event.
   // See change: reopen-sessions-after-shutdown.
@@ -534,6 +547,12 @@ export function wireEvents(deps: EventWiringDeps): void {
         }
       }
     }
+
+    // Idle-alive archive: complete the archive the user asked for. Extracted
+    // so the added branch keeps `onEnded` under the complexity budget.
+    // See changes: archive-sessions-lazy-load,
+    // fix-archive-feedback-and-sidebar-perf (A4).
+    consumePendingArchiveIntent(sessionId);
   };
 
   sessionManager.onUnregister = (sessionId) => {
@@ -577,14 +596,10 @@ export function wireEvents(deps: EventWiringDeps): void {
     // any run wedged by a lost terminal event.
     // See change: finalize-automation-run-on-session-death.
     dispatchPluginSessionEnded?.(sessionId);
-    // Idle-alive archive: the process was just ended, so complete the archive
-    // the user asked for. Consuming the one-shot intent here (rather than in a
-    // generic onChange) keeps "archived as a consequence of MY request"
-    // distinct from every other death path. See change:
-    // archive-sessions-lazy-load.
-    if (pendingArchiveIntents?.consume(sessionId)) {
-      sessionArchive?.archiveSession(sessionId, "manual");
-    }
+    // NOTE: the idle-alive archive intent is consumed by `onEnded` above (the
+    // shared transition seam). Consuming it here too would be a no-op — the
+    // registry is one-shot — so it is deliberately NOT repeated.
+    // See change: fix-archive-feedback-and-sidebar-perf (A4).
   };
 
   // Per-event cap for `Session.uiDataMap[event]`. Phase-1 spec contract:

@@ -2,13 +2,14 @@
  * Pure utility functions for grouping, sorting, and filtering sessions.
  * Extracted from SessionList.tsx for reuse and testability.
  */
-import type { DashboardSession } from "@blackbelt-technology/pi-dashboard-shared/types.js";
-import type { TerminalSession } from "@blackbelt-technology/pi-dashboard-shared/terminal-types.js";
+
 import {
   inferPlatform,
   pathKey,
   resolveSessionGroupPath,
 } from "@blackbelt-technology/pi-dashboard-shared/session-group-path.js";
+import type { TerminalSession } from "@blackbelt-technology/pi-dashboard-shared/terminal-types.js";
+import type { DashboardSession } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 
 // `inferPlatform`, `pathKey`, and `resolveSessionGroupPath` now live in
 // packages/shared so the server keys its order map by the SAME resolved
@@ -297,13 +298,15 @@ export function filterSessions(
  * Empty/whitespace queries return the input unchanged.
  *
  * Mirrors `getSessionDisplayName` to keep "what you see is what you
- * search" — a session showing as "pi-shodh" must match a `pi-sho` query
- * even when its underlying `name` and `firstMessage` are empty.
+ * search" — a session showing as "pi-shodh · 01a0b293" must match a
+ * `pi-sho` query even when its underlying `name` and `firstMessage` are
+ * empty. The id suffix the display fallback appends is display-only:
+ * queries match the basename, never the id suffix.
  *
  * The caller is responsible for applying `showHidden` filtering before
  * search (typically via the standard `filterSessions` pipeline).
  *
- * See change: pin-and-search-sessions §8.
+ * See change: pin-and-search-sessions §8; fix-archive-feedback-and-sidebar-perf (A1).
  */
 export function filterByQuery<
   T extends { name?: string; firstMessage?: string; cwd?: string },

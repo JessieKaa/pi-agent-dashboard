@@ -8,8 +8,8 @@ import { mdiArchiveOutline, mdiBroom, mdiChevronDown, mdiChevronRight, mdiChevro
 import { Icon } from "@mdi/react";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "wouter";
-import { useFolderUrgencySort } from "../../hooks/useFolderUrgencySort.js";
 import { ARCHIVE_PAGE_SIZE, useArchivedSessions } from "../../hooks/useArchivedSessions.js";
+import { useFolderUrgencySort } from "../../hooks/useFolderUrgencySort.js";
 import { useInitStatus } from "../../hooks/useInitStatus.js";
 import { useInstallPrompt } from "../../hooks/useInstallPrompt.js";
 import { maybeAutoInitWorktreeOnSpawn } from "../../lib/git/auto-init-worktree.js";
@@ -57,7 +57,6 @@ import { PiLogo } from "../primitives/PiLogo.js";
 import { Toast, useToast } from "../primitives/Toast.js";
 import { ThemePicker } from "../settings/ThemePicker.js";
 import { ThemeToggle } from "../settings/ThemeToggle.js";
-import { ArchivedSessionRow } from "./ArchivedSessionRow.js";
 import { allTagsInUse } from "../tags/all-tags.js";
 import { TagDeleteConfirmDialog } from "../tags/TagDeleteConfirmDialog.js";
 import { TagFilterGroup } from "../tags/TagFilterGroup.js";
@@ -71,6 +70,7 @@ import { WorkspaceHeader } from "../workspace/WorkspaceHeader.js";
 import { BranchSwitchDialog } from "../worktree/BranchSwitchDialog.js";
 import { ManageWorktreesDialog } from "../worktree/ManageWorktreesDialog.js";
 import { WorktreeSpawnDialog } from "../worktree/WorktreeSpawnDialog.js";
+import { ArchivedSessionRow } from "./ArchivedSessionRow.js";
 import { DashboardSpawnButtons } from "./DashboardSpawnButtons.js";
 import { PlaceholderSessionCard } from "./PlaceholderSessionCard.js";
 import { branchCache, GroupGitInfo, SessionCard } from "./SessionCard.js";
@@ -306,6 +306,10 @@ export { type DirectoryGroup, filterSessions, groupSessionsByDirectory } from ".
  */
 const PROJECT_INIT_PROMPT = "/skill:project-init";
 
+/** Unpinned zero-session stub groups rendered before the "+N more folders"
+ * summary row takes over. See change: fix-archive-feedback-and-sidebar-perf (C2). */
+const STUB_GROUP_BUDGET = 8;
+
 /** Per-group page in-flight lifetime; a lost `sessions_page_result` must not
  * wedge the expander. See change: fix-connect-snapshot-frame-loss (D9). */
 const PAGE_INFLIGHT_TIMEOUT_MS = 15_000;
@@ -345,7 +349,15 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
   // UI preference flag, default-on. Gates folder `+Worktree` and per-change
   // `⥂2+` buttons. See change: openspec-worktree-spawn-button.
   const gitWorktreeEnabled = gitWorktreeEnabledProp ?? true;
+  // Relative-time badge clock — one render-time read, floored to a 30s bucket
+  // for the card prop so the memo's `now` comparison only fires when a badge
+  // label can actually change. No ticker: a wall-clock advance alone causes no
+  // re-render (HostPressureIndicator ticks itself); any later re-render (a
+  // broadcast, a click) re-reads this. Worst case is one batch of latency after
+  // a label flips, never a frozen label.
+  // See change: fix-archive-feedback-and-sidebar-perf (C1).
   const now = Date.now();
+  const nowBucket = now - (now % 30_000);
   const [, navigate] = useLocation();
   const { messages, showToast, dismissToast } = useToast();
   const installPrompt = useInstallPrompt();
@@ -445,9 +457,53 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
   // axis; AND-across axes and with folder/search. See change: add-session-tags.
   const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set());
   const [selectedPhases, setSelectedPhases] = useState<Set<string>>(new Set());
+  // ── Folded key space (fix-archive-feedback-and-sidebar-perf B2) ─────────
+  // Every group-keyed map/state in this component (ended counts, archive
+  // counts, archive matches, expand sets, paging gates) is keyed by the
+  // FOLDED (`pathKey`) form — the same space the server sends. A group's
+  // DISPLAY `cwd` (raw session cwd / pinned spelling / worktree mainPath) is
+  // folded on every read and write through `foldKey`.
+  //
+  // Stub-group folded keys: every group key with ended sessions the client
+  // holds no session for. Feeds the grouping path as empty groups AND the
+  // fold-platform inference below.
+  const stubGroupCwds = useMemo(() => {
+    if (!endedTotalsMap || endedTotalsMap.size === 0) return undefined;
+    const cwds: string[] = [];
+    for (const [cwd, count] of endedTotalsMap) {
+      if (count > 0) cwds.push(cwd);
+    }
+    return cwds.length > 0 ? cwds : undefined;
+  }, [endedTotalsMap]);
+  // ONE inferred platform for every fold: group `cwd` values (raw session
+  // cwd, pinned display path, stub key) all fold through it.
+  const foldPlatform = useMemo(
+    () => inferPlatform([
+      ...sessions.map((s) => s.cwd),
+      ...sessions.map((s) => s.gitWorktree?.mainPath),
+      ...(pinnedDirectories ?? []),
+      ...(stubGroupCwds ?? []),
+    ]),
+    [sessions, pinnedDirectories, stubGroupCwds],
+  );
+  const foldKey = useCallback((p: string) => pathKey(p, foldPlatform), [foldPlatform]);
+  // Held ended count per GROUP key (the same folded key space `endedTotals`
+  // uses): the “more” affordance compares it against the group's full ended
+  // count.
+  const heldEndedByCwd = useMemo(() => {
+    const m = new Map<string, number>();
+    const pinned = pinnedDirectories ?? [];
+    const pinnedKeys = new Set(pinned.map((d) => pathKey(d, foldPlatform)));
+    for (const s of sessions) {
+      if (s.status !== "ended") continue;
+      const key = pathKey(resolveSessionGroupPath(s, pinnedKeys, foldPlatform), foldPlatform);
+      m.set(key, (m.get(key) ?? 0) + 1);
+    }
+    return m;
+  }, [sessions, pinnedDirectories, foldPlatform]);
   // Per-folder "show ended" expansion state. Ended sessions are collapsed
   // by default inside each folder; a minimal `Show N ended` row at the
-  // bottom toggles. State is keyed by cwd; absent = collapsed (default).
+  // bottom toggles. State is keyed by folded cwd; absent = collapsed (default).
   // The session-search query auto-expands ended in matching folders.
   const [endedExpanded, setEndedExpanded] = useState<Set<string>>(new Set());
   // Per-folder opt-in urgency sort (default off). See change:
@@ -526,36 +582,21 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
     const timer = setTimeout(() => loadArchivedFirst(archiveSearchKey), 300);
     return () => clearTimeout(timer);
   }, [archiveSearchKey, loadArchivedFirst]);
-  // Search results grouped by each item's `groupPath` (server resolved the
-  // pin > worktree-main > cwd precedence). None → no section rendered.
+  // Search results grouped by each item's folded `groupPath` (server resolved
+  // and folded: pin > worktree-main > cwd). None → no section rendered.
   const archivedMatchesByGroup = useMemo(() => {
     if (archiveSearchKey === null) return null;
     const page = getArchivedPage(archiveSearchKey);
     if (!page.loaded || page.items.length === 0) return null;
     const m = new Map<string, ArchivedSessionSummary[]>();
     for (const item of page.items) {
-      const arr = m.get(item.groupPath);
+      const key = pathKey(item.groupPath, foldPlatform);
+      const arr = m.get(key);
       if (arr) arr.push(item);
-      else m.set(item.groupPath, [item]);
+      else m.set(key, [item]);
     }
     return m;
-  }, [archiveSearchKey, getArchivedPage]);
-
-  // ── Ended paging + stub groups (fix-connect-snapshot-frame-loss D9) ─────
-  // Held ended count per GROUP key (the same key space `endedTotals` uses):
-  // the “more” affordance compares it against the group's full ended count.
-  const heldEndedByCwd = useMemo(() => {
-    const m = new Map<string, number>();
-    const pinned = pinnedDirectories ?? [];
-    const platform = inferPlatform([...sessions.map((s) => s.cwd), ...pinned]);
-    const pinnedKeys = new Set(pinned.map((d) => pathKey(d, platform)));
-    for (const s of sessions) {
-      if (s.status !== "ended") continue;
-      const key = resolveSessionGroupPath(s, pinnedKeys, platform);
-      m.set(key, (m.get(key) ?? 0) + 1);
-    }
-    return m;
-  }, [sessions, pinnedDirectories]);
+  }, [archiveSearchKey, getArchivedPage, foldPlatform]);
 
   // Per-group page in-flight: at most one `sessions_page` per group at a
   // time. Released when `pagedCount` for the group advances (the reply
@@ -578,19 +619,19 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
   }, []);
   const requestEndedPage = useCallback(
     (cwd: string) => {
-      if (!onSessionsPage || pagingInflight.has(cwd)) return;
-      const endedTotal = endedTotalsMap?.get(cwd) ?? 0;
-      if (endedTotal <= (heldEndedByCwd.get(cwd) ?? 0)) return; // everything held
-      onSessionsPage(cwd, pagedCount?.get(cwd) ?? 0);
-      setPagingInflight((prev) => new Set(prev).add(cwd));
+      const key = foldKey(cwd);
+      if (!onSessionsPage || pagingInflight.has(key)) return;
+      const endedTotal = endedTotalsMap?.get(key) ?? 0;
+      if (endedTotal <= (heldEndedByCwd.get(key) ?? 0)) return; // everything held
+      onSessionsPage(key, pagedCount?.get(key) ?? 0);
+      setPagingInflight((prev) => new Set(prev).add(key));
       pagingTimersRef.current.set(
-        cwd,
-        setTimeout(() => clearPagingInflight(cwd), PAGE_INFLIGHT_TIMEOUT_MS),
+        key,
+        setTimeout(() => clearPagingInflight(key), PAGE_INFLIGHT_TIMEOUT_MS),
       );
     },
-    [onSessionsPage, pagingInflight, endedTotalsMap, pagedCount, heldEndedByCwd, clearPagingInflight],
-  );
-  // Reply landed: every in-flight group whose paged count advanced clears.
+    [onSessionsPage, pagingInflight, endedTotalsMap, pagedCount, heldEndedByCwd, clearPagingInflight, foldKey],
+  );  // Reply landed: every in-flight group whose paged count advanced clears.
   const prevPagedCountRef = useRef(pagedCount);
   useEffect(() => {
     const prev = prevPagedCountRef.current;
@@ -618,26 +659,28 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
     },
     [],
   );
-  // Stub-group keys: every group key with ended sessions the client holds no
-  // session for. Feeds the grouping path as empty groups (D9).
-  const stubGroupCwds = useMemo(() => {
-    if (!endedTotalsMap || endedTotalsMap.size === 0) return undefined;
-    const cwds: string[] = [];
-    for (const [cwd, count] of endedTotalsMap) {
-      if (count > 0) cwds.push(cwd);
-    }
-    return cwds.length > 0 ? cwds : undefined;
-  }, [endedTotalsMap]);
-
   // Collapsed groups state
   const [collapsedGroups, setCollapsedGroupsState] = useState(() => getCollapsedGroups());
 
-  // Prune stale collapsed groups when sessions change
+  // Prune stale collapsed groups when sessions change. The functional-setState
+  // equality bail keeps the Set identity when nothing was pruned — the effect
+  // allocates a fresh Set on every `sessions.length` change, and committing it
+  // unconditionally churned `collapsedGroups` → `seekToFolderOpenSpec` →
+  // every card's memo comparator, re-rendering the whole list for nothing.
+  // See change: fix-archive-feedback-and-sidebar-perf (C1).
   useEffect(() => {
     if (sessions.length === 0) return;
     const knownCwds = new Set(sessions.map((s) => s.cwd));
     const prunedGroups = pruneStaleCollapsedGroups(knownCwds);
-    setCollapsedGroupsState(prunedGroups);
+    setCollapsedGroupsState((prev) => {
+      if (
+        prev.size === prunedGroups.size &&
+        [...prunedGroups].every((cwd) => prev.has(cwd))
+      ) {
+        return prev;
+      }
+      return prunedGroups;
+    });
   }, [sessions.length]);
 
 
@@ -708,6 +751,13 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
     );
     return unpinnedGroups.filter((g) => !claimed.has(g.cwd));
   }, [workspaceTiers, unpinnedGroups, workspaces]);
+  // Stub-row budget (C2): the per-row cost of an unpinned stub group (folder
+  // card + FolderInitScope probe + membership resolution) is bounded to the
+  // SESSION-less subset — pinned stubs and groups holding sessions always
+  // render. The excess collapses into one "+N more folders" summary row;
+  // expanding materializes every remaining stub. Narrowing filters lift the
+  // budget (the user is hunting a specific folder).
+  const [stubBudgetExpanded, setStubBudgetExpanded] = useState(false);
   const allGroups = useMemo(() => [...pinnedGroups, ...unpinnedGroups], [pinnedGroups, unpinnedGroups]);
 
   // Reverse lookup: cwd → owning workspace id (or null).
@@ -1515,12 +1565,16 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
         }
       : undefined;
     const folderHasSessions = group.sessions.length > 0;
+    // Folded lookup key for every group-keyed map below (ended totals, held
+    // counts, expand sets, paging, archive fold). See change:
+    // fix-archive-feedback-and-sidebar-perf (B2).
+    const groupKey = foldKey(group.cwd);
     // Ended-window bookkeeping (D9): the group's FULL ended count (snapshot
     // `endedTotals`, live-updated) vs the ended sessions actually held. A
     // group key with ended history but zero held sessions renders as a STUB —
     // header + ended expander only. See change: fix-connect-snapshot-frame-loss.
-    const endedTotal = endedTotalsMap?.get(group.cwd) ?? 0;
-    const heldEnded = heldEndedByCwd.get(group.cwd) ?? 0;
+    const endedTotal = endedTotalsMap?.get(groupKey) ?? 0;
+    const heldEnded = heldEndedByCwd.get(groupKey) ?? 0;
     const isStub = !folderHasSessions && endedTotal > 0;
 
     return (
@@ -1768,8 +1822,8 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
               cwd={group.cwd}
               labelCount={endedTotal}
               heldEnded={heldEnded}
-              expanded={endedExpanded.has(group.cwd)}
-              onToggle={toggleEndedExpanded}
+              expanded={endedExpanded.has(groupKey)}
+              onToggle={() => toggleEndedExpanded(groupKey)}
               onRequestPage={requestEndedPage}
             />
           </div>
@@ -1880,7 +1934,7 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
             );
             const showEnded =
               endedSessions.length > 0 &&
-              (endedExpanded.has(group.cwd) || sessionSearch.length > 0 || anyTagFilterActive);
+              (endedExpanded.has(groupKey) || sessionSearch.length > 0 || anyTagFilterActive);
             const visibleSessions = flatMergeMode
               ? sortSessionsByOrder(matched, order) // mixed-status, flat stored order
               : (showEnded
@@ -1923,7 +1977,7 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
             //   - only when at least one ended session exists in render
             const showInlineHideEnded =
               firstEndedIdx >= 0 &&
-              endedExpanded.has(group.cwd) &&
+              endedExpanded.has(groupKey) &&
               sessionSearch.length === 0 &&
               workspaceFilter.length === 0 &&
               !anyTagFilterActive;
@@ -1937,7 +1991,7 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
                     <React.Fragment key={`f-${id}`}>
                       {renderTopHideEnded && (
                         <button
-                          onClick={(e) => { e.stopPropagation(); toggleEndedExpanded(group.cwd); }}
+                          onClick={(e) => { e.stopPropagation(); toggleEndedExpanded(groupKey); }}
                           className="w-full text-[10px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] py-1 px-2 select-none flex items-center justify-center gap-1 border-t border-[var(--border-subtle)]"
                           data-testid={`folder-ended-toggle-top-${group.cwd}`}
                           aria-label={t("sessionList.hideEndedCount", { count: endedSessions.length }, `Hide ${endedSessions.length} ended sessions`)}
@@ -1951,7 +2005,7 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
                         session={session}
                         selectedId={selectedId}
                         onSelect={onSelect}
-                        now={now}
+                        now={nowBucket}
                         showGitInfo={group.sessions.length === 1}
                         isHidden={!!session.hidden}
                         onArchive={handleArchive}
@@ -2024,14 +2078,14 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
             const endedCount = matched.filter((s) => s.status === "ended").length;
             if (endedCount === 0 && endedTotal <= 0) return null;
             if (sessionSearch.length > 0 || anyTagFilterActive) return null; // auto-expanded
-            const expanded = endedExpanded.has(group.cwd);
+            const expanded = endedExpanded.has(groupKey);
             return (
               <EndedExpanderRow
                 cwd={group.cwd}
                 labelCount={endedTotal > 0 ? endedTotal : endedCount}
                 heldEnded={heldEnded}
                 expanded={expanded}
-                onToggle={toggleEndedExpanded}
+                onToggle={() => toggleEndedExpanded(groupKey)}
                 onRequestPage={requestEndedPage}
               />
             );
@@ -2041,7 +2095,7 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
               rendered beneath the folder's resident matches. The tag/phase /
               activeOnly axes never apply to archived rows. */}
           {(() => {
-            const matches = archivedMatchesByGroup?.get(group.cwd);
+            const matches = archivedMatchesByGroup?.get(groupKey);
             if (!matches || matches.length === 0) return null;
             return (
               <div className="mt-1 flex flex-col gap-1" data-testid={`archive-matches-${group.cwd}`}>
@@ -2072,10 +2126,10 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
               `Load M more` (M = min(page size, remaining)); inline retry on
               error. Hidden when the folder count is 0/absent (#F5). */}
           {(() => {
-            const archiveCount = archivedCountMap?.get(group.cwd) ?? 0;
+            const archiveCount = archivedCountMap?.get(groupKey) ?? 0;
             if (archiveCount <= 0) return null;
-            const expanded = archiveExpanded.has(group.cwd);
-            const page = getArchivedPage(group.cwd);
+            const expanded = archiveExpanded.has(groupKey);
+            const page = getArchivedPage(groupKey);
             const shown = page.items.length;
             const remaining = Math.max(archiveCount - shown, 0);
             const moreCount = Math.min(ARCHIVE_PAGE_SIZE, remaining);
@@ -2085,7 +2139,7 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    toggleArchiveExpanded(group.cwd);
+                    toggleArchiveExpanded(groupKey);
                   }}
                   className="w-full text-[10px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] py-1 px-2 select-none flex items-center gap-1 text-left"
                   data-testid={`folder-archive-toggle-${group.cwd}`}
@@ -2347,12 +2401,16 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
       {filteredSessions.length === 0 && pinnedGroups.length === 0 && (workspaces?.length ?? 0) === 0 && !stubGroupCwds ? (
         <div className="p-4 text-sm text-[var(--text-tertiary)]">{t("sessionList.noActiveSessions", undefined, "No active sessions")}</div>
       ) : (
-        // `measuring.droppable.strategy = Always`: spring-load mounts folder
-        // droppables MID-DRAG, and the default `Optimized` strategy does not
-        // remeasure newly-registered containers, so a drop inside a revealed
-        // body would resolve against stale rects.
-        // See change: drag-folders-across-workspaces.
-        <DndContext sensors={sensors} collisionDetection={compatibleClosestCenter} measuring={{ droppable: { strategy: MeasuringStrategy.Always } }} onDragStart={handleDragStart} onDragOver={handleDragOver} onDragEnd={handleDragEnd} onDragCancel={handleDragCancel}>
+        // `measuring.droppable.strategy = WhileDragging`: spring-load mounts
+        // folder droppables MID-DRAG, and dnd-kit measures newly-registered
+        // containers on registration even under that strategy (the measure
+        // queue is only disabled outside a drag), so a drop inside a revealed
+        // body still resolves against fresh rects. `Always` additionally
+        // re-measured EVERY droppable on every drag-state change — with a few
+        // hundred rows that is the sidebar's most expensive per-gesture cost.
+        // See changes: drag-folders-across-workspaces (original),
+        // fix-archive-feedback-and-sidebar-perf (A3).
+        <DndContext sensors={sensors} collisionDetection={compatibleClosestCenter} measuring={{ droppable: { strategy: MeasuringStrategy.WhileDragging } }} onDragStart={handleDragStart} onDragOver={handleDragOver} onDragEnd={handleDragEnd} onDragCancel={handleDragCancel}>
         <ul className={`flex flex-col ${compactSidebar ? "gap-1 p-1.5" : "gap-2 p-2"}`}>
           {/* Elevated dashboard-scope add buttons: rendered as the FIRST list
               item, above workspace tiers and pinned folder groups.
@@ -2460,12 +2518,54 @@ export function SessionList({ sessions, selectedId, onSelect, revealRequest, onS
               return workspaceFilter.length > 0
                 ? folderMatchesFilters(g)
                 : g.sessions.some((s) => s.status !== "ended") ||
-                  (endedTotalsMap?.get(g.cwd) ?? 0) > 0 ||
+                  (endedTotalsMap?.get(foldKey(g.cwd)) ?? 0) > 0 ||
                   // Archive-search matches keep an otherwise-ended folder
                   // visible so their `Archive matches` section is reachable.
-                  (archivedMatchesByGroup?.get(g.cwd)?.length ?? 0) > 0;
+                  (archivedMatchesByGroup?.get(foldKey(g.cwd))?.length ?? 0) > 0;
             })
-            .map((group) => renderGroupWithWorkspaceMenu(group, false))}
+            .map((group, idx, visible) => {
+              // C2 budget: zero-session stubs beyond the budget collapse into
+              // ONE summary row — only in the default (unfiltered) view.
+              // Session-bearing groups never consume the budget; an active
+              // narrowing filter (tag/phase/workspace path) renders everything
+              // the user asked for.
+              if (
+                !stubBudgetExpanded &&
+                !anyTagFilterActive &&
+                sessionSearch.trim().length === 0 &&
+                workspaceFilter.trim().length === 0
+              ) {
+                let stubRank = 0;
+                for (let i = 0; i <= idx; i += 1) {
+                  const g = visible[i]!;
+                  if (g.sessions.length === 0 && (endedTotalsMap?.get(foldKey(g.cwd)) ?? 0) > 0) stubRank += 1;
+                }
+                if (stubRank > STUB_GROUP_BUDGET) {
+                  if (stubRank === STUB_GROUP_BUDGET + 1) {
+                    let hidden = 0;
+                    for (let i = idx; i < visible.length; i += 1) {
+                      const g = visible[i]!;
+                      if (g.sessions.length === 0 && (endedTotalsMap?.get(foldKey(g.cwd)) ?? 0) > 0) hidden += 1;
+                    }
+                    return (
+                      <li key="stub-budget-overflow">
+                        <button
+                          type="button"
+                          onClick={() => setStubBudgetExpanded(true)}
+                          className="w-full text-[10px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] py-1 px-2 select-none flex items-center justify-center gap-1"
+                          data-testid="stub-budget-overflow"
+                        >
+                          <Icon path={mdiChevronDown} size={0.4} />
+                          <span>{t("sessionList.moreStubFolders", { count: hidden }, `+${hidden} more folders`)}</span>
+                        </button>
+                      </li>
+                    );
+                  }
+                  return null;
+                }
+              }
+              return renderGroupWithWorkspaceMenu(group, false);
+            })}
         </ul>
         </DndContext>
       )}

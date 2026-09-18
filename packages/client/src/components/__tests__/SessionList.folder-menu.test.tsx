@@ -279,3 +279,52 @@ describe("stub groups + ended paging (fix-connect-snapshot-frame-loss)", () => {
     }
   });
 });
+
+/**
+ * fix-archive-feedback-and-sidebar-perf C2: the per-row cost of stub groups
+ * (one FolderInitScope + membership probe each) is budgeted in the unpinned
+ * tier — beyond the budget one "+N more folders" summary row replaces the
+ * remaining stub rows and expanding materializes them. Groups holding
+ * sessions (ended included) never consume the budget.
+ */
+describe("stub-group budget (fix-archive-feedback-and-sidebar-perf C2)", () => {
+  function stubTotals(count: number): Map<string, number> {
+    const m = new Map<string, number>();
+    for (let i = 0; i < count; i += 1) m.set(`/stub-g${i}`, 2);
+    return m;
+  }
+  function stubRowCount(): number {
+    return document.querySelectorAll('[data-testid^="folder-stub-body-"]').length;
+  }
+
+  it("caps zero-session stub rows at the budget and summarizes the rest", () => {
+    renderList({ sessions: [], endedTotalsMap: stubTotals(12) });
+    expect(stubRowCount()).toBe(8);
+    const summary = screen.getByTestId("stub-budget-overflow");
+    expect(summary.textContent).toContain("4");
+    expect(summary.textContent).toContain("more folders");
+  });
+
+  it("expanding the summary materializes every remaining stub row", () => {
+    renderList({ sessions: [], endedTotalsMap: stubTotals(12) });
+    fireEvent.click(screen.getByTestId("stub-budget-overflow"));
+    expect(stubRowCount()).toBe(12);
+    expect(screen.queryByTestId("stub-budget-overflow")).toBeNull();
+  });
+
+  it("groups holding sessions do not consume the stub budget", () => {
+    const groups = 6;
+    const heldSessions: DashboardSession[] = [];
+    const totals = new Map<string, number>();
+    for (let i = 0; i < groups; i += 1) {
+      heldSessions.push({ ...session, id: `s${i}`, cwd: `/held${i}` });
+      totals.set(`/held${i}`, 1); // one held ended session — group has a body
+      totals.set(`/stub-h${i}`, 2); // zero-session stub beside it
+    }
+    renderList({ sessions: heldSessions, endedTotalsMap: totals });
+    // 6 stub rows — under the budget: no summary, held groups unaffected.
+    expect(stubRowCount()).toBe(groups);
+    expect(screen.queryByTestId("stub-budget-overflow")).toBeNull();
+    expect(screen.getByTestId("folder-body-/held0")).toBeTruthy();
+  });
+});

@@ -387,6 +387,12 @@ export const huCatalog: Record<string, string> = {
   "err.register_timeout": "A munkamenet regisztrációja időtúllépést okozott",
   "err.fork_degraded_to_new": "Nem sikerült elágaztatni — helyette új munkamenet indult",
   "err.git.not_a_repo": "Nem git tároló",
+  // --- err.archive.* (B1 archive_result kódok) ---
+  "err.archive.not_found": "A munkamenet nem található",
+  "err.archive.reject_live": "A munkamenet megszakadt (live) — nem archiválható",
+  "err.archive.reject_running": "A munkamenet fut — nem archiválható",
+  "err.archive.unavailable": "Az archiválás nem elérhető",
+  "err.archive.failed": "Az archiválás sikertelen",
   // --- err.doctor.* (task 4.6) ---
   "err.doctor.command_not_found": "A parancs nem található",
   "err.doctor.permission_denied": "Hozzáférés megtagadva",

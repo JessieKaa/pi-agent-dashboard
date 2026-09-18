@@ -260,6 +260,25 @@ describe("useMessageHandler — ended paging + endedTotals + openspec_get (fix-c
     expect(h.endedTotals.get().get("/g")).toBe(2);
   });
 
+  it("B2: a cosmetic cwd variant lands on the folded key the snapshot carries", () => {
+    // change: fix-archive-feedback-and-sidebar-perf. The snapshot key is
+    // folded server-side; a live increment for a session whose cwd carries a
+    // cosmetic variant (trailing separator / `..` segment) must target the
+    // SAME key — a raw write silently fails to grow the folder's count.
+    const h = makeStatefulHandler();
+    h.handle({
+      type: "sessions_snapshot",
+      sessions: [makeSession("v1", "/g/", "active")],
+      orders: { "/g": ["v1"] },
+      endedTotals: { "/g": 0 },
+      archivedCountByCwd: {},
+    });
+
+    h.handle({ type: "session_updated", sessionId: "v1", updates: { status: "ended" } });
+
+    expect(h.endedTotals.get().get("/g")).toBe(1);
+  });
+
   it("E41: openspec_get_result applies like openspec_update; in-flight released only on final:true", () => {
     const h = makeStatefulHandler();
     const timer = setTimeout(() => {}, 15_000);

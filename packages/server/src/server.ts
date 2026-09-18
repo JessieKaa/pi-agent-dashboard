@@ -26,13 +26,12 @@ import { getDefaultRegistry } from "@blackbelt-technology/pi-dashboard-shared/to
 import type { DashboardSession } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import compress from "@fastify/compress";
 import cors from "@fastify/cors";
-import fastifyStatic from "@fastify/static";
 import rateLimit from "@fastify/rate-limit";
+import fastifyStatic from "@fastify/static";
 import Fastify from "fastify";
 import { createFitWorkerPool } from "./attachments/fit-worker-pool.js";
 import { registerAuthPlugin, validateWsUpgrade } from "./auth/auth-plugin.js";
 import { registerBearerAuth } from "./auth/bearer-auth.js";
-import { createRouteTierGate } from "./auth/route-tier-gate.js";
 import {
   computeBindReachability,
   formatBindReachabilityWarning,
@@ -65,6 +64,7 @@ import {
 } from "./auth/localhost-guard.js";
 import { createMutationOriginGate } from "./auth/mutation-origin-gate.js";
 import { readAuthJson } from "./auth/provider-auth-storage.js";
+import { createRouteTierGate } from "./auth/route-tier-gate.js";
 import { mintSpawnToken } from "./auth/spawn-token.js";
 import {
   type CoreWsRouteScope,
@@ -115,6 +115,7 @@ import { PackageManagerWrapper } from "./package/package-manager-wrapper.js";
 import { type BrowserGateway, createBrowserGateway } from "./pairing/browser-gateway.js";
 import { PairedDeviceRegistry } from "./pairing/paired-devices.js";
 import { PairingManager } from "./pairing/pairing.js";
+import type { PendingArchiveIntentRegistry } from "./pending/pending-archive-intent-registry.js";
 import { createPendingArchiveIntentRegistry } from "./pending/pending-archive-intent-registry.js";
 import { createPendingAttachRegistry } from "./pending/pending-attach-registry.js";
 import { createPendingClientCorrelations } from "./pending/pending-client-correlations.js";
@@ -185,6 +186,7 @@ import { reconcileSessionOrder } from "./session/reconcile-session-order.js";
 import { createRemoteTranscriptStore } from "./session/remote-transcript-store.js";
 import { resolveOrderKey } from "./session/resolve-order-key.js";
 import { registerSessionApi } from "./session/session-api.js";
+import type { SessionArchive } from "./session/session-archive.js";
 import { createSessionArchive } from "./session/session-archive.js";
 import { discoverAndBroadcastSessions } from "./session/session-bootstrap.js";
 import { createSessionOrderManager, type SessionOrderManager } from "./session/session-order-manager.js";
@@ -348,6 +350,19 @@ export interface DashboardServer {
    * See change: fix-worktree-spawn-placeholder-and-ordering.
    */
   sessionOrderManager: SessionOrderManager;
+  /**
+   * Pinned-directory + display-prefs store. Exposed for in-process tests that
+   * need to seed preferences before boot. Not part of the public API.
+   */
+  preferencesStore: PreferencesStore;
+  /** Archive index. Exposed for in-process tests. Not part of the public API. */
+  sessionArchive: SessionArchive;
+  /**
+   * One-shot idle-alive archive intents. Exposed for in-process tests.
+   * Not part of the public API.
+   * See change: fix-archive-feedback-and-sidebar-perf (A4).
+   */
+  pendingArchiveIntents: PendingArchiveIntentRegistry;
 }
 
 
@@ -567,6 +582,15 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       // order seed. See change: fix-ended-session-missing-endedat.
       restored.endedAt = restored.endedAt ?? deriveEndedAt(restored);
     }
+    // Clear the STICKY in-memory liveness flag on every restored row: after
+    // this point the row can never be running (a live session re-registers and
+    // replaces the row), and a surviving `live:true` rejected manual archive
+    // (`reject-live`) and skipped the sweeper for the rest of the server
+    // lifetime — the "archive works until one crash" pattern. The DISK marker
+    // is owned separately (`setLiveness`); clearing memory here cannot
+    // resurrect a candidate because the classification above already read it.
+    // See change: fix-archive-feedback-and-sidebar-perf (A4).
+    restored.live = false;
     sessionManager.restore(restored);
   }
   if (scanResult.cacheUpdates > 0) {
@@ -2125,6 +2149,9 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
     pendingDashboardSpawns,
     directoryService,
     sessionOrderManager,
+    preferencesStore,
+    sessionArchive,
+    pendingArchiveIntents,
 
     flush() {
       metaPersistence.flushAll();

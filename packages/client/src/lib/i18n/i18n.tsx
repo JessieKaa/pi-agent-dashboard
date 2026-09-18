@@ -1124,6 +1124,12 @@ const zhCN: Record<string, string> = {
   "err.register_timeout": "会话注册超时",
   "err.fork_degraded_to_new": "无法派生 — 已改为新建会话",
   "err.git.not_a_repo": "不是 git 仓库",
+  // --- err.archive.* (B1 archive_result codes) ---
+  "err.archive.not_found": "找不到会话",
+  "err.archive.reject_live": "会话已中断（live），无法归档",
+  "err.archive.reject_running": "会话正在运行，无法归档",
+  "err.archive.unavailable": "归档功能不可用",
+  "err.archive.failed": "归档失败",
   // --- err.doctor.* (task 4.6) ---
   "err.doctor.command_not_found": "找不到命令",
   "err.doctor.permission_denied": "权限被拒绝",

@@ -2,13 +2,13 @@
  * Session metadata handlers: rename, archive, unarchive, attach/detach proposal, fetch_content, list_sessions,
  * sessions_page.
  */
-import type { BrowserToServerMessage } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
-import type { DashboardSession } from "@blackbelt-technology/pi-dashboard-shared/types.js";
+import type { ArchiveResultBrowserMessage, ArchiveResultCode, BrowserToServerMessage } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
 import { normalizeTags } from "@blackbelt-technology/pi-dashboard-shared/tags.js";
+import type { DashboardSession } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import { attachRenameTarget, detachShouldClearName } from "../openspec/proposal-attach-naming.js";
-import { shutdownSession } from "./session-action-handler.js";
 import { stripNotifyLog } from "../session/memory-session-manager.js";
 import type { BrowserHandlerContext } from "./handler-context.js";
+import { shutdownSession } from "./session-action-handler.js";
 
 export function handleRenameSession(
   msg: Extract<BrowserToServerMessage, { type: "rename_session" }>,
@@ -102,8 +102,9 @@ export function decideArchiveAction(session: DashboardSession | undefined): Arch
  * idle-alive → register a one-shot intent, terminate the process, and archive
  * on the `ended` transition; running or `live:true` → error reply. Returns the
  * outcome so the REST route can mirror it; the WS path relies on the
- * `session_archived` / `archived_count_updated` broadcasts.
- * See change: archive-sessions-lazy-load.
+ * `session_archived` / `archived_count_updated` broadcasts for the state
+ * change and on `archive_result` (B1) for the ACK.
+ * See changes: archive-sessions-lazy-load, fix-archive-feedback-and-sidebar-perf.
  */
 export async function requestArchive(
   sessionId: string,
@@ -118,16 +119,16 @@ export async function requestArchive(
     | "pendingArchiveIntents"
     | "endSession"
   >,
-): Promise<{ ok: boolean; pending?: boolean; error?: string }> {
+): Promise<{ ok: boolean; pending?: boolean; error?: string; code?: ArchiveResultCode }> {
   const { sessionManager, sessionArchive, pendingArchiveIntents } = ctx;
-  if (!sessionArchive) return { ok: false, error: "archive unavailable" };
+  if (!sessionArchive) return { ok: false, error: "archive unavailable", code: "archive.unavailable" };
   const action = decideArchiveAction(sessionManager.get(sessionId));
-  if (action === "not-found") return { ok: false, error: "session not found" };
-  if (action === "reject-live") return { ok: false, error: "session is live (interrupted)" };
-  if (action === "reject-running") return { ok: false, error: "session is running" };
+  if (action === "not-found") return { ok: false, error: "session not found", code: "archive.not_found" };
+  if (action === "reject-live") return { ok: false, error: "session is live (interrupted)", code: "archive.reject_live" };
+  if (action === "reject-running") return { ok: false, error: "session is running", code: "archive.reject_running" };
   if (action === "archive") {
     const res = sessionArchive.archiveSession(sessionId, "manual");
-    return res.ok ? { ok: true } : { ok: false, error: res.error };
+    return res.ok ? { ok: true } : { ok: false, error: res.error, code: "archive.failed" };
   }
   // Alive idle: terminate the process, then archive on the ended transition.
   pendingArchiveIntents?.record(sessionId);
@@ -142,16 +143,31 @@ export async function requestArchive(
     });
   } catch (err) {
     pendingArchiveIntents?.clear(sessionId);
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    return { ok: false, error: err instanceof Error ? err.message : String(err), code: "archive.failed" };
   }
   return { ok: true, pending: true };
 }
 
+/**
+ * WS entry point: run `requestArchive` and ack the outcome on the requesting
+ * socket. The ack is the ONLY failure signal the WS path has — a rejection
+ * here (not-found / live / running / end-failure) previously vanished, so the
+ * card just stayed with no feedback. Success sends `{ok:true}` — within that
+ * frame the archive starts (ended case); for `pending` the archive lands on
+ * the `ended` transition and the `session_archived` broadcast owns the UI.
+ * `pending:true` is therefore a receipt for "file it when it ends", NOT a
+ * guarantee the archive already happened.
+ * See change: fix-archive-feedback-and-sidebar-perf (B1).
+ */
 export async function handleArchiveSession(
   msg: Extract<BrowserToServerMessage, { type: "archive_session" }>,
   ctx: BrowserHandlerContext,
 ): Promise<void> {
-  await requestArchive(msg.sessionId, ctx);
+  const res = await requestArchive(msg.sessionId, ctx);
+  const result: ArchiveResultBrowserMessage = res.ok
+    ? { type: "archive_result", sessionId: msg.sessionId, ok: true, ...(res.pending ? { pending: true } : {}) }
+    : { type: "archive_result", sessionId: msg.sessionId, ok: false, error: res.error, code: res.code };
+  ctx.sendTo(ctx.ws, result);
 }
 
 /**

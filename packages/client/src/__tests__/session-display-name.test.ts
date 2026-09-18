@@ -1,6 +1,6 @@
-import { describe, it, expect } from "vitest";
-import { getSessionDisplayName } from "../lib/session/session-display-name.js";
 import type { DashboardSession } from "@blackbelt-technology/pi-dashboard-shared/types.js";
+import { describe, expect, it } from "vitest";
+import { getSessionDisplayName } from "../lib/session/session-display-name.js";
 
 function makeSession(overrides: Partial<DashboardSession> = {}): DashboardSession {
   return {
@@ -48,9 +48,14 @@ describe("getSessionDisplayName", () => {
     expect(getSessionDisplayName(session)).toBe("My Name");
   });
 
-  it("should fall back to cwd last segment when neither name nor firstMessage", () => {
+  it("should fall back to cwd last segment + id suffix when neither name nor firstMessage", () => {
     const session = makeSession({});
-    expect(getSessionDisplayName(session)).toBe("my-project");
+    expect(getSessionDisplayName(session)).toBe("my-project · test-ses");
+  });
+
+  it("should not suffix a firstMessage-derived label", () => {
+    const session = makeSession({ firstMessage: "Help me fix the authentication module" });
+    expect(getSessionDisplayName(session)).toBe("Help me fix the authentication module");
   });
 
   it("should fall back to ID prefix when cwd has no segments", () => {
@@ -66,6 +71,6 @@ describe("getSessionDisplayName", () => {
 
   it("should ignore empty/whitespace-only firstMessage", () => {
     const session = makeSession({ name: undefined, firstMessage: "   " });
-    expect(getSessionDisplayName(session)).toBe("my-project");
+    expect(getSessionDisplayName(session)).toBe("my-project · test-ses");
   });
 });

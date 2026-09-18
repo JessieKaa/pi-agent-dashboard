@@ -117,6 +117,17 @@ export function frameClassOf(
     case "terminal_updated":
     case "terminal_removed":
       return { cls: "state", key: `terminal:${msg.terminalId}` };
+    case "session_archived":
+      // The client applies this as a local-only delete with no reconciliation,
+      // so a shed frame is unrecoverable — state-class keyed per session.
+      // See change: fix-archive-feedback-and-sidebar-perf (A2).
+      return { cls: "state", key: `session_archived:${msg.sessionId}` };
+    case "archive_result":
+      // The unicast ack carries the ONLY failure signal for a WS archive
+      // request (the REST path has a response body). A shed frame would make
+      // a rejected archive indistinguishable from a successful one.
+      // See change: fix-archive-feedback-and-sidebar-perf (B1).
+      return { cls: "state", key: `archive_result:${msg.sessionId}` };
     default:
       return { cls: "transcript", key: msg.type };
   }

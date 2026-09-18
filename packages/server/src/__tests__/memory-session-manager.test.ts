@@ -229,7 +229,126 @@ describe("memory-session-manager — snapshot byte bound (E18/P1, fixture rows)"
     // The window is not degenerate: both live and ended rows are present.
     expect(snap.sessions.filter((s) => s.status !== "ended")).toHaveLength(25);
     expect(snap.sessions.filter((s) => s.status === "ended").length).toBeGreaterThan(120);
-    expect(Object.keys(snap.endedTotals)).toHaveLength(400);
+    // C2 (fix-archive-feedback-and-sidebar-perf): the stub surface is now
+    // bounded — top-25 groups by recency + a session-count overflow, instead
+    // of one key per historical group.
+    expect(Object.keys(snap.endedTotals)).toHaveLength(25);
+    const listed = Object.values(snap.endedTotals).reduce((a, b) => a + b, 0);
+    expect(listed + (snap.endedTotalsOverflow ?? 0)).toBe(4_000);
+  });
+});
+
+// ── B2 group-key normalization — see change: fix-archive-feedback-and-sidebar-perf ──
+// `endedTotals` keys must live in the SAME folded (pathKey) space the client
+// reads: the snapshot reducer, the live endedTotals increments, and the
+// `sessions_page` request all arrive carrying a client-computed folded key.
+// A raw display-path key (trailing separator, `..`, doubled separators) would
+// never match, so the "N ended" count and the paging gate silently read 0.
+describe("memory-session-manager — endedTotals folded keys (B2)", () => {
+  it("folds cosmetic cwd variants into one group key", () => {
+    const sm = createMemorySessionManager();
+    sm.restore(endedRow("v1", "/a/b"));
+    sm.restore(endedRow("v2", "/a/b/"));
+    sm.restore(endedRow("v3", "/a/b/./"));
+
+    const snap = sm.buildSnapshot([]);
+    expect(snap.endedTotals).toEqual({ "/a/b": 3 });
+  });
+
+  it("keys a worktree group by its folded parent path, not the raw mainPath", () => {
+    const sm = createMemorySessionManager();
+    sm.restore(endedRow("w1", "/a/b/.worktrees/x", { gitWorktree: { mainPath: "/a/b/", name: "x" } }));
+
+    const snap = sm.buildSnapshot([]);
+    expect(snap.endedTotals).toEqual({ "/a/b": 1 });
+  });
+
+  it("a pinned key variant still pages (pinning worktree out of its parent)", () => {
+    const sm = createMemorySessionManager();
+    sm.restore(endedRow("w1", "/a/b/.worktrees/x", { gitWorktree: { mainPath: "/a/b", name: "x" } }));
+
+    // Grouped under the parent (unpinned).
+    expect(sm.buildSnapshot([]).endedTotals).toEqual({ "/a/b": 1 });
+    expect(sm.endedSequence("/a/b", [])).toEqual(["w1"]);
+
+    // Pinned (display-path variant) → its own folded group; the sequence
+    // answers under the folded pin key the client requests with.
+    expect(sm.buildSnapshot(["/a/b/.worktrees/x/"]).endedTotals).toEqual({ "/a/b/.worktrees/x": 1 });
+    expect(sm.endedSequence("/a/b/.worktrees/x", ["/a/b/.worktrees/x/"])).toEqual(["w1"]);
+  });
+});
+
+// ── C2 bounded stub surface — see change: fix-archive-feedback-and-sidebar-perf ──
+// `endedTotals` is the snapshot's stub-folder surface; per historical cwd it
+// grows without bound. The wire map is capped to the top-N groups by most
+// recent ended activity with the remainder folded into an overflow count —
+// the client renders the top rows plus one summary row. A capped-out group is
+// still fully pageable (`endedSequence` / `sessions_page` are not windowed).
+describe("memory-session-manager — endedTotals cap (C2)", () => {
+  it("caps the map to the top-N most recent groups and counts the rest", () => {
+    const sm = createMemorySessionManager();
+    // 30 groups × 2 ended, recency increasing with the group index.
+    for (let g = 0; g < 30; g++) {
+      for (let i = 0; i < 2; i++) {
+        sm.restore(endedRow(`g${g}-e${i}`, `/cap/g${g}`, { endedAt: 1_000 + g * 10 + i }));
+      }
+    }
+
+    const snap = sm.buildSnapshot([]);
+    const keys = Object.keys(snap.endedTotals);
+    expect(keys).toHaveLength(25);
+    // Top-25 by recency → g5..g29; the 5 oldest groups drop out.
+    for (let g = 5; g < 30; g++) {
+      expect(snap.endedTotals[`/cap/g${g}`], `/cap/g${g} present`).toBe(2);
+    }
+    for (let g = 0; g < 5; g++) {
+      expect(Object.prototype.hasOwnProperty.call(snap.endedTotals, `/cap/g${g}`)).toBe(false);
+    }
+    // 5 dropped groups × 2 ended each.
+    expect(snap.endedTotalsOverflow).toBe(10);
+    // Overflow counts SESSIONS, not groups: listed totals + overflow = all ended.
+    const listed = Object.values(snap.endedTotals).reduce((a, b) => a + b, 0);
+    expect(listed + (snap.endedTotalsOverflow ?? 0)).toBe(60);
+  });
+
+  it("omits the overflow field when nothing was capped", () => {
+    const sm = createMemorySessionManager();
+    sm.restore(endedRow("n1", "/small/a", { endedAt: 2_000 }));
+    sm.restore(endedRow("n2", "/small/b", { endedAt: 2_100 }));
+
+    const snap = sm.buildSnapshot([]);
+    expect(snap.endedTotals).toEqual({ "/small/a": 1, "/small/b": 1 });
+    expect(snap.endedTotalsOverflow).toBeUndefined();
+  });
+
+  it("a capped-out group is still pageable (sequence is not windowed)", () => {
+    const sm = createMemorySessionManager();
+    for (let g = 0; g < 30; g++) {
+      for (let i = 0; i < 2; i++) {
+        sm.restore(endedRow(`p${g}-e${i}`, `/cap2/g${g}`, { endedAt: 1_000 + g * 10 + i }));
+      }
+    }
+    // Newer filler everywhere → the oldest group's rows are outside the
+    // snapshot window entirely (stub case), like the client's cold load.
+    seedGlobalWindowFiller(sm, 1_400, 200);
+
+    const snap = sm.buildSnapshot([]);
+    expect(Object.keys(snap.endedTotals)).toHaveLength(25);
+    expect(Object.values(snap.endedTotals).reduce((a, b) => a + b, 0) + (snap.endedTotalsOverflow ?? 0)).toBe(260);
+    // The oldest group is out of the cap — its full sequence still answers.
+    expect(sm.endedSequence("/cap2/g0", [])).toEqual(["p0-e0", "p0-e1"]);
+  });
+
+  it("recency is max endedAt per group (per-group ordering, not global interleave)", () => {
+    const sm = createMemorySessionManager();
+    sm.restore(endedRow("hot-old", "/cap3/hot", { endedAt: 1_000 }));
+    sm.restore(endedRow("hot-new", "/cap3/hot", { endedAt: 9_000 }));
+    sm.restore(endedRow("cold", "/cap3/cold", { endedAt: 2_000 }));
+
+    const snap = sm.buildSnapshot([]);
+    expect(snap.endedTotals["/cap3/hot"]).toBe(2);
+    expect(snap.endedTotals["/cap3/cold"]).toBe(1);
+    expect(snap.endedTotalsOverflow).toBeUndefined();
   });
 });
 

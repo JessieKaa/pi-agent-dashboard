@@ -303,4 +303,30 @@ describe("SessionList — include-archive search chip (archive-sessions-lazy-loa
     expect(screen.getByTestId("search-include-archive").getAttribute("aria-pressed")).toBe("true");
     second.unmount();
   });
+
+  it("B2: archived matches file under the FOLDED group key (cosmetic variant)", async () => {
+    // The server stamps `groupPath` in the folded key space (change:
+    // fix-archive-feedback-and-sidebar-perf). A cosmetic variant — trailing
+    // separator — must still land under the group's folded `cwd`, not render
+    // an orphaned `Archive matches` section.
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = archiveFetch([archivedItem("a1", "/home/user/project/")]);
+      vi.stubGlobal("fetch", fetchImpl);
+      renderList([makeSession({ name: "Live session" })]);
+
+      fireEvent.click(screen.getByTestId("search-include-archive"));
+      fireEvent.change(screen.getByTestId("session-search-input"), { target: { value: "allow" } });
+      await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+
+      expect(
+        screen.getByTestId("archive-matches-/home/user/project"),
+        "archived row filed under the folded group key",
+      ).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
 });

@@ -13,8 +13,8 @@ import { readSessionMeta, writeSessionMeta } from "@blackbelt-technology/pi-dash
 import type { DashboardSession } from "@blackbelt-technology/pi-dashboard-shared/types.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { decideArchiveAction, requestArchive } from "../browser-handlers/session-meta-handler.js";
-import { createMetaPersistence } from "../persistence/meta-persistence.js";
 import { createPendingArchiveIntentRegistry } from "../pending/pending-archive-intent-registry.js";
+import { createMetaPersistence } from "../persistence/meta-persistence.js";
 import { createMemorySessionManager } from "../session/memory-session-manager.js";
 import { createSessionArchive } from "../session/session-archive.js";
 
@@ -130,6 +130,37 @@ describe("archiveSession (E4, X1)", () => {
   });
 });
 
+describe("archive index rows carry the folded group key (B2)", () => {
+  // See change: fix-archive-feedback-and-sidebar-perf. `row.groupPath` is the
+  // key the client files the archive fold and the include-archive search
+  // matches under, so it must equal the FOLDED key the index map and
+  // `archivedCountByCwd` use — not the raw display spelling.
+  it("folds a cosmetic cwd variant on archive", () => {
+    const { manager, archive } = makeRig();
+    seedSession(manager, { cwd: "/repo/" });
+
+    expect(archive.archiveSession("s1", "manual").ok).toBe(true);
+    expect(archive.countsByKey()).toEqual({ "/repo": 1 });
+    expect(archive.getById("s1")?.groupPath).toBe("/repo");
+  });
+
+  it("folds the seed/rebuild path too", () => {
+    const { archive, events } = makeRig();
+    archive.seed([
+      { id: "s1", name: "S1", cwd: "/repo/", groupPath: "/repo/", endedAt: 2000, archivedAt: 2100, sessionFile: "" },
+    ]);
+
+    expect(archive.countsByKey()).toEqual({ "/repo": 1 });
+    expect(archive.rows()[0]?.groupPath).toBe("/repo");
+
+    // Pinning a display variant re-keys through the same folded space — no
+    // count churn for a cosmetic re-spelling.
+    archive.rekey();
+    expect(archive.countsByKey()).toEqual({ "/repo": 1 });
+    expect(events).toEqual([]);
+  });
+});
+
 describe("unarchiveSession (E8, E9)", () => {
   it("restores a migrated (hidden) session as visible ended + broadcasts", () => {
     const { manager, archive, events } = makeRig();
@@ -224,5 +255,42 @@ describe("idle-alive archive request (X3)", () => {
     expect(intents.size()).toBe(0);
     expect(archive.has("s1")).toBe(false);
     expect(events).toEqual([]);
+  });
+
+  // B1 — the REST route maps `code` to its HTTP status; the WS ack carries it
+  // verbatim. Every rejection is classifiable so the client can translate.
+  // See change: fix-archive-feedback-and-sidebar-perf.
+  it("classifies every outcome with a stable code (B1)", async () => {
+    const { manager, archive, intents } = makeRig();
+    // Minimal context every eligibility branch ignores beyond the manager.
+    const base = {
+      sessionManager: manager,
+      sessionArchive: archive,
+      pendingArchiveIntents: intents,
+      broadcast: () => {},
+      piGateway: { sendToSession: () => {} } as never,
+      headlessPidRegistry: { killBySessionId: async () => {} } as never,
+    };
+
+    expect(await requestArchive("ghost", base)).toMatchObject({ ok: false, code: "archive.not_found" });
+
+    seedSession(manager, { live: true });
+    expect(await requestArchive("s1", base)).toMatchObject({ ok: false, code: "archive.reject_live" });
+    manager.remove("s1");
+
+    seedSession(manager, { status: "streaming", endedAt: undefined });
+    expect(await requestArchive("s1", base)).toMatchObject({ ok: false, code: "archive.reject_running" });
+    manager.remove("s1");
+
+    // `archive.unavailable`: no index wired.
+    expect(await requestArchive("s1", { ...base, sessionArchive: undefined }))
+      .toMatchObject({ ok: false, code: "archive.unavailable" });
+
+    // `archive.failed`: end-failure on the idle-alive path.
+    seedSession(manager, { status: "idle", endedAt: undefined });
+    expect(await requestArchive("s1", {
+      ...base,
+      endSession: async () => { throw new Error("end failed"); },
+    })).toMatchObject({ ok: false, code: "archive.failed" });
   });
 });

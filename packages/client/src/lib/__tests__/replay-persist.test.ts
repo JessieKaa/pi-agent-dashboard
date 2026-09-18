@@ -304,6 +304,96 @@ describe("replay-persist", () => {
     expect(put).not.toHaveBeenCalled();
   });
 
+  // --- Buffer lifetime bound (change: fix-archive-feedback-and-sidebar-perf C3) ---
+
+  it("trims the buffer to the tail bound after a successful flush", async () => {
+    const cache = createReplayCache({ factory });
+    const p = createReplayPersister(cache, 0, () => KEY, 50);
+    const events = Array.from({ length: 100 }, (_, i) => evt(i + 1));
+    p.seed("s1", events);
+    await p.flush("s1");
+
+    // Persisted payload is the TAIL: the cursor (maxSeq) is what a reload
+    // resumes from, and the reduced state re-derived from a fresh-load-sized
+    // tail matches the cache-miss experience.
+    const hit = await cache.get("s1", KEY);
+    expect(hit?.maxSeq).toBe(100);
+    expect(hit?.payload.map((e) => e.seq)).toEqual(
+      Array.from({ length: 50 }, (_, i) => i + 51),
+    );
+  });
+
+  it("keeps appending after a trim with dedup and contiguity intact", async () => {
+    const cache = createReplayCache({ factory });
+    const p = createReplayPersister(cache, 0, () => KEY, 50);
+    p.seed("s1", Array.from({ length: 100 }, (_, i) => evt(i + 1)));
+    await p.flush("s1");
+
+    p.record("s1", [evt(101), evt(102)], "live");
+    await p.flush("s1");
+    const hit = await cache.get("s1", KEY);
+    expect(hit?.maxSeq).toBe(102);
+    expect(hit?.payload.map((e) => e.seq)).toEqual(
+      Array.from({ length: 50 }, (_, i) => i + 53),
+    );
+  });
+
+  it("a never-descended session schedules no flush work (test-plan C3)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { cache, put } = spyCache(createReplayCache({ factory }));
+      const p = createReplayPersister(cache, 50, () => KEY);
+      // Live broadcast only — the buffer can never be persisted, so the
+      // debounce is pure waste. (The client now unsubscribes sessions it is
+      // not viewing; this bounds the stragglers between deselect and stop.)
+      p.record("X", [evt(1)], "live");
+      expect(vi.getTimerCount()).toBe(0);
+
+      // A descended session (this tab's own replay) schedules as before.
+      p.record("Y", [evt(1), evt(2)], "replay");
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(put).toHaveBeenCalledTimes(1);
+      expect(put.mock.calls[0]?.[0]).toBe("Y");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an append during a pending flush survives the post-flush trim", async () => {
+    const inner = createReplayCache({ factory });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const cache: ReplayCache = {
+      get: inner.get,
+      delete: inner.delete,
+      put: async (id, entry, key) => {
+        await gate;
+        return inner.put(id, entry, key);
+      },
+    };
+    const p = createReplayPersister(cache, 60_000, () => KEY, 50);
+    p.seed("s1", Array.from({ length: 100 }, (_, i) => evt(i + 1)));
+
+    const flushP = p.flush("s1"); // the write is now in flight
+    p.record("s1", [evt(101)], "live"); // a live frame lands during the await
+    release();
+    await flushP;
+
+    // Were 101 dropped by the trim, the NEXT live frame (102) would read as a
+    // dropped-frame gap (buffered max 100 → 102) and void provenance for the
+    // session until a reseed — the contamination failure this module exists
+    // to prevent.
+    p.record("s1", [evt(102)], "live");
+    await p.flush("s1");
+    const hit = await cache.get("s1", KEY);
+    expect(hit?.maxSeq).toBe(102);
+    expect(hit?.payload[hit.payload.length - 1]?.seq).toBe(102);
+    p.resetBuffers(); // drop the 60 s debounce timer
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
   });

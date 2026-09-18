@@ -18,6 +18,15 @@ import { resolveOrderKey } from "./resolve-order-key.js";
  */
 const SNAPSHOT_ENDED_GLOBAL = 120;
 const SNAPSHOT_ENDED_PER_GROUP = 3;
+/**
+ * `endedTotals` cap (C2): groups kept in the snapshot's stub surface, ranked
+ * by most recent ended activity (`max endedSortKey` per group). The remainder
+ * is reported only as a session count in `endedTotalsOverflow` — the client
+ * batches those stub rows behind one summary row. Capped-out groups stay
+ * fully pageable: `endedSequence` and `sessions_page` are not windowed.
+ * See change: fix-archive-feedback-and-sidebar-perf.
+ */
+const SNAPSHOT_ENDED_TOTALS_GROUPS = 25;
 
 /**
  * Persisted-order read surface the snapshot window needs. Structural subset
@@ -46,8 +55,18 @@ export interface SnapshotResult {
   sessions: DashboardSession[];
   /** groupKey → persisted order filtered to the window (non-empty entries only). */
   orders: Record<string, string[]>;
-  /** groupKey → ended count regardless of window, for every group with ≥1 ended. */
+  /**
+   * groupKey → ended count, capped to the top `SNAPSHOT_ENDED_TOTALS_GROUPS`
+   * groups by most recent ended activity. Capped-out groups carry no entry;
+   * their session count lands in `endedTotalsOverflow`.
+   * See change: fix-archive-feedback-and-sidebar-perf (C2).
+   */
   endedTotals: Record<string, number>;
+  /**
+   * Total ended sessions in groups NOT present in `endedTotals` (0-group →
+   * field omitted). See change: fix-archive-feedback-and-sidebar-perf (C2).
+   */
+  endedTotalsOverflow?: number;
 }
 
 /**
@@ -221,9 +240,18 @@ export function createMemorySessionManager(
 
   // ── Snapshot window (D4) — see change: fix-connect-snapshot-frame-loss ──
 
-  /** Group key the sidebar groups/orders by (pin > worktree mainPath > cwd). */
+  /**
+   * FOLDED group key the sidebar groups/orders by. `resolveOrderKey` returns
+   * the raw display spelling (pin > worktree mainPath > cwd); `pathKey`
+   * collapses cosmetic drift into the exact key space the client computes
+   * (its group-map keys and `endedTotals`/`sessions_page` lookups are folded).
+   * Every keyed surface below — the per-group window, `endedSequence` and the
+   * `endedTotals` wire keys — lives in this one space, so a trailing
+   * separator or `..` segment can never split a folder's count.
+   * See change: fix-archive-feedback-and-sidebar-perf (B2).
+   */
   const groupKeyOf = (s: DashboardSession, pinned: readonly string[]): string =>
-    resolveOrderKey(s, pinned);
+    pathKey(resolveOrderKey(s, pinned), process.platform);
 
   /** Global-window sort key: `endedAt ?? lastActivityAt ?? startedAt` (startedAt is always set). */
   const endedSortKey = (s: DashboardSession): number => s.endedAt ?? s.lastActivityAt ?? s.startedAt;
@@ -293,13 +321,37 @@ export function createMemorySessionManager(
       const filtered = ids.filter((id) => visible.has(id));
       if (filtered.length > 0) windowedOrders[g] = filtered;
     }
-    const endedTotals: Record<string, number> = {};
+    // Bounded stub surface (C2): counts per group, then keep only the top
+    // SNAPSHOT_ENDED_TOTALS_GROUPS by newest ended activity and fold the rest
+    // into one session-count overflow field. Paging (`endedSequence` /
+    // `sessions_page`) is untouched, so a capped-out group stays reachable.
+    const totalsByGroup = new Map<string, { count: number; recency: number }>();
     for (const s of sessions.values()) {
       if (s.status !== "ended") continue;
       const g = groupKeyOf(s, pinned);
-      endedTotals[g] = (endedTotals[g] ?? 0) + 1;
+      const entry = totalsByGroup.get(g);
+      if (entry) {
+        entry.count += 1;
+        entry.recency = Math.max(entry.recency, endedSortKey(s));
+      } else {
+        totalsByGroup.set(g, { count: 1, recency: endedSortKey(s) });
+      }
     }
-    return { sessions: rows, orders: windowedOrders, endedTotals };
+    const rankedGroups = [...totalsByGroup.entries()].sort((a, b) => b[1].recency - a[1].recency);
+    const endedTotals: Record<string, number> = {};
+    let endedTotalsOverflow = 0;
+    for (const [g, { count }] of rankedGroups.slice(0, SNAPSHOT_ENDED_TOTALS_GROUPS)) {
+      endedTotals[g] = count;
+    }
+    for (const [, { count }] of rankedGroups.slice(SNAPSHOT_ENDED_TOTALS_GROUPS)) {
+      endedTotalsOverflow += count;
+    }
+    return {
+      sessions: rows,
+      orders: windowedOrders,
+      endedTotals,
+      ...(endedTotalsOverflow > 0 ? { endedTotalsOverflow } : {}),
+    };
   }
 
   const mgr: SessionManager = {

@@ -1,6 +1,6 @@
-import React from "react";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import React from "react";
 
 interface Props {
   id: string;
@@ -8,16 +8,29 @@ interface Props {
 }
 
 /**
- * Context channel that hands the dnd-kit drag handle props (attributes +
- * listeners) from `SortableSessionCard` to a descendant `SessionCard`. Using
- * context (instead of cloneElement) lets `SortableSessionCard` accept
- * arbitrary children (e.g. a SessionCard plus a resume-error banner sibling)
- * without needing to traverse and identify the SessionCard.
+ * Ref-stable channel for the dnd-kit drag handle props (attributes +
+ * listeners). `useSortable` returns a NEW `listeners` object on every call, so
+ * a plain context value would change identity on every sidebar render — and a
+ * context value change re-renders ALL consumers, straight through the
+ * `React.memo` boundary on `SessionCard` (memo cannot skip context-driven
+ * renders). The box object here never changes identity; SortableSessionCard
+ * refreshes its `.current` in place each render, and the card reads the latest
+ * value at its own render time (bottom-anchored reads: the wrapper renders
+ * first in the same pass). Skipped cards keep the previous DOM props — safe
+ * because the listener closures read live dnd state (registered nodes, latest
+ * sensor config) at activation, and `attributes` is identity-stable per id.
+ * Using a box (instead of cloneElement) also lets `SortableSessionCard` accept
+ * arbitrary children (e.g. a SessionCard plus a resume-error banner sibling).
+ * See change: fix-archive-feedback-and-sidebar-perf (C1).
  */
-const DragHandleCtx = React.createContext<React.HTMLAttributes<HTMLDivElement> | null>(null);
+interface DragHandleBox {
+  current: React.HTMLAttributes<HTMLDivElement> | null;
+}
+
+const DragHandleCtx = React.createContext<DragHandleBox | null>(null);
 
 export function useSessionCardDragHandle() {
-  return React.useContext(DragHandleCtx);
+  return React.useContext(DragHandleCtx)?.current ?? null;
 }
 
 /**
@@ -48,9 +61,15 @@ export function SortableSessionCard({ id, children }: Props) {
     [attributes, listeners],
   );
 
+  // Single identity-stable box per card (see DragHandleCtx). Refresh the value
+  // in place — the object identity never changes, so consumers' memo
+  // boundaries survive dnd's per-render `listeners` churn.
+  const dragHandleBoxRef = React.useRef<DragHandleBox>({ current: null });
+  dragHandleBoxRef.current.current = dragHandleProps;
+
   return (
     <div ref={setNodeRef} style={style}>
-      <DragHandleCtx.Provider value={dragHandleProps}>{children}</DragHandleCtx.Provider>
+      <DragHandleCtx.Provider value={dragHandleBoxRef.current}>{children}</DragHandleCtx.Provider>
     </div>
   );
 }

@@ -22,6 +22,7 @@
  */
 import { cleanup, configure } from "@testing-library/react";
 import { afterEach, vi } from "vitest";
+import { __resetInitStatusCache } from "../lib/git/init-status-cache.js";
 
 // Global RTL cleanup: unmount every rendered tree after each test so React's
 // concurrent scheduler can't flush work AFTER the vitest fork's jsdom teardown
@@ -68,6 +69,11 @@ afterEach(async () => {
   const needsDrain = drainPending;
   cleanup();
   drainPending = false;
+  // Each test is a fresh "page load" for module-level caches: useInitStatus's
+  // init-status cache would otherwise serve a previous test's mocked answer
+  // (or suppress its fetch assertions) inside a shared worker.
+  // See change: fix-archive-feedback-and-sidebar-perf (A5).
+  __resetInitStatusCache();
   if (vi.isFakeTimers() || !needsDrain) return;
   await new Promise((resolve) => setTimeout(resolve, 160));
 });

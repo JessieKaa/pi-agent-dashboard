@@ -7,8 +7,9 @@
  *  - proves the drop is now COUNTED per-session + rate-limited-LOGGED (3.4)
  *  - proves the counters are surfaced via `getDroppedFrameStats()` (3.3/3.4)
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 import type { ServerToBrowserMessage } from "@blackbelt-technology/pi-dashboard-shared/browser-protocol.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createBrowserGateway, frameClassOf } from "../pairing/browser-gateway.js";
 import { createMemoryEventStore } from "../persistence/memory-event-store.js";
 import { createMemorySessionManager } from "../session/memory-session-manager.js";
@@ -154,6 +155,32 @@ describe("frameClassOf — static class per message type (E1)", () => {
     expect(frameClassOf(asMsg({ type: "session_updated", sessionId: "s", updates: {} }))).toEqual({ cls: "transcript", key: "session_updated" });
     expect(frameClassOf(asMsg({ type: "sessions_reordered", cwd: "/a", sessionIds: [] }))).toEqual({ cls: "transcript", key: "sessions_reordered" });
     expect(frameClassOf(asMsg({ type: "event", sessionId: "s", seq: 1, event: {} }))).toEqual({ cls: "transcript", key: "event" });
+  });
+
+  it("session_archived is state-class, keyed per session (A2)", () => {
+    // A shed session_archived is unrecoverable for the client (local-only
+    // delete, no reconciliation), so it must coalesce instead of dropping.
+    // See change: fix-archive-feedback-and-sidebar-perf (A2).
+    expect(frameClassOf(asMsg({ type: "session_archived", sessionId: "s1" }))).toEqual({
+      cls: "state",
+      key: "session_archived:s1",
+    });
+    expect(
+      frameClassOf(asMsg({ type: "session_archived", sessionId: "s1" })).key,
+    ).not.toBe(frameClassOf(asMsg({ type: "session_archived", sessionId: "s2" })).key);
+  });
+
+  it("archive_result is state-class, keyed per session (B1)", () => {
+    // The ack is the ONLY failure signal for a WS archive request — a shed
+    // frame would make a rejection look like success. Latest-wins per session.
+    // See change: fix-archive-feedback-and-sidebar-perf (B1).
+    expect(frameClassOf(asMsg({ type: "archive_result", sessionId: "s1", ok: false, error: "x" }))).toEqual({
+      cls: "state",
+      key: "archive_result:s1",
+    });
+    expect(
+      frameClassOf(asMsg({ type: "archive_result", sessionId: "s1", ok: true })).key,
+    ).not.toBe(frameClassOf(asMsg({ type: "archive_result", sessionId: "s2", ok: true })).key);
   });
 });
 
