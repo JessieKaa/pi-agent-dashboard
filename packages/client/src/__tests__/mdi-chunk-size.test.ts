@@ -17,6 +17,12 @@ import { describe, expect, it } from "vitest";
 // icon set: present in the `mdi` chunk, absent from the entry chunk.
 const MDI_MARKER = "mdiZodiacAquarius";
 const INDEX_GZ_CAP_BYTES = 900 * 1024;
+// The mdi chunk must hold only the named icons actually imported (~180 after
+// the namespace-import removal; ~30 KB gz). A re-added `import * as mdi`
+// re-inflates it to the full ~785 KB gz set WITHOUT tripping the entry-marker
+// assertion, so this cap is the real tree-shaking tripwire. See change:
+// trim-cold-start-transfer-and-config-fanout (②).
+const MDI_GZ_CAP_BYTES = 100 * 1024;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.resolve(here, "../../dist");
@@ -55,5 +61,19 @@ describe("@mdi/js is split out of the eager index entry chunk (test-plan #S1)", 
       gzipped,
       `index entry chunk ${kb} KB gzipped exceeds the ${INDEX_GZ_CAP_BYTES / 1024} KB cap`,
     ).toBeLessThanOrEqual(INDEX_GZ_CAP_BYTES);
+  });
+
+  it("keeps the mdi chunks tree-shaken (no namespace-import regression)", () => {
+    if (!existsSync(assetsDir)) return; // no build output — CI builds first
+    const mdiChunks = readdirSync(assetsDir).filter((f) => /^mdi-/.test(f) && f.endsWith(".js"));
+    let gzipped = 0;
+    for (const file of mdiChunks) {
+      gzipped += gzipSync(readFileSync(path.join(assetsDir, file))).length;
+    }
+    const kb = (gzipped / 1024).toFixed(0);
+    expect(
+      gzipped,
+      `mdi chunk(s) ${kb} KB gzipped exceed the ${MDI_GZ_CAP_BYTES / 1024} KB tree-shaking cap — a namespace import of @mdi/js is back`,
+    ).toBeLessThanOrEqual(MDI_GZ_CAP_BYTES);
   });
 });

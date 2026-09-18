@@ -95,7 +95,7 @@ function indexOf(container: HTMLElement, target: Element | null): number {
 }
 
 describe("Task 6.1: ask_user blocking flow — text bubble appears above question", () => {
-  it("assistant text DOM index < interactiveUi DOM index during the blocking window", () => {
+  it("assistant text DOM index < interactiveUi DOM index during the blocking window", async () => {
     let state = applyEvents([
       asstStart(100),
       textDelta(101, "I'll ask you which path:"),
@@ -110,11 +110,16 @@ describe("Task 6.1: ask_user blocking flow — text bubble appears above questio
     );
     // Note: NO message_end. Question dialog is open while user thinks.
 
-    const { container } = render(
+    const { container, findByText } = render(
       <ThemeProvider>
         <ChatView state={state} toolContext={defaultToolContext} />
       </ThemeProvider>,
     );
+    // Both the text bubble and the question render through lazy boundaries →
+    // await each before measuring DOM order. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    await findByText("I'll ask you which path:");
+    await findByText("pick");
 
     // Find the assistant text bubble by its content.
     const allElements = Array.from(container.querySelectorAll("*"));
@@ -140,7 +145,7 @@ describe("Task 6.1: ask_user blocking flow — text bubble appears above questio
 });
 
 describe("Task 6.1a: long-running bash — text bubble appears above running tool card", () => {
-  it("assistant text DOM index < running tool card DOM index, no streaming bubble", () => {
+  it("assistant text DOM index < running tool card DOM index, no streaming bubble", async () => {
     let state = applyEvents([
       asstStart(100),
       textDelta(101, "All 63 tests pass. Run full test suite as final guard:"),
@@ -151,11 +156,14 @@ describe("Task 6.1a: long-running bash — text bubble appears above running too
       state = reduceEvent(state, toolUpdate(102 + i, "t1", `chunk #${i}`));
     }
 
-    const { container } = render(
+    const { container, findByText } = render(
       <ThemeProvider>
         <ChatView state={state} toolContext={defaultToolContext} />
       </ThemeProvider>,
     );
+    // The text bubble renders through the lazy markdown boundary → async.
+    // See change: trim-cold-start-transfer-and-config-fanout (③).
+    await findByText("All 63 tests pass. Run full test suite as final guard:");
 
     const allElements = Array.from(container.querySelectorAll("*"));
     const textBubble = allElements.find((el) =>

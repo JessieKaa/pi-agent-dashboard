@@ -2,7 +2,7 @@ import { mdiAlertCircle, mdiCheckboxMarkedOutline, mdiCheckCircle, mdiCommentQue
 import { Icon } from "@mdi/react";
 import type React from "react";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 import type { ToolRendererProps } from "./types.js";
 
 const methodIcons: Record<string, string> = {
@@ -86,7 +86,7 @@ function AskUserBatchRenderer({ args, result, toolDetails }: ToolRendererProps) 
 
       {title && (
         <div className="text-xs text-[var(--text-primary)]">
-          <MarkdownContent content={title} />
+          <LazyMarkdownContent content={title} />
         </div>
       )}
 
@@ -173,14 +173,14 @@ export function AskUserToolRenderer(props: ToolRendererProps) {
       {/* Question title */}
       {title && (
         <div className="text-xs text-[var(--text-primary)]">
-          <MarkdownContent content={title} />
+          <LazyMarkdownContent content={title} />
         </div>
       )}
 
       {/* Message body (if different from title) */}
       {message && message !== title && (
         <div className="text-xs text-[var(--text-secondary)]">
-          <MarkdownContent content={message} />
+          <LazyMarkdownContent content={message} />
         </div>
       )}
 

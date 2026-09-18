@@ -3,7 +3,7 @@ import { mdiCheckCircle, mdiFormTextbox, mdiImageMultiple } from "@mdi/js";
 import { Icon } from "@mdi/react";
 import React, { useState } from "react";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 import { InlineMarkdown } from "./InlineMarkdown.js";
 import { InputComposer } from "./InputComposer.js";
 import type { InteractiveRendererProps } from "./types.js";
@@ -39,7 +39,7 @@ export function InputRenderer({ params, status, result, onRespond, onCancel }: I
           <span className="text-[var(--text-primary)] font-medium"><InlineMarkdown content={title} /></span>
         </div>
         {message && (
-          <div className="text-xs text-[var(--text-secondary)] mb-2 ml-6"><MarkdownContent content={message} /></div>
+          <div className="text-xs text-[var(--text-secondary)] mb-2 ml-6"><LazyMarkdownContent content={message} /></div>
         )}
         <div
           className={
@@ -67,7 +67,7 @@ export function InputRenderer({ params, status, result, onRespond, onCancel }: I
         <span className="text-sm font-medium text-[var(--text-primary)]"><InlineMarkdown content={title} /></span>
       </div>
       {message && (
-        <div className="text-xs text-[var(--text-secondary)] mb-3 ml-6"><MarkdownContent content={message} /></div>
+        <div className="text-xs text-[var(--text-secondary)] mb-3 ml-6"><LazyMarkdownContent content={message} /></div>
       )}
       <div className="ml-6">
         <InputComposer

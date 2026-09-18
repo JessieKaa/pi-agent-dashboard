@@ -25,7 +25,7 @@ import { isExternalHref } from "./is-external-href.js";
 import { MermaidBlock } from "./MermaidBlock.js";
 import { type ImageBase, resolveLocalImageSrc } from "./resolve-local-image-src.js";
 
-interface Props {
+export interface Props {
   content: string;
   /**
    * When provided, inline prose text and inline-`code` spans are run through

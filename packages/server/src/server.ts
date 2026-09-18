@@ -2082,10 +2082,17 @@ export async function createServer(config: ServerConfig, options?: CreateServerO
       // stream-reset as ERR_ABORTED 500 in browsers.
       preCompressed: true,
       // @fastify/static v10 hands `setHeaders` a FastifyReply (v8 passed the
-      // raw ServerResponse), so the header goes through `.header()`.
+      // raw ServerResponse), so the header goes through `.header()`. Runs
+      // before the preCompressed body switch (v10 index.js), so the decision
+      // sees the logical path and covers `.gz`-served responses too.
       setHeaders: (reply, filePath) => {
         if (filePath.endsWith(".html")) {
           reply.header("Cache-Control", "no-cache, no-store, must-revalidate");
+        } else if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+          // Vite content-hashes everything under assets/; the same URL can
+          // never change contents, so revalidation is pure waste on reload.
+          // See change: trim-cold-start-transfer-and-config-fanout (①).
+          reply.header("Cache-Control", "public, max-age=31536000, immutable");
         }
       },
     });

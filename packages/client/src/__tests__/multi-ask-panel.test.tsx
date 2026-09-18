@@ -15,7 +15,7 @@
  *
  * See change: surface-concurrent-ask-user-prompts, harden-multi-ask-panel.
  */
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MultiAskPanel } from "../components/chat/MultiAskPanel.js";
 import { ThemeProvider } from "../components/settings/ThemeProvider.js";
@@ -40,6 +40,15 @@ beforeEach(() => {
 
 function renderPanel(ui: React.ReactElement) {
   return render(<ThemeProvider>{ui}</ThemeProvider>);
+}
+
+// Cards sit behind the LazyInteractiveRenderer boundary → the ConfirmRenderer
+// buttons resolve asynchronously. See change:
+// trim-cold-start-transfer-and-config-fanout (③).
+function firstCardButton(card: HTMLElement, selector = "button"): Element {
+  const el = card.querySelector(selector);
+  if (!el) throw new Error(`no ${selector} in card yet (lazy renderer not resolved)`);
+  return el;
 }
 
 function confirmReq(id: string, title: string, message: string): InteractiveUiRequest {
@@ -76,7 +85,7 @@ describe("MultiAskPanel — grouped concurrent asks", () => {
     expect(getAllByTestId(/^multi-ask-card-/)).toHaveLength(2);
   });
 
-  it("C2 answering a card resolves its own requestId only", () => {
+  it("C2 answering a card resolves its own requestId only", async () => {
     const onRespond = vi.fn();
     const { getByTestId } = renderPanel(
       <MultiAskPanel
@@ -85,15 +94,15 @@ describe("MultiAskPanel — grouped concurrent asks", () => {
       />,
     );
     const p2Card = getByTestId("multi-ask-card-p2");
-    const yes = p2Card.querySelector("button")!;
-    fireEvent.click(yes);
+    await waitFor(() => firstCardButton(p2Card));
+    fireEvent.click(p2Card.querySelector("button")!);
     expect(onRespond).toHaveBeenCalledTimes(1);
     expect(onRespond.mock.calls[0][0]).toBe("p2");
     // Covers test-plan #F4 (harden-multi-ask-panel): answering one card
     // resolves only its own id.
   });
 
-  it("C2b cancelling a card resolves its own requestId with cancelled=true only", () => {
+  it("C2b cancelling a card resolves its own requestId with cancelled=true only", async () => {
     const onRespond = vi.fn();
     const { getByTestId } = renderPanel(
       <MultiAskPanel
@@ -101,8 +110,11 @@ describe("MultiAskPanel — grouped concurrent asks", () => {
         onRespondToUi={onRespond}
       />,
     );
-    // ConfirmRenderer buttons: [Yes, No, Cancel] — Cancel is the third.
-    const p2Buttons = getByTestId("multi-ask-card-p2").querySelectorAll("button");
+    const p2Card = getByTestId("multi-ask-card-p2");
+    // ConfirmRenderer buttons: [Yes, No, Cancel] — Cancel is the third; the
+    // card body (and its buttons) mount once the lazy boundary resolves.
+    await waitFor(() => expect(p2Card.querySelectorAll("button").length).toBe(3));
+    const p2Buttons = p2Card.querySelectorAll("button");
     fireEvent.click(p2Buttons[p2Buttons.length - 1]);
     expect(onRespond).toHaveBeenCalledTimes(1);
     expect(onRespond.mock.calls[0]).toEqual(["p2", undefined, true]);
@@ -134,21 +146,22 @@ describe("MultiAskPanel — grouped concurrent asks", () => {
     expect(queryByTestId("multi-ask-panel")).toBeNull();
   });
 
-  it("C6 a batch entry renders as its wizard alongside a confirm card", () => {
+  it("C6 a batch entry renders as its wizard alongside a confirm card", async () => {
     const batch: InteractiveUiRequest = {
       requestId: "pb",
       method: "batch",
       params: { title: "Batch", questions: [{ type: "confirm", question: "Go?" }] },
       status: "pending",
     };
-    const { getByTestId, getByText } = renderPanel(
+    const { getByTestId, findByText } = renderPanel(
       <MultiAskPanel requests={[batch, confirmReq("p1", "Plain", "A")]} onRespondToUi={vi.fn()} />,
     );
     // Batch wizard slot + plain confirm slot coexist.
     expect(getByTestId("multi-ask-card-pb")).toBeTruthy();
     expect(getByTestId("multi-ask-card-p1")).toBeTruthy();
-    // BatchRenderer shows its stepper header ("Question 1 of 1").
-    expect(getByText(/Question 1 of 1/)).toBeTruthy();
+    // BatchRenderer shows its stepper header ("Question 1 of 1") — async,
+    // behind the lazy interactive boundary.
+    expect(await findByText(/Question 1 of 1/)).toBeTruthy();
   });
 
   // Covers test-plan #E6 (harden-multi-ask-panel): the n=1 always-panel
@@ -178,11 +191,14 @@ describe("MultiAskPanel — grouped concurrent asks", () => {
   // respect to the pending set — a sibling arrival must NOT remount the card,
   // which would discard the typed value. Falsifies any future "panel only
   // when 2+" grouping rule.
-  it("F3 a sibling ask arriving does not remount the incumbent card", () => {
+  it("F3 a sibling ask arriving does not remount the incumbent card", async () => {
     const { rerender, getByTestId } = renderPanel(
       <MultiAskPanel requests={[inputReq("p1", "Your name?")]} onRespondToUi={vi.fn()} />,
     );
     const typeInto = () => getByTestId("multi-ask-card-p1").querySelector("textarea")!;
+    await waitFor(() => {
+      expect(typeInto()).toBeTruthy();
+    });
     fireEvent.change(typeInto(), { target: { value: "hello" } });
     rerender(
       <ThemeProvider>

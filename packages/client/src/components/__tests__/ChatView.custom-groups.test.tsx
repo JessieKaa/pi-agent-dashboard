@@ -94,17 +94,20 @@ function bodyText(container: HTMLElement): string {
 }
 
 describe("custom group gate (task 7.1)", () => {
-  it("a hidden group's rows are excluded from row-visibility AND from rendering", () => {
+  it("a hidden group's rows are excluded from row-visibility AND from rendering", async () => {
     prefsRef.current = {
       ...prefsRef.current,
       customEventGroups: { ...prefsRef.current.customEventGroups, memory: false },
     };
-    const { container } = renderChat(
+    const { container, findByText } = renderChat(
       stateWith([
         entryRow("om.observations.recorded", "memory", "memory-body-1"),
         userRow("visible-user-row"),
       ]),
     );
+    // User bubbles render through the lazy markdown boundary → async.
+    // See change: trim-cold-start-transfer-and-config-fanout (③).
+    expect(await findByText("visible-user-row")).toBeTruthy();
     const text = bodyText(container);
     expect(text).not.toContain("memory-body-1");
     expect(text).toContain("visible-user-row");

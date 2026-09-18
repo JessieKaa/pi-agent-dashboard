@@ -145,19 +145,23 @@ describe("NotifyRenderer — behaviour preserved through the migration", () => {
   });
 
   // 2.26 / #F17 — the legacy pre-split fallback still resolves.
-  it("falls back to params.title when message is absent", () => {
-    const { container } = renderNotify({ title: "legacy title" });
-    expect(container.textContent).toContain("legacy title");
+  it("falls back to params.title when message is absent", async () => {
+    // Body renders through the lazy markdown boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    const { findByText } = renderNotify({ title: "legacy title" });
+    expect(await findByText("legacy title")).toBeTruthy();
   });
 
   // 2.27 / #F18
-  it("still renders the markdown body", () => {
-    const { container } = renderNotify({
+  it("still renders the markdown body", async () => {
+    // Lazy markdown boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    const { findByText } = renderNotify({
       message: "**bold** and `code`",
       level: "info",
     });
-    expect(container.querySelector("strong")?.textContent).toBe("bold");
-    expect(container.querySelector("code")?.textContent).toBe("code");
+    expect((await findByText("bold")).tagName).toBe("STRONG");
+    expect((await findByText("code")).tagName).toBe("CODE");
   });
 
   it("treats an unrecognized level as info", () => {
@@ -169,10 +173,12 @@ describe("NotifyRenderer — behaviour preserved through the migration", () => {
   // FUNCTION and crashed InlineMessage on `tone.bg`. See CodeRabbit, PR #453.
   it.each([["toString"], ["constructor"], ["valueOf"], ["hasOwnProperty"], ["__proto__"]])(
     "renders an inherited-property level (%p) as info instead of crashing",
-    (level) => {
-      const { getByTestId, container } = renderNotify({ message: "hello", level });
+    async (level) => {
+      const { getByTestId, findByText } = renderNotify({ message: "hello", level });
       expect(getByTestId("inline-message").outerHTML).toContain("--severity-info-bg");
-      expect(container.textContent).toContain("hello");
+      // Body text resolves through the lazy markdown boundary → async.
+      // See change: trim-cold-start-transfer-and-config-fanout (③).
+      expect(await findByText("hello")).toBeTruthy();
     },
   );
 });

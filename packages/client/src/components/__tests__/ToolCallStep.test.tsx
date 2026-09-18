@@ -115,7 +115,7 @@ describe("ToolCallStep", () => {
     expect(button!.textContent).toContain("echo hello");
   });
 
-  it("auto-expands when images are present", () => {
+  it("auto-expands when images are present", async () => {
     const { container } = renderStep({
       toolName: "read",
       toolCallId: "tc-img-1",
@@ -125,10 +125,15 @@ describe("ToolCallStep", () => {
       images: [{ data: "iVBORw0KGgo=", mimeType: "image/png" }],
     });
 
-    // Should be expanded by default — renderer content should be visible
-    const img = container.querySelector("img");
-    expect(img).not.toBeNull();
-    expect(img!.getAttribute("src")).toContain("data:image/png;base64,iVBORw0KGgo=");
+    // Should be expanded by default — renderer content should be visible.
+    // The renderer sits behind the lazy tool-renderer boundary → async.
+    // See change: trim-cold-start-transfer-and-config-fanout (③).
+    const img = await waitFor(() => {
+      const el = container.querySelector("img");
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    expect(img.getAttribute("src")).toContain("data:image/png;base64,iVBORw0KGgo=");
   });
 
   it("stays collapsed when no images", () => {
@@ -145,7 +150,7 @@ describe("ToolCallStep", () => {
     expect(img).toBeNull();
   });
 
-  it("renders image in ReadToolRenderer when expanded", () => {
+  it("renders image in ReadToolRenderer when expanded", async () => {
     const { container } = renderStep({
       toolName: "read",
       toolCallId: "tc-img-2",
@@ -155,17 +160,22 @@ describe("ToolCallStep", () => {
       images: [{ data: "abc123", mimeType: "image/jpeg" }],
     });
 
-    const img = container.querySelector("img");
-    expect(img).not.toBeNull();
-    expect(img!.getAttribute("alt")).toBe("screenshot.jpg");
-    expect(img!.className).toContain("max-w-[512px]");
+    // Lazy tool-renderer boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    const img = await waitFor(() => {
+      const el = container.querySelector("img");
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    expect(img.getAttribute("alt")).toBe("screenshot.jpg");
+    expect(img.className).toContain("max-w-[512px]");
   });
 
   // Fix B: live auto-expand. The card mounts at tool_execution_start WITHOUT
   // images, then images arrive at tool_execution_end. The useState seed misses
   // them; a one-shot effect must expand when images first appear.
   // See change: inline-agent-screenshot-artifacts.
-  it("auto-expands when images arrive AFTER mount (live tool_execution_end)", () => {
+  it("auto-expands when images arrive AFTER mount (live tool_execution_end)", async () => {
     const base = {
       toolName: "bash",
       toolCallId: "tc-live-img",
@@ -191,15 +201,20 @@ describe("ToolCallStep", () => {
         />
       </ThemeProvider>,
     );
-    const img = container.querySelector("img");
-    expect(img).not.toBeNull();
-    expect(img!.getAttribute("src")).toContain("data:image/png;base64,c2hvdA==");
+    // Lazy tool-renderer boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    const img = await waitFor(() => {
+      const el = container.querySelector("img");
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    expect(img.getAttribute("src")).toContain("data:image/png;base64,c2hvdA==");
   });
 
   // Fix B: a non-Read tool (bash/browser screenshot) carrying an inlined image
   // block renders an inline <img>, auto-expanded, with no path-link.
   // See change: inline-agent-screenshot-artifacts.
-  it("renders an inline image for a bash screenshot result, auto-expanded, no path-link", () => {
+  it("renders an inline image for a bash screenshot result, auto-expanded, no path-link", async () => {
     const { container } = renderStep({
       toolName: "bash",
       toolCallId: "tc-shot-1",
@@ -210,10 +225,15 @@ describe("ToolCallStep", () => {
       images: [{ data: "c2hvdA==", mimeType: "image/png" }],
     });
 
-    // Auto-expanded → inline <img> visible without clicking.
-    const img = container.querySelector("img");
-    expect(img).not.toBeNull();
-    expect(img!.getAttribute("src")).toContain("data:image/png;base64,c2hvdA==");
+    // Auto-expanded → inline <img> visible without clicking. Lazy
+    // tool-renderer boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    const img = await waitFor(() => {
+      const el = container.querySelector("img");
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    expect(img.getAttribute("src")).toContain("data:image/png;base64,c2hvdA==");
 
     // No dead path-link rendered for the consumed screenshot path.
     expect(container.querySelector("a[href*='.png']")).toBeNull();
@@ -305,7 +325,7 @@ describe("ToolCallStep", () => {
     expect(button.getAttribute("title")).toBe(`Explore: ${longDesc}`);
   });
 
-  it("opens lightbox when clicking a tool result image", () => {
+  it("opens lightbox when clicking a tool result image", async () => {
     const { container } = renderStep({
       toolName: "read",
       toolCallId: "tc-img-lb",
@@ -316,13 +336,18 @@ describe("ToolCallStep", () => {
     });
 
     // The thumbnail is wrapped in a keyboard-accessible button (a11y);
-    // clicking it (or the img inside it) opens the lightbox.
-    const img = container.querySelector("img");
-    expect(img).not.toBeNull();
-    const trigger = img!.closest("button");
+    // clicking it (or the img inside it) opens the lightbox. Lazy
+    // tool-renderer boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    const img = await waitFor(() => {
+      const el = container.querySelector("img");
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    const trigger = img.closest("button");
     expect(trigger).not.toBeNull();
     expect(trigger!.className).toContain("cursor-pointer");
-    fireEvent.click(img!);
+    fireEvent.click(img);
     const lightbox = document.body.querySelector("[data-testid='lightbox-backdrop']");
     expect(lightbox).not.toBeNull();
   });
@@ -384,41 +409,47 @@ describe("ToolCallStep plugin tool-renderer dispatch", () => {
   });
 
   // 3.2 no plugin claim → built-in renderer wins
-  it("3.2 no plugin claim → built-in renderer renders", () => {
+  it("3.2 no plugin claim → built-in renderer renders", async () => {
     const registry = createSlotRegistry();
-    const { queryByTestId, getByText } = renderWithRegistry(registry, {
+    const { queryByTestId, findByText } = renderWithRegistry(registry, {
       toolName: "read",
       args: { path: "file.ts" },
       result: "BUILTIN_RESULT_BODY",
     });
+    // Built-in renderer sits behind the lazy boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    expect(await findByText("BUILTIN_RESULT_BODY")).toBeDefined();
     expect(queryByTestId("plugin-renderer")).toBeNull();
-    expect(getByText("BUILTIN_RESULT_BODY")).toBeDefined();
   });
 
   // 3.3 plugin claim with shouldRender:false → falls through to built-in
-  it("3.3 shouldRender:false falls through to built-in", () => {
+  it("3.3 shouldRender:false falls through to built-in", async () => {
     const registry = createSlotRegistry();
     registry.addClaim(pluginClaim("read", { shouldRender: () => false }));
-    const { queryByTestId, getByText } = renderWithRegistry(registry, {
+    const { queryByTestId, findByText } = renderWithRegistry(registry, {
       toolName: "read",
       args: { path: "file.ts" },
       result: "BUILTIN_RESULT_BODY",
     });
+    // Lazy built-in boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    expect(await findByText("BUILTIN_RESULT_BODY")).toBeDefined();
     expect(queryByTestId("plugin-renderer")).toBeNull();
-    expect(getByText("BUILTIN_RESULT_BODY")).toBeDefined();
   });
 
   // 3.4 plugin claim with NO built-in fallback → Generic when shouldRender:false; plugin when truthy
-  it("3.4 no built-in: shouldRender:false → Generic fires (result shown)", () => {
+  it("3.4 no built-in: shouldRender:false → Generic fires (result shown)", async () => {
     const registry = createSlotRegistry();
     registry.addClaim(pluginClaim("ctx_execute", { shouldRender: () => false }));
-    const { queryByTestId, getByText } = renderWithRegistry(registry, {
+    const { queryByTestId, findByText } = renderWithRegistry(registry, {
       toolName: "ctx_execute",
       args: {},
       result: "GENERIC_OUTPUT",
     });
+    // Generic renderer sits behind the lazy boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    expect(await findByText("GENERIC_OUTPUT")).toBeDefined();
     expect(queryByTestId("plugin-renderer")).toBeNull();
-    expect(getByText("GENERIC_OUTPUT")).toBeDefined();
   });
 
   it("3.4 no built-in: shouldRender truthy → plugin fires", () => {
@@ -468,7 +499,7 @@ describe("ToolCallStep plugin tool-renderer dispatch", () => {
   });
 
   // 3.7 plugin shouldRender throws → fail-closed; fall through; console warning
-  it("3.7 shouldRender throws → fail-closed, falls through, warns", () => {
+  it("3.7 shouldRender throws → fail-closed, falls through, warns", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const registry = createSlotRegistry();
     registry.addClaim(
@@ -478,20 +509,22 @@ describe("ToolCallStep plugin tool-renderer dispatch", () => {
         },
       }),
     );
-    const { queryByTestId, getByText } = renderWithRegistry(registry, {
+    const { queryByTestId, findByText } = renderWithRegistry(registry, {
       toolName: "read",
       args: { path: "file.ts" },
       result: "BUILTIN_RESULT_BODY",
     });
+    // Lazy built-in boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    expect(await findByText("BUILTIN_RESULT_BODY")).toBeDefined();
     expect(queryByTestId("plugin-renderer")).toBeNull();
-    expect(getByText("BUILTIN_RESULT_BODY")).toBeDefined();
     const warned = warnSpy.mock.calls.map((c) => c.join(" "));
     expect(warned.some((s) => s.includes("p") && s.includes("read"))).toBe(true);
     warnSpy.mockRestore();
   });
 
   // 3.8 no provider → useSlotRegistryOrNull null → falls through to built-in
-  it("3.8 no SlotRegistryProvider → falls through to built-in", () => {
+  it("3.8 no SlotRegistryProvider → falls through to built-in", async () => {
     const view = render(
       <ThemeProvider>
         <ToolCallStep
@@ -505,8 +538,10 @@ describe("ToolCallStep plugin tool-renderer dispatch", () => {
       </ThemeProvider>,
     );
     fireEvent.click(view.container.querySelector("button")!);
+    // Lazy built-in boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    expect(await view.findByText("BUILTIN_RESULT_BODY")).toBeDefined();
     expect(view.queryByTestId("plugin-renderer")).toBeNull();
-    expect(view.getByText("BUILTIN_RESULT_BODY")).toBeDefined();
   });
 
   // 4.2 demo-plugin smoke: green box mounts for toolName DashboardDemo

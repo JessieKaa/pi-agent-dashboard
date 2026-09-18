@@ -23,7 +23,7 @@
  * See change: add-faux-model-integration-tests.
  */
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { render } from "@testing-library/react";
+import { render, waitFor } from "@testing-library/react";
 import React from "react";
 import { ChatView } from "../chat/ChatView.js";
 import { ThemeProvider } from "../settings/ThemeProvider.js";
@@ -160,19 +160,22 @@ describe("faux renderer matrix — tool renderers (§3.2)", () => {
 });
 
 describe("faux renderer matrix — interactive renderers (§3.3)", () => {
-  const cases: Array<[scenarioId: string, method: string, expected: React.ComponentType<any>]> = [
-    ["ask-confirm", "confirm", ConfirmRenderer],
-    ["ask-select", "select", SelectRenderer],
-    ["ask-multiselect", "multiselect", MultiselectRenderer],
-    ["ask-input", "input", InputRenderer],
-    ["ask-editor", "editor", EditorRenderer],
-    ["ask-batch", "batch", BatchRenderer],
-    ["ask-notify", "notify", NotifyRenderer],
-    ["ask-unknown-method", "totally-unknown-method", GenericInteractiveRenderer],
+  // Anchor text each fixture's renderer is guaranteed to show once mounted:
+  // the title for most methods; notify renders its message (not the title),
+  // and the generic fallback prints `method: ` (params dump), not the title.
+  const cases: Array<[scenarioId: string, method: string, expected: React.ComponentType<any>, anchor: string]> = [
+    ["ask-confirm", "confirm", ConfirmRenderer, "Proceed?"],
+    ["ask-select", "select", SelectRenderer, "Choose one"],
+    ["ask-multiselect", "multiselect", MultiselectRenderer, "Choose many"],
+    ["ask-input", "input", InputRenderer, "Your name?"],
+    ["ask-editor", "editor", EditorRenderer, "Edit the draft"],
+    ["ask-batch", "batch", BatchRenderer, "Setup"],
+    ["ask-notify", "notify", NotifyRenderer, "done"],
+    ["ask-unknown-method", "totally-unknown-method", GenericInteractiveRenderer, "totally-unknown-method: "],
   ];
 
-  for (const [scenarioId, method, expected] of cases) {
-    it(`${scenarioId} (method=${method}) dispatches to ${expected.name} and mounts in ChatView`, () => {
+  for (const [scenarioId, method, expected, anchor] of cases) {
+    it(`${scenarioId} (method=${method}) dispatches to ${expected.name} and mounts in ChatView`, async () => {
       const scenario = SCENARIOS[scenarioId];
       const built = stateForAskScenario(scenario);
       expect(built.method).toBe(method);
@@ -181,8 +184,14 @@ describe("faux renderer matrix — interactive renderers (§3.3)", () => {
       expect(getInteractiveRenderer(method)).toBe(expected);
 
       // ChatView mounts that interactive renderer with the real faux params.
+      // The interactive family sits behind the LazyInteractiveRenderer
+      // boundary, so the card resolves asynchronously (generic prints its
+      // anchor split across spans → assert via container text). See change:
+      // trim-cold-start-transfer-and-config-fanout (③).
       const { container } = renderChat(built.state);
-      expect(container.textContent ?? "").not.toBe("");
+      await waitFor(() => {
+        expect(container.textContent ?? "").toContain(anchor);
+      });
     });
   }
 });

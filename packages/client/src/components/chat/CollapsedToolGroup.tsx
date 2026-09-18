@@ -11,7 +11,7 @@ import { useDisplayPrefs } from "../../hooks/useDisplayPrefs.js";
 import { useMobile } from "../../hooks/useMobile.js";
 import type { ToolCallGroup } from "../../lib/chat/group-tool-calls.js";
 import { getSummary } from "../../lib/chat/tool-summary.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 import { ToolCallStep } from "./ToolCallStep.js";
 import type { ToolContext } from "../tool-renderers/index.js";
 
@@ -86,7 +86,7 @@ export function CollapsedToolGroup({ group, toolContext }: Props) {
                   className="px-2 py-1 text-xs text-[var(--text-tertiary)]"
                   data-testid="collapsed-group-narration"
                 >
-                  <MarkdownContent content={row.content} context={toolContext} />
+                  <LazyMarkdownContent content={row.content} context={toolContext} />
                 </div>
               );
             }

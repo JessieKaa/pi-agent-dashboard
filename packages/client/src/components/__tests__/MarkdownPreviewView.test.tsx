@@ -4,8 +4,8 @@ import React from "react";
 import { MarkdownPreviewView } from "../preview/MarkdownPreviewView.js";
 
 // Mock MarkdownContent to avoid full markdown rendering in tests
-vi.mock("../preview/MarkdownContent.js", () => ({
-  MarkdownContent: ({ content }: { content: string }) => (
+vi.mock("../preview/LazyMarkdownContent.js", () => ({
+  LazyMarkdownContent: ({ content }: { content: string }) => (
     <div data-testid="mock-markdown">{content}</div>
   ),
 }));

@@ -2,7 +2,7 @@ import { mdiCheckboxMarkedOutline, mdiCheckCircle } from "@mdi/js";
 import { Icon } from "@mdi/react";
 import React, { useState } from "react";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 import { AnsweredOption } from "./AnsweredOption.js";
 import { InlineMarkdown } from "./InlineMarkdown.js";
 import type { InteractiveRendererProps } from "./types.js";
@@ -57,7 +57,7 @@ export function MultiselectRenderer({ params, status, result, onRespond, onCance
           </span>
         </div>
         {message && (
-          <div className="text-xs text-[var(--text-secondary)] mb-2 ml-6"><MarkdownContent content={message} /></div>
+          <div className="text-xs text-[var(--text-secondary)] mb-2 ml-6"><LazyMarkdownContent content={message} /></div>
         )}
         <div className="flex flex-col gap-1 ml-6">
           {options.map((option) => (
@@ -75,7 +75,7 @@ export function MultiselectRenderer({ params, status, result, onRespond, onCance
         <span className="text-sm font-medium text-[var(--text-primary)]"><InlineMarkdown content={title} /></span>
       </div>
       {message && (
-        <div className="text-xs text-[var(--text-secondary)] mb-3 ml-6"><MarkdownContent content={message} /></div>
+        <div className="text-xs text-[var(--text-secondary)] mb-3 ml-6"><LazyMarkdownContent content={message} /></div>
       )}
       <div className="flex flex-col gap-1 ml-6 mb-2">
         {options.length > 0 && (

@@ -30,7 +30,7 @@ import { Icon } from "@mdi/react";
 import type React from "react";
 import { useMemo, useState } from "react";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 
 export interface WhatsNewDialogProps {
   /** When false, the component renders nothing. */
@@ -250,7 +250,7 @@ function BulletGroups({ groups }: { groups: BulletGroup[] }): React.ReactElement
 function BulletProse({ text }: { text: string }): React.ReactElement {
   return (
     <span className="whats-new-bullet">
-      <MarkdownContent content={text} />
+      <LazyMarkdownContent content={text} />
     </span>
   );
 }

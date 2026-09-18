@@ -33,7 +33,7 @@ import React, { useCallback, useRef, useState } from "react";
 import { formatMessageTime } from "../../lib/util/format.js";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
 import { CopyButton } from "../primitives/CopyButton.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 
 interface Props {
   /** Parsed skill metadata stamped on the ChatMessage. */
@@ -95,7 +95,7 @@ export function SkillInvocationCard({
         <div className="px-4 pb-2">
           <div className="border-t border-purple-400/20 pt-2" />
           <div ref={contentRef}>
-            <MarkdownContent content={skill.body} />
+            <LazyMarkdownContent content={skill.body} />
           </div>
           {skill.args && (
             <>

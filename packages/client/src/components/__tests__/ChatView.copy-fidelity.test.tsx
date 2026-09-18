@@ -37,15 +37,19 @@ function dispatchCopy(scrollEl: HTMLElement): { text: string | null; prevented: 
 }
 
 describe("ChatView copy fidelity", () => {
-  it("rebuilds clipboard text from a partial-node transcript selection", () => {
+  it("rebuilds clipboard text from a partial-node transcript selection", async () => {
     const state = createInitialState();
     state.messages.push({ id: "0", role: "user", content: "the quick brown fox", timestamp: Date.now() });
-    const { container } = render(
+    const { container, findByText } = render(
       <ThemeProvider>
         <ChatView state={state} toolContext={defaultToolContext} />
       </ThemeProvider>,
     );
     const scrollEl = getScrollContainer(container);
+    // The bubble body renders through the lazy markdown boundary → wait for
+    // the text before anchoring a selection to its node. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    await findByText("the quick brown fox");
     const textNode = scrollEl.querySelector("[data-index] p")!.firstChild!;
     const range = document.createRange();
     range.setStart(textNode, 4);
@@ -59,15 +63,18 @@ describe("ChatView copy fidelity", () => {
     expect(prevented).toBe(true);
   });
 
-  it("skips a selection that extends outside the transcript (native copy owns it)", () => {
+  it("skips a selection that extends outside the transcript (native copy owns it)", async () => {
     const state = createInitialState();
     state.messages.push({ id: "0", role: "user", content: "inside the transcript", timestamp: Date.now() });
-    const { container } = render(
+    const { container, findByText } = render(
       <ThemeProvider>
         <ChatView state={state} toolContext={defaultToolContext} />
       </ThemeProvider>,
     );
     const scrollEl = getScrollContainer(container);
+    // Lazy markdown boundary → wait for the rendered text. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    await findByText("inside the transcript");
     // A node OUTSIDE the scroll container (sibling in the document body).
     const outside = document.createElement("p");
     outside.textContent = "outside pane text";

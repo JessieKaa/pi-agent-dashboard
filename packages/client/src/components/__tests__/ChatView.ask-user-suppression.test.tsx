@@ -73,19 +73,21 @@ describe("ChatView — ask_user tool-card suppression (change: fix-ask-user-card
   const toolCardButton = (c: HTMLElement) =>
     Array.from(c.querySelectorAll("button")).find((b) => b.textContent?.includes(TITLE)) ?? null;
 
-  it("T.1 (pending live): suppresses the ask_user tool card when a paired pending interactiveUi exists; interactive card renders", () => {
-    const { container, getByText } = renderChat([
+  it("T.1 (pending live): suppresses the ask_user tool card when a paired pending interactiveUi exists; interactive card renders", async () => {
+    const { container, findByText } = renderChat([
       askUserToolResult({ toolStatus: "running" }),
       interactiveUi("pending"),
     ]);
     expect(toolCardButton(container)).toBeNull();
-    // pending ConfirmRenderer widget is the single card
-    expect(getByText("Yes")).toBeTruthy();
-    expect(getByText("No")).toBeTruthy();
+    // pending ConfirmRenderer widget is the single card (lazy boundary →
+    // the card resolves asynchronously; see change:
+    // trim-cold-start-transfer-and-config-fanout ③).
+    expect(await findByText("Yes")).toBeTruthy();
+    expect(await findByText("No")).toBeTruthy();
   });
 
-  it("T.1 (answered but still live): suppresses the tool card when the paired interactiveUi is RESOLVED but still in the list — the case the adjacency/pending helper misses", () => {
-    const { container, getByText } = renderChat([
+  it("T.1 (answered but still live): suppresses the tool card when the paired interactiveUi is RESOLVED but still in the list — the case the adjacency/pending helper misses", async () => {
+    const { container, findByText } = renderChat([
       askUserToolResult({ toolStatus: "complete", result: 'User responded: true' }),
       interactiveUi("resolved", { args: {
         requestId: "r1",
@@ -97,7 +99,7 @@ describe("ChatView — ask_user tool-card suppression (change: fix-ask-user-card
     ]);
     expect(toolCardButton(container)).toBeNull();
     // resolved ConfirmRenderer still shows the question + both options
-    expect(getByText(TITLE)).toBeTruthy();
+    expect(await findByText(TITLE)).toBeTruthy();
   });
 
   it("T.2 (history reload): renders the ask_user tool card when there is NO paired interactiveUi", () => {

@@ -42,11 +42,13 @@ function renderWithPending(pendingPrompt: PendingPrompt) {
 }
 
 describe("ChatView pending-prompt status arms", () => {
-  it("#F3 a failed prompt renders the failed affordance, keeps its text, and shows no 'sent' tick", () => {
+  it("#F3 a failed prompt renders the failed affordance, keeps its text, and shows no 'sent' tick", async () => {
     renderWithPending({ text: "hi", status: "failed" });
 
     expect(screen.getByTestId("pending-prompt-failed")).toBeTruthy();
-    expect(screen.getByText("hi")).toBeTruthy();
+    // Prompt text renders through the lazy markdown boundary → async.
+    // See change: trim-cold-start-transfer-and-config-fanout (③).
+    expect(await screen.findByText("hi")).toBeTruthy();
     expect(screen.queryByText("sent")).toBeNull();
     expect(screen.queryByText("sending")).toBeNull();
   });

@@ -3,7 +3,7 @@
  *
  * Fetches `/api/doctor` on mount, groups checks by section, renders status
  * pill + name + message + truncated detail per row, and shows the suggestion
- * via `<MarkdownContent>` when present.
+ * via `<LazyMarkdownContent>` when present.
  *
  * Toolbar:
  *   [Re-run]            disabled while a fetch is in flight, "Running…" label
@@ -24,7 +24,7 @@ import { type AutoNameOutcomeRow, fetchAutoNameOutcomes } from "../../lib/api/au
 import { t as i18nT } from "../../lib/i18n/i18n.js";
 import { resolveServerMessage } from "../../lib/api/server-error.js";
 import { DialogPortal } from "../primitives/DialogPortal.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 
 type DoctorSection = DoctorCheck["section"];
 
@@ -365,7 +365,7 @@ export function DiagnosticsSection({ fetcher, autoNameFetcher }: Props = {}) {
                     ) : null}
                     {c.status !== "ok" && c.suggestion ? (
                       <div className="mt-2 px-3 py-2 border-l-2 border-yellow-600 bg-stone-900/40 rounded-r text-xs text-yellow-100">
-                        <MarkdownContent content={c.suggestion} />
+                        <LazyMarkdownContent content={c.suggestion} />
                       </div>
                     ) : null}
                     {c.name === "git source" ? (

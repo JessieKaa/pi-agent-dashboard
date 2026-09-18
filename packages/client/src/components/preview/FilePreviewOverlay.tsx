@@ -13,7 +13,7 @@ import { AsciiDocPreview } from "./AsciiDocPreview.js";
 import { DiagramPreview } from "./DiagramPreview.js";
 import { DocxPreview } from "./DocxPreview.js";
 import { EmlPreview } from "./EmlPreview.js";
-import { MarkdownContent } from "./MarkdownContent.js";
+import { LazyMarkdownContent } from "./LazyMarkdownContent.js";
 import { PptxPreview } from "./PptxPreview.js";
 import { dirname } from "./resolve-local-image-src.js";
 import { SpreadsheetPreview } from "./SpreadsheetPreview.js";
@@ -251,7 +251,7 @@ export function FilePreviewOverlay({ cwd, path, line, onClose }: Props) {
               </div>
             )}
             {!error && !isImage && content !== null && isMd && (
-              <MarkdownContent
+              <LazyMarkdownContent
                 content={content}
                 frontmatter="properties"
                 imageBase={{ cwd, dir: absOf(cwd, dirname(path)) }}

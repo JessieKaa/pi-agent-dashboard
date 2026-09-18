@@ -11,7 +11,8 @@ import { getSummary } from "../../lib/chat/tool-summary.js";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
 import { ErrorBoundary } from "../primitives/ErrorBoundary.js";
 import { ElapsedBadge } from "../session/ElapsedBadge.js";
-import { getToolRenderer, type ToolContext } from "../tool-renderers/index.js";
+import { LazyToolRenderer } from "../tool-renderers/LazyToolRenderer.js";
+import type { ToolContext } from "../tool-renderers/types.js";
 
 /**
  * Evaluate a `tool-renderer` claim's optional `shouldRender`. Absent or truthy
@@ -91,7 +92,6 @@ export function ToolCallStep({ toolName, toolCallId, args, status, result, image
   const isFailedAskUser = isAskUser && status === "error";
   const [expanded, setExpanded] = useState(hasImages || isAgentRunning || (isAskUser && !isFailedAskUser));
   const [stopState, setStopState] = useState<StopState>("idle");
-  const Renderer = getToolRenderer(toolName);
 
   // Show-full-output affordance: when the rendered result carries the
   // truncation marker, offer an on-demand fetch of the full stored result.
@@ -231,7 +231,7 @@ export function ToolCallStep({ toolName, toolCallId, args, status, result, image
                 />
               </CurrentPluginLayer>
             ) : (
-              <Renderer
+              <LazyToolRenderer
                 toolName={toolName}
                 args={args}
                 status={status}

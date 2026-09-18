@@ -5,7 +5,7 @@ import {
   mdiInformationOutline,
 } from "@mdi/js";
 import type { InteractiveRendererProps } from "./types.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 import { InlineMessage, type Severity } from "../primitives/InlineMessage.js";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
 
@@ -91,7 +91,7 @@ export function NotifyRenderer({ params }: InteractiveRendererProps) {
         title={i18nT(labelKey, undefined, fallback)}
         testId="inline-message"
       >
-        <MarkdownContent content={message} />
+        <LazyMarkdownContent content={message} />
       </InlineMessage>
     </div>
   );

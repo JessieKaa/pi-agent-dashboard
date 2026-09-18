@@ -84,7 +84,7 @@ describe("WhatsNewDialog", () => {
     expect(screen.getByText(/0\.62\.0 → 0\.70\.0/)).toBeTruthy();
   });
 
-  it("pins Breaking Changes section at the top when hasBreaking is true", () => {
+  it("pins Breaking Changes section at the top when hasBreaking is true", async () => {
     const releases = [
       makeRelease("0.70.0", {
         breaking: [{ text: "broke X", issues: [] }],
@@ -94,7 +94,9 @@ describe("WhatsNewDialog", () => {
     renderDialog({ response: makeResponse(releases, true) });
     expect(screen.getByTestId("whats-new-breaking")).toBeTruthy();
     expect(screen.getByText(/1 breaking change since/)).toBeTruthy();
-    expect(screen.getByText("broke X")).toBeTruthy();
+    // Entry text renders through the lazy markdown boundary → async.
+    // See change: trim-cold-start-transfer-and-config-fanout (③).
+    expect(await screen.findByText("broke X")).toBeTruthy();
   });
 
   it("does not render Breaking section when hasBreaking is false", () => {
@@ -103,7 +105,7 @@ describe("WhatsNewDialog", () => {
     expect(screen.queryByTestId("whats-new-breaking")).toBeNull();
   });
 
-  it("renders Other changes section collapsed by default and expands on click", () => {
+  it("renders Other changes section collapsed by default and expands on click", async () => {
     const releases = [
       makeRelease("0.70.0", { fixed: [{ text: "fixed Y", issues: [] }] }),
     ];
@@ -113,7 +115,9 @@ describe("WhatsNewDialog", () => {
     expect(screen.queryByText("fixed Y")).toBeNull();
     fireEvent.click(toggle);
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
-    expect(screen.getByText("fixed Y")).toBeTruthy();
+    // Entry text renders through the lazy markdown boundary → async.
+    // See change: trim-cold-start-transfer-and-config-fanout (③).
+    expect(await screen.findByText("fixed Y")).toBeTruthy();
   });
 
   it("renders empty-state message when releases is empty", () => {

@@ -1,9 +1,9 @@
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
-import tailwindcss from "@tailwindcss/vite";
-import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
+import tailwindcss from "@tailwindcss/vite";
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
 // Import via a relative workspace path so vite's esbuild config-loader bundles
 // the plugin (and its transitive .ts deps) into the temp config bundle. Using
 // the package specifier "@blackbelt-technology/dashboard-plugin-runtime"
@@ -119,6 +119,14 @@ export default defineConfig({
               "@dnd-kit/utilities",
             ],
             "util": ["fuse.js", "qrcode", "wouter", "ansi-to-react"],
+            // Vite emits its shared __vitePreload helper as a virtual module;
+            // route it into `util` (already in the landing preload set) so the
+            // helper never lands in a LAZY manual chunk — that would make the
+            // entry statically import the lazy chunk and re-preload it
+            // (exactly how the markdown payload re-entered landing after the
+            // LazyMarkdownContent boundary was added). See change:
+            // trim-cold-start-transfer-and-config-fanout (③).
+            "util-helper": ["vite/preload-helper"],
             // Monaco is heavy + only referenced by the lazily-imported
             // MonacoBuffer, so this chunk is fetched on first text-file open.
             // See change: add-internal-monaco-editor-pane.
@@ -134,6 +142,17 @@ export default defineConfig({
               return chunk;
             }
           }
+          // The preload helper is vite-injected (no /node_modules/ path);
+          // place it after the node_modules rules so real packages win.
+          if (id.includes("vite/preload-helper")) return "util";
+          // NOTE: do NOT pin src/lib/theme/syntax-theme.ts into `markdown`.
+          // Its static import of ./themes.js drags the app's i18n/theme
+          // modules into whatever chunk holds it; folding it into `markdown`
+          // gives the entry a static edge to the lazy markdown chunk (the
+          // preload graph re-grows) and pulls react-i18next into markdown.
+          // As its own lazily-loaded chunk it stays shared by the markdown
+          // and tool-renderer lazy families without touching the entry. See
+          // change: trim-cold-start-transfer-and-config-fanout (③).
         },
       },
     },

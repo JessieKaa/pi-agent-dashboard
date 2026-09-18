@@ -2,7 +2,7 @@ import { mdiArrowLeft, mdiLoading } from "@mdi/js";
 import { Icon } from "@mdi/react";
 import React, { useRef } from "react";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
-import { MarkdownContent } from "./MarkdownContent.js";
+import { LazyMarkdownContent } from "./LazyMarkdownContent.js";
 import { MarkdownSearch } from "./MarkdownSearch.js";
 
 export interface PreviewTab {
@@ -106,7 +106,7 @@ export function MarkdownPreviewView({
           </div>
         )}
         {content && !isLoading && !error && (
-          <MarkdownContent content={content} frontmatter="properties" />
+          <LazyMarkdownContent content={content} frontmatter="properties" />
         )}
       </div>
     </div>

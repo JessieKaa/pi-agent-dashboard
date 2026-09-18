@@ -41,7 +41,7 @@ import { UI_PRIMITIVE_KEYS } from "@blackbelt-technology/pi-dashboard-shared/das
 import { ThinkingBlock } from "./components/chat/ThinkingBlock.js";
 import { ToolCallStep } from "./components/chat/ToolCallStep.js";
 import { PairLanding } from "./components/connectivity/PairLanding.js";
-import { MarkdownContent } from "./components/preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "./components/preview/LazyMarkdownContent.js";
 import { LogBlock } from "./components/primitives/LogBlock.js";
 import { makeToolContext } from "./components/tool-renderers/make-tool-context.js";
 import {
@@ -59,7 +59,11 @@ installUnhandledRejectionReporter();
 
 const primitiveRegistry = createUiPrimitiveRegistry();
 registerUiPrimitive(primitiveRegistry, UI_PRIMITIVE_KEYS.agentCard, AgentCardShell);
-registerUiPrimitive(primitiveRegistry, UI_PRIMITIVE_KEYS.markdownContent, MarkdownContent);
+// The markdown primitive is the LAZY wrapper: registering the eager
+// MarkdownContent here would preload the ~1 MB markdown chunk on every landing
+// page. Plugin slot renders still resolve it through the boundary.
+// See change: trim-cold-start-transfer-and-config-fanout (③).
+registerUiPrimitive(primitiveRegistry, UI_PRIMITIVE_KEYS.markdownContent, LazyMarkdownContent);
 // `confirmDialog` primitive — re-skinned over the unified `Confirm`/`Dialog`
 // without changing the narrow contract plugins depend on. Maps the registry's
 // `onCancel` to `Confirm`'s `onClose`, supplies no title (always open while
@@ -170,6 +174,16 @@ const isPairRoute = window.location.pathname === "/pair";
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});
 }
+
+// Warm the markdown payload chunk after the shell mounts: it is not
+// module-preloaded (landing bandwidth), but almost every session renders
+// markdown shortly after — fetching it once post-first-frame turns the first
+// chat open into a cache hit. The one-shot timer escapes the landing's
+// module-eval path entirely. Idempotent with the per-component prefetch.
+// See change: trim-cold-start-transfer-and-config-fanout (③).
+setTimeout(() => {
+  void import("./components/preview/MarkdownContent.js");
+}, 0);
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

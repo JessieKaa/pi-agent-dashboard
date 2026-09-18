@@ -117,21 +117,23 @@ function rowWrappers(container: HTMLElement) {
 
 describe("notify gate — row count vs rendered rows (test-plan #F1)", () => {
   // 2.16
-  it("leaves no blank measured row where a hidden notify was", () => {
+  it("leaves no blank measured row where a hidden notify was", async () => {
     prefsRef.current = { ...prefsRef.current, notifyMinLevel: "warnings" };
     const state = stateWith([
       ...LEVELS.map(notifyRow),
       askRow("confirm"),
       askRow("select"),
     ]);
-    const { container } = renderChat(state);
+    const { container, findByText } = renderChat(state);
 
     // Sub-floor notifies are gone from the transcript entirely…
     expect(container.textContent).not.toContain("notify-body-info");
     expect(container.textContent).not.toContain("notify-body-success");
-    // …and the at/above-floor ones remain.
-    expect(container.textContent).toContain("notify-body-warning");
-    expect(container.textContent).toContain("notify-body-error");
+    // …and the at/above-floor ones remain. The bodies render through the lazy
+    // interactive-renderer boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    expect(await findByText("notify-body-warning")).toBeTruthy();
+    expect(await findByText("notify-body-error")).toBeTruthy();
 
     // The invariant: every counted/mounted row produced an element. An empty
     // wrapper is the exact signature of a render-branch-only gate.
@@ -142,10 +144,12 @@ describe("notify gate — row count vs rendered rows (test-plan #F1)", () => {
     }
   });
 
-  it.each(LEVELS)("shows every level at the 'all' floor (%s)", (level) => {
+  it.each(LEVELS)("shows every level at the 'all' floor (%s)", async (level) => {
     prefsRef.current = { ...prefsRef.current, notifyMinLevel: "all" };
-    const { container } = renderChat(stateWith([notifyRow(level)]));
-    expect(container.textContent).toContain(`notify-body-${level}`);
+    // Lazy interactive-renderer boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    const { findByText } = renderChat(stateWith([notifyRow(level)]));
+    expect(await findByText(`notify-body-${level}`)).toBeTruthy();
   });
 
   it("hides everything below error at the strictest floor, but never error", () => {

@@ -272,7 +272,7 @@ describe("InputRenderer", () => {
 
 describe("InputRenderer — resolved shows message body (change: fix-ask-user-card-duplication)", () => {
   const MSG = "Your full legal name.";
-  it("renders params.message in the resolved state", () => {
+  it("renders params.message in the resolved state", async () => {
     render(
       <ThemeProvider>
         <InputRenderer
@@ -283,7 +283,9 @@ describe("InputRenderer — resolved shows message body (change: fix-ask-user-ca
       />
       </ThemeProvider>,
     );
-    expect(screen.getByText(MSG)).toBeTruthy();
+    // Message body renders through the lazy markdown boundary → async.
+    // See change: trim-cold-start-transfer-and-config-fanout (③).
+    expect(await screen.findByText(MSG)).toBeTruthy();
   });
   it("renders no message body when params.message is absent", () => {
     render(

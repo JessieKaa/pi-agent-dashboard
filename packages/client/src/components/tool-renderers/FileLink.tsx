@@ -1,11 +1,16 @@
 import type React from "react";
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { resolveLinkOrigin } from "../../lib/util/link-origin.js";
 import { resolveFileMention } from "../../lib/api/resolve-mention-api.js";
-import { FilePreviewOverlay } from "../preview/FilePreviewOverlay.js";
 import { useOptionalSplitWorkspace } from "../split/SplitWorkspaceContext.js";
 import type { ToolContext } from "./types.js";
 import { useFileOpenRouting } from "./useFileOpenRouting.js";
+
+// Lazy: the overlay pulls the markdown + syntax-highlighter payload and only
+// mounts after a click. See change: trim-cold-start-transfer-and-config-fanout (③).
+const FilePreviewOverlay = lazy(() =>
+  import("../preview/FilePreviewOverlay.js").then((m) => ({ default: m.FilePreviewOverlay })),
+);
 
 interface Props {
   path: string;
@@ -129,12 +134,14 @@ export function FileLink({ path, line, col, absolute, context, children }: Props
       {children}
     </button>
     {!hostManaged && previewTarget && (
-      <FilePreviewOverlay
-        cwd={previewTarget.cwd}
-        path={previewTarget.path}
-        line={previewTarget.line}
-        onClose={closePreview}
-      />
+      <Suspense fallback={null}>
+        <FilePreviewOverlay
+          cwd={previewTarget.cwd}
+          path={previewTarget.path}
+          line={previewTarget.line}
+          onClose={closePreview}
+        />
+      </Suspense>
     )}
     </>
   );

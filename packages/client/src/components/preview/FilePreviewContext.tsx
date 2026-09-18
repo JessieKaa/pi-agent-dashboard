@@ -1,6 +1,12 @@
 import type React from "react";
-import { createContext, useContext, useMemo, useState } from "react";
-import { FilePreviewOverlay } from "./FilePreviewOverlay.js";
+import { createContext, lazy, Suspense, useContext, useMemo, useState } from "react";
+
+// Lazy: FilePreviewOverlay pulls the markdown + syntax-highlighter payload;
+// the overlay only exists after a user opens a preview, so keep it off the
+// landing graph. See change: trim-cold-start-transfer-and-config-fanout (③).
+const FilePreviewOverlayLazy = lazy(() =>
+  import("./FilePreviewOverlay.js").then((m) => ({ default: m.FilePreviewOverlay })),
+);
 
 /** Target file for the in-dashboard preview overlay. */
 export interface FilePreviewTarget {
@@ -64,6 +70,8 @@ export function FilePreviewHost() {
   const { target, close } = useFilePreview();
   if (!target) return null;
   return (
-    <FilePreviewOverlay cwd={target.cwd} path={target.path} line={target.line} onClose={close} />
+    <Suspense fallback={null}>
+      <FilePreviewOverlayLazy cwd={target.cwd} path={target.path} line={target.line} onClose={close} />
+    </Suspense>
   );
 }

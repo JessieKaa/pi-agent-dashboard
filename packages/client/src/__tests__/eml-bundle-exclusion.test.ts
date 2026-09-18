@@ -82,9 +82,18 @@ describe("manualChunks topology after fix-vite-build-warnings", () => {
   it("folds react-syntax-highlighter into markdown: no standalone syntax chunk (test-plan #S2)", () => {
     if (!existsSync(assetsDir)) return; // no build output — CI builds first
     const jsChunks = readdirSync(assetsDir).filter((f) => f.endsWith(".js"));
-    const syntaxChunks = jsChunks.filter((f) => /^syntax-/.test(f));
+    // `syntax-theme-*` is the lazily-loaded prism-theme module (shared by the
+    // markdown + tool-renderer lazy families). It is not the old circular
+    // `syntax` vendor chunk this guard pins against — that concern is still
+    // covered by the markdown-chunk check below. Forcing it back into
+    // `markdown` re-grows the landing preload graph (the entry statically
+    // needs react-i18next, which rides its theme module). See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    const syntaxVendorChunks = jsChunks.filter(
+      (f) => /^syntax-/.test(f) && !/^syntax-theme-/.test(f),
+    );
     const markdownChunks = jsChunks.filter((f) => /^markdown-/.test(f));
-    expect(syntaxChunks, `unexpected standalone syntax chunk(s): ${syntaxChunks.join(", ")}`).toHaveLength(0);
+    expect(syntaxVendorChunks, `unexpected standalone syntax chunk(s): ${syntaxVendorChunks.join(", ")}`).toHaveLength(0);
     expect(markdownChunks.length, "expected a markdown-*.js chunk (highlighter folded in)").toBeGreaterThan(0);
   });
 

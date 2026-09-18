@@ -2,7 +2,7 @@ import { mdiFormatListBulleted } from "@mdi/js";
 import { Icon } from "@mdi/react";
 import React from "react";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 import { AnsweredOption } from "./AnsweredOption.js";
 import { InlineMarkdown } from "./InlineMarkdown.js";
 import { isCancelOption, parseOption } from "./parseOption.js";
@@ -34,7 +34,7 @@ export function SelectRenderer({ params, status, result, onRespond, onCancel }: 
           <span className="text-[var(--text-primary)] font-medium"><InlineMarkdown content={title} /></span>
         </div>
         {message && (
-          <div className="text-xs text-[var(--text-secondary)] mb-2 ml-6"><MarkdownContent content={message} /></div>
+          <div className="text-xs text-[var(--text-secondary)] mb-2 ml-6"><LazyMarkdownContent content={message} /></div>
         )}
         <div className="flex flex-col gap-1 ml-6">
           {options.map((option) => {
@@ -62,7 +62,7 @@ export function SelectRenderer({ params, status, result, onRespond, onCancel }: 
         <span className="text-sm font-medium text-[var(--text-primary)]"><InlineMarkdown content={title} /></span>
       </div>
       {message && (
-        <div className="text-xs text-[var(--text-secondary)] mb-3 ml-6"><MarkdownContent content={message} /></div>
+        <div className="text-xs text-[var(--text-secondary)] mb-3 ml-6"><LazyMarkdownContent content={message} /></div>
       )}
       <div className="flex flex-col gap-1.5 ml-6">
         {options.map((option) => {

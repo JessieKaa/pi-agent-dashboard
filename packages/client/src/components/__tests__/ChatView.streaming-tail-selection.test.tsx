@@ -107,7 +107,12 @@ const PREFIX = "UNIQZPREFIX";
 
 describe("ChatView streaming-tail selection preservation", () => {
   it("2.1 keeps the committed tail nodes stable across a chunk append (buffer + flush)", async () => {
-    const { container } = renderChat(userState(`${PREFIX} streaming answer`));
+    const { container, findByText } = renderChat(userState(`${PREFIX} streaming answer`));
+    // The tail renders through the lazy markdown boundary, so the markdown
+    // chunk resolves asynchronously (subsequent effects hang off the resolved
+    // tree, same as production). See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    await findByText(`${PREFIX} streaming answer`);
     await flushRaf();
 
     const textNode = tailTextNode(container);
@@ -135,11 +140,15 @@ describe("ChatView streaming-tail selection preservation", () => {
     // Collapse → flush to the latest streamed text.
     await act(async () => collapseSelection());
     await flushMicrotasks();
+    await findByText(`${PREFIX} streaming answer with MORE text appended`);
     expect(getTail(container)?.textContent).toContain("MORE text appended");
   });
 
   it("2.2 preserves a tail selection across turn completion, then reveals the committed twin on collapse", async () => {
-    const { container } = renderChat(userState(`${PREFIX} final answer body`));
+    const { container, findByText } = renderChat(userState(`${PREFIX} final answer body`));
+    // Lazy markdown boundary → wait for the tail text to resolve.
+    // See change: trim-cold-start-transfer-and-config-fanout (③).
+    await findByText(`${PREFIX} final answer body`);
     await flushRaf();
 
     const textNode = tailTextNode(container);

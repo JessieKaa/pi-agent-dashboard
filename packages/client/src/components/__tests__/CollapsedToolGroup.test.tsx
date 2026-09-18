@@ -65,7 +65,7 @@ describe("CollapsedToolGroup", () => {
     expect(summarySpan!.textContent).toBe(`$ ${longCommand}`);
   });
 
-  it("renders absorbed narration from `rendered` when expanded", () => {
+  it("renders absorbed narration from `rendered` when expanded", async () => {
     const m1 = makeMsg("m1", "curl x");
     const m2 = makeMsg("m2", "curl x");
     const m3 = makeMsg("m3", "curl x");
@@ -82,7 +82,7 @@ describe("CollapsedToolGroup", () => {
       messages: [m1, m2, m3],
       rendered: [m1, prose, m2, m3],
     };
-    const { container, getByTestId, queryByTestId } = render(
+    const { container, getByTestId, queryByTestId, findByText } = render(
       <ThemeProvider>
         <CollapsedToolGroup group={group} toolContext={ctx} />
       </ThemeProvider>,
@@ -92,7 +92,10 @@ describe("CollapsedToolGroup", () => {
     // Count badge reflects toolResult-only messages (×3), not rendered length.
     expect(container.querySelector('[data-testid="collapsed-group"]')!.textContent).toContain("×3");
     fireEvent.click(container.querySelector('[data-testid="collapsed-group"]')!);
-    // Expanded: absorbed prose now visible.
+    // Expanded: absorbed prose now visible. Narration renders through the lazy
+    // markdown boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    expect(await findByText("still starting")).toBeTruthy();
     expect(getByTestId("collapsed-group-narration").textContent).toContain("still starting");
   });
 });

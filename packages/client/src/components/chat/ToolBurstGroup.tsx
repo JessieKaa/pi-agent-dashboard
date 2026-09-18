@@ -37,7 +37,7 @@ import type { ToolBurstGroup as ToolBurstGroupData } from "../../lib/chat/group-
 import type { ChatItem, ToolCallGroup } from "../../lib/chat/group-tool-calls.js";
 import { getSummary, getToolIcon } from "../../lib/chat/tool-summary.js";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 import type { ToolContext } from "../tool-renderers/index.js";
 import { CollapsedToolGroup } from "./CollapsedToolGroup.js";
 import { ThinkingBlock } from "./ThinkingBlock.js";
@@ -308,7 +308,7 @@ function BurstBodyItem({
   if (msg.role === "assistant" && msg.content.trim() !== "") {
     return (
       <div className="px-2 py-1 text-xs text-[var(--text-tertiary)]" data-testid="tool-burst-narration">
-        <MarkdownContent content={msg.content} context={toolContext} />
+        <LazyMarkdownContent content={msg.content} context={toolContext} />
       </div>
     );
   }

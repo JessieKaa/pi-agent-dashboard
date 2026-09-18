@@ -69,10 +69,14 @@ describe("ChatView inline-chat steering", () => {
     expect(queryAllByTestId("pending-steer-card")).toHaveLength(0);
   });
 
-  it("renders a user-style bubble per pending steer entry", () => {
-    const { getAllByTestId } = renderWith({ pendingSteering: ["focus on X", "also try Y"] });
+  it("renders a user-style bubble per pending steer entry", async () => {
+    const { getAllByTestId, findByText } = renderWith({ pendingSteering: ["focus on X", "also try Y"] });
     const cards = getAllByTestId("pending-steer-card");
     expect(cards).toHaveLength(2);
+    // Steer text renders through the lazy markdown boundary → async.
+    // See change: trim-cold-start-transfer-and-config-fanout (③).
+    await findByText("focus on X");
+    await findByText("also try Y");
     expect(cards[0].textContent).toContain("focus on X");
     expect(cards[1].textContent).toContain("also try Y");
   });

@@ -69,3 +69,5 @@ Pending-prompt desync affordance (D10 of fix-pending-prompt-lost-on-replay): opt
 Inline reasoning flow: `<ThinkingBlock>` in tool groups carries `inlineFlow={prefs.reasoningInlineFlow}`. See change: render-inline-reasoning-and-custom-entries.
 
 Per-group custom chat entry visibility: rows gated by `customEventGroups` prefs (replacing the single `customEntryFallback`). See change: add-custom-event-group-filters.
+
+Interactive ask cards (`InteractiveUiCard`) and the pending-prompt bubble's markdown body render through the `LazyInteractiveRenderer` / `LazyMarkdownContent` boundaries — their inner content resolves asynchronously (tests: await it). Status-tick rows, retry/fork affordances, and plugin-claimed renderer paths stay eager. See change: trim-cold-start-transfer-and-config-fanout (③).

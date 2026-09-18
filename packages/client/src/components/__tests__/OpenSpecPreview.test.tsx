@@ -94,9 +94,11 @@ function renderPreview(initialArtifact: string) {
 }
 
 describe("OpenSpecPreview tab → URL wiring", () => {
-  it("renders the artifact for the initial URL segment", () => {
+  it("renders the artifact for the initial URL segment", async () => {
     renderPreview("proposal");
-    expect(screen.getByText(/proposal content/)).toBeTruthy();
+    // Artifact body renders through the lazy markdown boundary → async.
+    // See change: trim-cold-start-transfer-and-config-fanout (③).
+    expect(await screen.findByText(/proposal content/)).toBeTruthy();
   });
 
   it("navigates to the artifact preview URL when a tab is clicked (push)", () => {
@@ -108,8 +110,10 @@ describe("OpenSpecPreview tab → URL wiring", () => {
     expect(last).toBe(buildOpenSpecPreviewUrl(CWD, CHANGE, "design"));
   });
 
-  it("shows the active tab derived from the initial artifact", () => {
+  it("shows the active tab derived from the initial artifact", async () => {
     renderPreview("design");
-    expect(screen.getByText(/design content/)).toBeTruthy();
+    // Lazy markdown boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    expect(await screen.findByText(/design content/)).toBeTruthy();
   });
 });

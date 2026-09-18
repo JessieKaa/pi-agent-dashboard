@@ -31,7 +31,7 @@ import {
   noteSubagentTerminal,
   trackInspectorMounted,
 } from "../../lib/state/subagent-inspector-telemetry.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 import { AgentCardShell } from "../session/AgentCardShell.js";
 import { formatDuration } from "../session/agent-card-utils.js";
 import { ElapsedBadge } from "../session/ElapsedBadge.js";
@@ -139,7 +139,7 @@ function ResultBlock({ text }: { text: string }) {
     <div className="mt-1.5">
       <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wider mb-0.5">{i18nT("common.result", undefined, "Result")}</div>
       <div className="max-h-80 overflow-auto text-[12px]">
-        <MarkdownContent content={text} />
+        <LazyMarkdownContent content={text} />
       </div>
     </div>
   );

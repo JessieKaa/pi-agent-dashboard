@@ -46,10 +46,13 @@ import { buildTurnSummaries, type TurnSummary } from "../../lib/util/lineDelta.j
 import { isOutOfCwd, normalizeUnderCwd } from "../../lib/util/normalize-path.js";
 import { scrollDebugLog } from "../../lib/util/scroll-debug.js";
 import { ChangeSummaryBlock } from "../diff/ChangeSummaryBlock.js";
-import { getInteractiveRenderer } from "../interactive-renderers/registry.js";
+// Lazy host — the registry's renderers statically import react-markdown
+// (via InlineMarkdown), so a static edge here would preload the markdown
+// chunk on landing. See change: trim-cold-start-transfer-and-config-fanout (③).
+import { LazyInteractiveRenderer } from "../interactive-renderers/LazyInteractiveRenderer.js";
 import { FilePreviewHost, FilePreviewProvider } from "../preview/FilePreviewContext.js";
 import { ImageLightbox } from "../preview/ImageLightbox.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 import { CopyButton } from "../primitives/CopyButton.js";
 import { RetriedErrorBadge } from "../session/RetriedErrorBadge.js";
 import { useOptionalSplitWorkspace } from "../split/SplitWorkspaceContext.js";
@@ -343,7 +346,7 @@ function MessageBubble({ content, className, timestamp, entryId, onFork, context
   return (
     <div className={className}>
       <div ref={contentRef}>
-        <MarkdownContent content={content} context={context} />
+        <LazyMarkdownContent content={content} context={context} />
       </div>
       <div className="border-t border-[var(--border-secondary)] mt-2 pt-1.5 flex justify-end items-center gap-0.5 opacity-50 hover:opacity-100 transition-opacity">
         {timestamp != null && (
@@ -369,9 +372,8 @@ function InteractiveUiCard({ request, onRespondToUi }: {
   request: InteractiveUiRequest;
   onRespondToUi?: (requestId: string, result?: unknown, cancelled?: boolean) => void;
 }) {
-  const Renderer = getInteractiveRenderer(request.method);
   return (
-    <Renderer
+    <LazyInteractiveRenderer
       requestId={request.requestId}
       method={request.method}
       params={request.params}
@@ -2123,7 +2125,7 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
       {streamingTailText && (
         <div ref={tailContainerRef} className="flex justify-start chat-cv-skip">
           <div ref={streamFxRef} className={`chat-stream-live bg-[var(--bg-tertiary)] border border-[var(--border-subtle)] rounded-xl shadow-md px-4 py-2 ${hasMermaid(streamingTailText) ? bubbleWide : bubbleMax}`}>
-            <MarkdownContent content={streamingTailText} context={toolContext} />
+            <LazyMarkdownContent content={streamingTailText} context={toolContext} />
             {state.streamingText && (
               <span className="inline-block w-1.5 h-4 bg-[var(--bg-surface)] animate-pulse ml-0.5" />
             )}
@@ -2160,7 +2162,7 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
               <Icon path={mdiLoading} size={0.45} className="animate-spin" />
               {i18nT("session.steering", undefined, "Steering")}
             </div>
-            <MarkdownContent content={steerText} />
+            <LazyMarkdownContent content={steerText} />
           </div>
         </div>
       ))}
@@ -2190,7 +2192,7 @@ const ChatViewInner = forwardRef<ChatViewHandle, Props>(function ChatView({ sess
             )}
             <div className="flex items-start gap-2">
               <div className="flex-1">
-                <MarkdownContent content={state.pendingPrompt.text} />
+                <LazyMarkdownContent content={state.pendingPrompt.text} />
               </div>
               <div className="flex items-center gap-1.5 shrink-0 mt-0.5">
                 {state.pendingPrompt.status === "sending" ? (

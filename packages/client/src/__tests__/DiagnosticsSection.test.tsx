@@ -4,9 +4,10 @@
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, fireEvent, cleanup, act, waitFor } from "@testing-library/react";
-// Stub MarkdownContent — it pulls ThemeContext that we don't need to wire here.
-vi.mock("../components/preview/MarkdownContent.js", () => ({
-  MarkdownContent: ({ content }: { content: string }) => content,
+// Stub the lazy markdown boundary — it pulls ThemeContext that we don't need
+// to wire here.
+vi.mock("../components/preview/LazyMarkdownContent.js", () => ({
+  LazyMarkdownContent: ({ content }: { content: string }) => content,
 }));
 import { DiagnosticsSection } from "../components/settings/DiagnosticsSection.js";
 import { DoctorFetchError } from "../lib/api/doctor-api.js";

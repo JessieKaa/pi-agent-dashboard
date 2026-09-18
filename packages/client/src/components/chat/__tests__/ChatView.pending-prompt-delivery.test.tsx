@@ -42,14 +42,16 @@ function renderWithPending(pendingPrompt: PendingPrompt, extraProps: Record<stri
 }
 
 describe("ChatView — honest no-bridge failure", () => {
-  it("F5: a connection-attributed failure names the cause, not the session", () => {
+  it("F5: a connection-attributed failure names the cause, not the session", async () => {
     renderWithPending({ text: "run the tests", status: "failed", failureCause: "connection" });
 
     expect(
       screen.getByText("Dashboard is offline — your prompt never left this browser."),
     ).toBeTruthy();
-    // The prompt text is preserved.
-    expect(screen.getByText("run the tests")).toBeTruthy();
+    // The prompt text is preserved (renders through the lazy markdown
+    // boundary → async). See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    expect(await screen.findByText("run the tests")).toBeTruthy();
   });
 
   it("2.3a: the failed arm offers a Retry exit", () => {

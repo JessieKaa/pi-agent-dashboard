@@ -8,7 +8,10 @@
  * See change: adopt-server-driven-intent-rendering.
  */
 import Icon from "@mdi/react";
-import * as mdi from "@mdi/js";
+// Generated dynamic-key table — replaces a namespace import of the full
+// @mdi/js module, which defeated tree-shaking (all ~7,000 icons in the eager
+// bundle). See change: trim-cold-start-transfer-and-config-fanout (②).
+import dynamicMdiKeys from "@blackbelt-technology/pi-dashboard-shared/dynamic-mdi-keys.json";
 // We accept icon as a string key (MDI), look up via resolveMdiIcon at render time.
 import type { UiActionListProps } from "@blackbelt-technology/pi-dashboard-shared/dashboard-plugin/ui-primitives.js";
 import { sendPluginAction } from "@blackbelt-technology/dashboard-plugin-runtime";
@@ -71,14 +74,10 @@ export function ActionList({ actions }: UiActionListProps) {
 
 /**
  * Render an MDI icon by its export-name key. Best-effort — unknown keys
- * render nothing. The shell ships @mdi/js so this is a flat property
- * lookup.
+ * render nothing (the generated dynamic-key table is the allowlist).
  */
 function IconByKey({ iconKey }: { iconKey: string }) {
-  // @mdi/js is already eager (statically imported across the shell), so this
-  // is a synchronous flat property lookup — no dynamic import, no loading
-  // state. See change: shrink-client-index-chunk.
-  const candidate = (mdi as Record<string, unknown>)[iconKey];
+  const candidate = (dynamicMdiKeys as Record<string, unknown>)[iconKey];
   const path = typeof candidate === "string" ? candidate : null;
   if (!path) return null;
   return <Icon path={path} size={0.6} />;

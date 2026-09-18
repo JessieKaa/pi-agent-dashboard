@@ -2,7 +2,7 @@ import { mdiShieldAlert } from "@mdi/js";
 import { Icon } from "@mdi/react";
 import React from "react";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 import { AnsweredOption } from "./AnsweredOption.js";
 import { InlineMarkdown } from "./InlineMarkdown.js";
 import type { InteractiveRendererProps } from "./types.js";
@@ -32,7 +32,7 @@ export function ConfirmRenderer({ params, status, result, onRespond, onCancel }:
           <span className="text-[var(--text-primary)] font-medium"><InlineMarkdown content={title} /></span>
         </div>
         {message && (
-          <div className="text-xs text-[var(--text-secondary)] mb-2 ml-6"><MarkdownContent content={message} /></div>
+          <div className="text-xs text-[var(--text-secondary)] mb-2 ml-6"><LazyMarkdownContent content={message} /></div>
         )}
         <div className="flex gap-2 ml-6">
           <AnsweredOption title={i18nT("common.yes", undefined, "Yes")} picked={!!confirmed} />
@@ -49,7 +49,7 @@ export function ConfirmRenderer({ params, status, result, onRespond, onCancel }:
         <span className="text-sm font-medium text-[var(--text-primary)]"><InlineMarkdown content={title} /></span>
       </div>
       {message && (
-        <div className="text-xs text-[var(--text-secondary)] mb-3 ml-6"><MarkdownContent content={message} /></div>
+        <div className="text-xs text-[var(--text-secondary)] mb-3 ml-6"><LazyMarkdownContent content={message} /></div>
       )}
       <div className="flex gap-2 ml-6">
         <button

@@ -21,6 +21,7 @@ Files in this directory. One row per source file.
 | `changelog-types.ts` | `ChangelogBullet` / `Release` / `Response` types for parsed CHANGELOG.md responses. See change: pi-update-whats-new-panel. |
 | `config.ts` | Dashboard config loader. `loadConfig()` reads `~/.pi/dashboard/config.json` via `CONFIG_FILE`;… → see `config.ts.AGENTS.md` || `credential-detect.ts` | Detects configured LLM-provider credential. `hasAnyProviderCredential(homeDir?)` OR-merges… → see `credential-detect.ts.AGENTS.md` |
 | `credential-detect.ts` | Detects configured LLM-provider credential. `hasAnyProviderCredential(homeDir?)` OR-merges… → see `credential-detect.ts.AGENTS.md` |
+| `dynamic-mdi-keys.json` | GENERATED key → `@mdi/js` path table consumed by the client's three dynamic-icon resolvers (`mdi-icon-lookup.ts`, client-utils `StatusPill`/`ActionList`). Replaces `import * as mdi` namespace imports that defeated tree-shaking. Regenerate: `node scripts/generate-dynamic-mdi-keys.mjs` (union-preserving; verifies keys against installed `@mdi/js`). See change: trim-cold-start-transfer-and-config-fanout (②). |
 | `custom-event-groups-store.ts` | Node-side store for `~/.pi/dashboard/custom-event-groups.json`. → see `custom-event-groups-store.ts.AGENTS.md` |
 | `custom-event-groups.ts` | Browser-safe types + shipped defaults for custom chat row groups. → see `custom-event-groups.ts.AGENTS.md` |
 | `dashboard-paths.ts` | Single-source path helpers for dashboard runtime dirs. `getDashboardConfigDir` → `~/.pi/dashboard/`. → see `dashboard-paths.ts.AGENTS.md` |

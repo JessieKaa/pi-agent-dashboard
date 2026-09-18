@@ -29,8 +29,8 @@ vi.mock("@monaco-editor/react", () => ({
   ),
 }));
 // Keep MarkdownContent light.
-vi.mock("../../preview/MarkdownContent.js", () => ({
-  MarkdownContent: ({ content }: { content: string }) => <div data-testid="md-preview">{content}</div>,
+vi.mock("../../preview/LazyMarkdownContent.js", () => ({
+  LazyMarkdownContent: ({ content }: { content: string }) => <div data-testid="md-preview">{content}</div>,
 }));
 
 import MarkdownViewer from "../MarkdownViewer.js";

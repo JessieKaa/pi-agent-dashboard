@@ -1,4 +1,4 @@
-import { act, fireEvent, render } from "@testing-library/react";
+import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import React from "react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChatMessage, createInitialState, type PendingPrompt } from "../../lib/chat/event-reducer.js";
@@ -95,7 +95,7 @@ describe("ChatView", () => {
     expect(button!.querySelector("svg")).not.toBeNull();
   });
 
-  it("renders expandable tool call with args and result", () => {
+  it("renders expandable tool call with args and result", async () => {
     const state = stateWithToolMessage();
     const { container } = render(<ThemeProvider><ChatView state={state} toolContext={defaultToolContext} /></ThemeProvider>);
 
@@ -106,12 +106,17 @@ describe("ChatView", () => {
     const stepButton = container.querySelector('[data-testid="tool-burst-body"] button')!;
     fireEvent.click(stepButton);
 
-    // Should show args and result in expanded view
-    const expanded = container.querySelector(".bg-\\[var\\(--bg-secondary\\)\\]");
-    expect(expanded).not.toBeNull();
-    expect(expanded!.textContent).toContain("ls -la");
-    expect(expanded!.textContent).toContain("file1");
-    expect(expanded!.textContent).toContain("file2");
+    // Should show args and result in expanded view. The built-in renderer sits
+    // behind the lazy tool-renderer boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    const expanded = await waitFor(() => {
+      const el = container.querySelector(".bg-\\[var\\(--bg-secondary\\)\\]");
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    await waitFor(() => expect(expanded.textContent).toContain("file1"));
+    expect(expanded.textContent).toContain("ls -la");
+    expect(expanded.textContent).toContain("file2");
   });
 
   it("renders running tool call with spinner icon", () => {

@@ -79,8 +79,8 @@ describe("SkillInvocationCard", () => {
     expect(container.textContent).not.toContain("Second body line");
   });
 
-  it("clicking the header expands the body", () => {
-    const { container } = renderWithTheme(
+  it("clicking the header expands the body", async () => {
+    const { container, findByText } = renderWithTheme(
       <SkillInvocationCard skill={SKILL} rawContent={RAW_CONTENT} timestamp={1} />,
     );
     const headerBtn = container.querySelector("button[aria-expanded]") as HTMLButtonElement;
@@ -89,8 +89,10 @@ describe("SkillInvocationCard", () => {
       fireEvent.click(headerBtn);
     });
     expect(headerBtn.getAttribute("aria-expanded")).toBe("true");
-    expect(container.textContent).toContain("First body line");
-    expect(container.textContent).toContain("Second body line");
+    // Body renders through the lazy markdown boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    expect(await findByText(/First body line/)).toBeTruthy();
+    expect(await findByText(/Second body line/)).toBeTruthy();
   });
 
   it("expanded view shows args section when args is set", () => {
@@ -107,15 +109,18 @@ describe("SkillInvocationCard", () => {
     expect(expanded).toContain("continue with X");
   });
 
-  it("expanded view does NOT show args section when args is undefined", () => {
-    const { container } = renderWithTheme(
+  it("expanded view does NOT show args section when args is undefined", async () => {
+    const { container, findByText } = renderWithTheme(
       <SkillInvocationCard skill={SKILL_NO_ARGS} rawContent={RAW_CONTENT} timestamp={1} />,
     );
     const headerBtn = container.querySelector("button[aria-expanded]") as HTMLButtonElement;
     act(() => {
       fireEvent.click(headerBtn);
     });
-    // First body line shows up; "args" label section should not.
+    // First body line shows up (lazy markdown boundary → async; see change:
+    // trim-cold-start-transfer-and-config-fanout ③); "args" label section
+    // should not.
+    expect(await findByText(/First body line/)).toBeTruthy();
     const allText = container.textContent || "";
     expect(allText).toContain("First body line");
     // Match "args" as the standalone label (the uppercase tracking-wider element)
@@ -191,8 +196,8 @@ describe("SkillInvocationCard", () => {
     expect(writeText).toHaveBeenCalledWith("line one\nline two\nline three");
   });
 
-  it("only the chevron button toggles expansion (header text is not a button)", () => {
-    const { container } = renderWithTheme(
+  it("only the chevron button toggles expansion (header text is not a button)", async () => {
+    const { container, findByText } = renderWithTheme(
       <SkillInvocationCard skill={SKILL} rawContent={RAW_CONTENT} timestamp={1} />,
     );
     // The condensed slash text is in a plain <span>, not a button.
@@ -208,7 +213,9 @@ describe("SkillInvocationCard", () => {
       fireEvent.click(toggler);
     });
     expect(toggler.getAttribute("aria-expanded")).toBe("true");
-    expect(container.textContent).toContain("First body line");
+    // Lazy markdown boundary → async. See change:
+    // trim-cold-start-transfer-and-config-fanout (③).
+    expect(await findByText(/First body line/)).toBeTruthy();
   });
 
   it('"Copy as Markdown" button copies the raw <skill> wrapper content', async () => {

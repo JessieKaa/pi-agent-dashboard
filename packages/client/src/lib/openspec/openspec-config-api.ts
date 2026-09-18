@@ -234,6 +234,38 @@ export async function fetchUpdateStatus(): Promise<CwdUpdateStatus[]> {
  */
 const configCache = new Map<string, OpenSpecConfig>();
 
+// Module-level fetch sharing: concurrent hook instances with the same cwd
+// (one SessionCard per session) share a single in-flight request instead of
+// firing one each. See change: trim-cold-start-transfer-and-config-fanout (④).
+const inflightConfigFetches = new Map<string, Promise<OpenSpecConfig>>();
+
+// Failure negative-cache: after a failed fetch, remounts within the TTL reuse
+// the failure instead of re-hammering the endpoint (e.g. offline). Cleared by
+// a success or by `__resetOpenSpecConfigCache` (the save/epoch path).
+const configFailureAt = new Map<string, number>();
+
+/** How long a failed config fetch suppresses refetch (④). */
+export const OPENSPEC_CONFIG_FAILURE_TTL_MS = 30_000;
+
+function fetchOpenSpecConfigShared(cwd: string): Promise<OpenSpecConfig> {
+  const existing = inflightConfigFetches.get(cwd);
+  if (existing) return existing;
+  const p = fetchOpenSpecConfig(cwd).then(
+    (data) => {
+      configFailureAt.delete(cwd);
+      inflightConfigFetches.delete(cwd);
+      return data;
+    },
+    (err: unknown) => {
+      configFailureAt.set(cwd, Date.now());
+      inflightConfigFetches.delete(cwd);
+      throw err;
+    },
+  );
+  inflightConfigFetches.set(cwd, p);
+  return p;
+}
+
 export function useOpenSpecConfig(cwd: string | undefined): OpenSpecConfig {
   // Re-render + re-run the fetch effect whenever a save bumps the epoch.
   const epoch = useSyncExternalStore(
@@ -257,22 +289,34 @@ export function useOpenSpecConfig(cwd: string | undefined): OpenSpecConfig {
     const cached = configCache.get(cwd);
     if (cached) setConfig(cached);
 
-    const ac = new AbortController();
-    fetchOpenSpecConfig(cwd, ac.signal)
+    // Negative-cache guard: a recent failure suppresses the refetch. The
+    // shared request must not be tied to this hook's lifetime — a sibling
+    // hook may still need it, so unmount uses a flag, not AbortController.
+    const failedAt = configFailureAt.get(cwd);
+    if (failedAt !== undefined && Date.now() - failedAt < OPENSPEC_CONFIG_FAILURE_TTL_MS) {
+      return;
+    }
+
+    let cancelled = false;
+    fetchOpenSpecConfigShared(cwd)
       .then((data) => {
         configCache.set(cwd, data);
-        setConfig(data);
+        if (!cancelled) setConfig(data);
       })
       .catch(() => {
         // Keep cached / DEFAULT value on failure.
       });
-    return () => ac.abort();
+    return () => {
+      cancelled = true;
+    };
   }, [cwd, epoch]);
 
   return config;
 }
 
-/** Reset the module-scope cache. Used by tests. */
+/** Reset the module-scope caches. Used by tests and the save/epoch path. */
 export function __resetOpenSpecConfigCache(): void {
   configCache.clear();
+  inflightConfigFetches.clear();
+  configFailureAt.clear();
 }

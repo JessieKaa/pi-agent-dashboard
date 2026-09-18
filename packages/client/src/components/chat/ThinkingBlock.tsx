@@ -3,7 +3,7 @@ import { Icon } from "@mdi/react";
 import { useEffect, useRef, useState } from "react";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
 import { ElapsedBadge } from "../session/ElapsedBadge.js";
-import { MarkdownContent } from "../preview/MarkdownContent.js";
+import { LazyMarkdownContent } from "../preview/LazyMarkdownContent.js";
 
 interface Props {
   content: string;
@@ -182,7 +182,7 @@ export function ThinkingBlock({
               : "mt-1 ml-4 p-2 bg-purple-500/5 rounded-xl shadow-md border border-purple-500/10 text-xs text-[var(--text-secondary)] overflow-x-auto max-h-[400px] overflow-y-auto"
           }
         >
-          <MarkdownContent content={content} />
+          <LazyMarkdownContent content={content} />
           {isStreaming && (
             <span className="inline-block w-1.5 h-3 bg-purple-400/50 animate-pulse ml-0.5" />
           )}

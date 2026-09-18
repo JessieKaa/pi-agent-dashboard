@@ -257,7 +257,7 @@ describe("MultiselectRenderer", () => {
 
 describe("MultiselectRenderer — resolved shows message body (change: fix-ask-user-card-duplication)", () => {
   const MSG = "Choose all that apply.";
-  it("renders params.message in the resolved state", () => {
+  it("renders params.message in the resolved state", async () => {
     render(
       <ThemeProvider>
         <MultiselectRenderer
@@ -268,7 +268,9 @@ describe("MultiselectRenderer — resolved shows message body (change: fix-ask-u
       />
       </ThemeProvider>,
     );
-    expect(screen.getByText(MSG)).toBeTruthy();
+    // Message body renders through the lazy markdown boundary → async.
+    // See change: trim-cold-start-transfer-and-config-fanout (③).
+    expect(await screen.findByText(MSG)).toBeTruthy();
   });
   it("renders no message body when params.message is absent", () => {
     render(

@@ -1,6 +1,7 @@
 import React from "react";
 import { t as i18nT } from "../../lib/i18n/i18n.js";
-import { getInteractiveRenderer } from "../interactive-renderers/registry.js";
+// Lazy host — see change: trim-cold-start-transfer-and-config-fanout (③).
+import { LazyInteractiveRenderer } from "../interactive-renderers/LazyInteractiveRenderer.js";
 import type { InteractiveUiRequest } from "../../lib/chat/event-reducer.js";
 
 /**
@@ -32,10 +33,9 @@ export function MultiAskPanel({ requests, onRespondToUi }: {
       </div>
       <div className="flex flex-col divide-y divide-[var(--border-secondary)]">
         {requests.map((request) => {
-          const Renderer = getInteractiveRenderer(request.method);
           return (
             <div key={request.requestId} data-testid={`multi-ask-card-${request.requestId}`}>
-              <Renderer
+              <LazyInteractiveRenderer
                 requestId={request.requestId}
                 method={request.method}
                 params={request.params}

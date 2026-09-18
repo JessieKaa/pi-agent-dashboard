@@ -32,6 +32,7 @@ const indexHtmlPath = path.join(distDir, "index.html");
 const LAZY_VENDOR_CHUNKS: Array<[name: string, why: string]> = [
   ["xterm", "terminal layer (EditorPane lazy boundary + InlineTerminalCard)"],
   ["git-diff-view", "Diff route/tab + EditToolRenderer RichDiff lazy boundaries"],
+  ["markdown", "markdown payload (LazyMarkdownContent boundary)"],
 ];
 
 /** Files that must keep their dynamic import of the feature module. */
@@ -41,6 +42,15 @@ const LAZY_READERS: Array<[file: string, specifier: string]> = [
   ["src/App.tsx", "./components/diff/FileDiffView.js"],
   ["src/components/editor-pane/pseudo-tab-registry.tsx", "./DiffViewer.js"],
   ["src/components/tool-renderers/EditToolRenderer.tsx", "../diff/RichDiff.js"],
+  // Payload-family boundaries (change: trim-cold-start-transfer-and-config-fanout ③).
+  ["src/components/preview/LazyMarkdownContent.tsx", "./MarkdownContent.js"],
+  ["src/components/interactive-renderers/LazyInteractiveRenderer.tsx", "./registry.js"],
+  ["src/components/tool-renderers/LazyToolRenderer.tsx", "./index.js"],
+];
+
+/** Payload chunks that must stay lazy: `[manualChunkName, emitted]`. */
+const LAZY_PAYLOAD_CHUNKS: Array<[name: string, emitted: boolean]> = [
+  ["markdown", true],
 ];
 
 function escapeRegExp(s: string): string {
@@ -85,6 +95,21 @@ describe("lazy feature chunks — built output", () => {
       expect(
         html,
         `cold index.html preloads a ${name} chunk — the feature re-entered the landing graph.`,
+      ).not.toContain(`/assets/${name}-`);
+    }
+
+    for (const [name] of LAZY_PAYLOAD_CHUNKS) {
+      const chunks = readdirSync(assetsDir).filter(
+        (f) => f.startsWith(`${name}-`) && f.endsWith(".js"),
+      );
+      if (chunks.length === 0) {
+        expect.fail(
+          `dist/assets exists but no ${name} chunk was emitted — the payload chunk was renamed or merged into another asset.`,
+        );
+      }
+      expect(
+        html,
+        `cold index.html preloads the ${name} chunk — the payload re-entered the landing preload graph.`,
       ).not.toContain(`/assets/${name}-`);
     }
   });
